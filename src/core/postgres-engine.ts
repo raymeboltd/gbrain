@@ -292,14 +292,17 @@ export class PostgresEngine implements BrainEngine {
     const hash = page.content_hash || contentHash(page);
     const frontmatter = page.frontmatter || {};
 
-    // v0.18.0 Step 2: source_id relies on schema DEFAULT 'default'. ON
-    // CONFLICT target becomes (source_id, slug) since global UNIQUE(slug)
-    // was dropped in migration v17. See pglite-engine.ts for matching
-    // notes; multi-source sync (Step 5) will surface an explicit sourceId.
+    // v0.22.6.2 #475 Step 5: source_id is bound explicitly when
+    // PageInput.source_id is set (multi-source `gbrain sync --source <id>`),
+    // and falls back to the schema DEFAULT 'default' when omitted so
+    // existing single-source callers work unchanged. ON CONFLICT target
+    // is (source_id, slug) since the global UNIQUE(slug) was dropped in
+    // migration v17 (v0.18.0).
     const pageKind = page.page_kind || 'markdown';
+    const sourceId = page.source_id || 'default';
     const rows = await sql`
-      INSERT INTO pages (slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at)
-      VALUES (${slug}, ${page.type}, ${pageKind}, ${page.title}, ${page.compiled_truth}, ${page.timeline || ''}, ${sql.json(frontmatter as Parameters<typeof sql.json>[0])}, ${hash}, now())
+      INSERT INTO pages (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at)
+      VALUES (${sourceId}, ${slug}, ${page.type}, ${pageKind}, ${page.title}, ${page.compiled_truth}, ${page.timeline || ''}, ${sql.json(frontmatter as Parameters<typeof sql.json>[0])}, ${hash}, now())
       ON CONFLICT (source_id, slug) DO UPDATE SET
         type = EXCLUDED.type,
         page_kind = EXCLUDED.page_kind,

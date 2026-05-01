@@ -611,6 +611,110 @@ describe('PGLiteEngine: batch ops source-awareness (v0.18.0)', () => {
   });
 });
 
+// v0.22.6.2 #475 Step 5 — putPage now binds source_id explicitly when
+// PageInput.source_id is set. Before this fix, every write landed in the
+// schema DEFAULT 'default' source, so `gbrain sync --source vault` then
+// `gbrain sync --source taniwha` silently overwrote each other on
+// shared slugs (people/foo, projects/README) instead of creating two
+// distinct rows per the (source_id, slug) unique key.
+describe('PGLiteEngine: putPage source-awareness (v0.22.6.2)', () => {
+  beforeEach(async () => {
+    await truncateAll();
+    const db = (engine as any).db;
+    await db.query(
+      `INSERT INTO sources (id, name) VALUES ('alt', 'alt')
+       ON CONFLICT (id) DO NOTHING`
+    );
+  });
+
+  test('putPage with explicit source_id writes to that source', async () => {
+    await engine.putPage('people/foo', {
+      type: 'person',
+      title: 'Foo (alt)',
+      compiled_truth: 'body alt',
+      source_id: 'alt',
+    });
+
+    const db = (engine as any).db;
+    const { rows } = await db.query(
+      `SELECT source_id, slug, title FROM pages WHERE slug = $1`,
+      ['people/foo'],
+    );
+    expect(rows.length).toBe(1);
+    expect(rows[0].source_id).toBe('alt');
+    expect(rows[0].title).toBe('Foo (alt)');
+  });
+
+  test('putPage without source_id falls back to schema DEFAULT default', async () => {
+    await engine.putPage('topics/ai', {
+      type: 'concept',
+      title: 'AI',
+      compiled_truth: 'body',
+    });
+
+    const db = (engine as any).db;
+    const { rows } = await db.query(
+      `SELECT source_id FROM pages WHERE slug = $1`,
+      ['topics/ai'],
+    );
+    expect(rows.length).toBe(1);
+    expect(rows[0].source_id).toBe('default');
+  });
+
+  test('same slug across two sources does NOT collide (multi-source slug namespace)', async () => {
+    // Regression for multi-source bulk sync: two sources with overlapping
+    // slugs (e.g. people/* shared between two repos) used to overwrite each
+    // other when sync wrote both into the schema-DEFAULT 'default' source.
+    // The (source_id, slug) UNIQUE constraint can only do its job if the
+    // writer binds source_id explicitly.
+    await engine.putPage('people/example-person', {
+      type: 'person',
+      title: 'Person (default source)',
+      compiled_truth: 'default body',
+    });
+    await engine.putPage('people/example-person', {
+      type: 'person',
+      title: 'Person (alt source)',
+      compiled_truth: 'alt body',
+      source_id: 'alt',
+    });
+
+    const db = (engine as any).db;
+    const { rows } = await db.query(
+      `SELECT source_id, title FROM pages WHERE slug = $1 ORDER BY source_id`,
+      ['people/example-person'],
+    );
+    expect(rows.length).toBe(2);
+    expect(rows.map((r: any) => r.source_id)).toEqual(['alt', 'default']);
+    expect(rows.find((r: any) => r.source_id === 'alt').title).toBe('Person (alt source)');
+    expect(rows.find((r: any) => r.source_id === 'default').title).toBe('Person (default source)');
+  });
+
+  test('putPage with same source_id and same slug updates in place (ON CONFLICT)', async () => {
+    await engine.putPage('people/foo', {
+      type: 'person',
+      title: 'Foo v1',
+      compiled_truth: 'v1',
+      source_id: 'alt',
+    });
+    await engine.putPage('people/foo', {
+      type: 'person',
+      title: 'Foo v2',
+      compiled_truth: 'v2',
+      source_id: 'alt',
+    });
+
+    const db = (engine as any).db;
+    const { rows } = await db.query(
+      `SELECT title, compiled_truth FROM pages WHERE slug = $1 AND source_id = $2`,
+      ['people/foo', 'alt'],
+    );
+    expect(rows.length).toBe(1);
+    expect(rows[0].title).toBe('Foo v2');
+    expect(rows[0].compiled_truth).toBe('v2');
+  });
+});
+
 // ─────────────────────────────────────────────────────────────────
 // Raw Data, Versions, Config, IngestLog
 // ─────────────────────────────────────────────────────────────────

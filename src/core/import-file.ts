@@ -185,7 +185,7 @@ export async function importFromContent(
   engine: BrainEngine,
   slug: string,
   content: string,
-  opts: { noEmbed?: boolean } = {},
+  opts: { noEmbed?: boolean; source_id?: string } = {},
 ): Promise<ImportResult> {
   // Reject oversized payloads before any parsing, chunking, or embedding happens.
   // Uses Buffer.byteLength to count UTF-8 bytes the same way disk size would,
@@ -276,6 +276,7 @@ export async function importFromContent(
       timeline: parsed.timeline || '',
       frontmatter: parsed.frontmatter,
       content_hash: hash,
+      source_id: opts.source_id,
     });
 
     // Tag reconciliation: remove stale, add current
@@ -339,7 +340,7 @@ export async function importFromFile(
   engine: BrainEngine,
   filePath: string,
   relativePath: string,
-  opts: { noEmbed?: boolean; inferFrontmatter?: boolean } = {},
+  opts: { noEmbed?: boolean; inferFrontmatter?: boolean; source_id?: string } = {},
 ): Promise<ImportResult> {
   // Defense-in-depth: reject symlinks before reading content.
   const lstat = lstatSync(filePath);
@@ -404,7 +405,7 @@ export async function importCodeFile(
   engine: BrainEngine,
   relativePath: string,
   content: string,
-  opts: { noEmbed?: boolean; force?: boolean } = {},
+  opts: { noEmbed?: boolean; force?: boolean; source_id?: string } = {},
 ): Promise<ImportResult> {
   const slug = slugifyCodePath(relativePath);
   const lang = detectCodeLanguage(relativePath) || 'unknown';
@@ -504,6 +505,7 @@ export async function importCodeFile(
       timeline: '',
       frontmatter: { language: lang, file: relativePath },
       content_hash: hash,
+      source_id: opts.source_id,
     });
 
     await tx.addTag(slug, 'code');

@@ -1,7 +1,7 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { writeFileSync, mkdirSync, rmSync, symlinkSync } from 'fs';
 import { join } from 'path';
-import { importFile, importFromContent } from '../src/core/import-file.ts';
+import { importFile, importFromContent, importCodeFile } from '../src/core/import-file.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 
 const TMP = join(import.meta.dir, '.tmp-import-test');
@@ -406,5 +406,94 @@ ${longText}
         expect(chunks[i].chunk_index).toBe(i);
       }
     }
+  });
+});
+
+// v0.22.6.2 #475 Step 5 — importFile / importFromContent / importCodeFile
+// must thread `opts.source_id` into PageInput.source_id at the putPage
+// call so multi-source `gbrain sync --source <id>` lands writes in the
+// right source. Before this fix, sync.ts knew sourceId but the import
+// pipeline silently dropped it, sending every write to the schema
+// DEFAULT 'default' source.
+describe('source_id threading (v0.22.6.2)', () => {
+  test('importFromContent passes opts.source_id into PageInput at putPage', async () => {
+    const engine = mockEngine();
+    await importFromContent(
+      engine,
+      'people/foo',
+      `---
+type: person
+title: Foo
+---
+
+body`,
+      { noEmbed: true, source_id: 'vault' },
+    );
+
+    const calls = (engine as any)._calls;
+    const putPageCall = calls.find((c: any) => c.method === 'putPage');
+    expect(putPageCall).toBeDefined();
+    expect(putPageCall.args[0]).toBe('people/foo');
+    expect(putPageCall.args[1].source_id).toBe('vault');
+  });
+
+  test('importFromContent omits source_id when opts.source_id is undefined', async () => {
+    const engine = mockEngine();
+    await importFromContent(
+      engine,
+      'concepts/ai',
+      `---
+type: concept
+title: AI
+---
+
+body`,
+      { noEmbed: true },
+    );
+
+    const calls = (engine as any)._calls;
+    const putPageCall = calls.find((c: any) => c.method === 'putPage');
+    expect(putPageCall).toBeDefined();
+    expect(putPageCall.args[1].source_id).toBeUndefined();
+  });
+
+  test('importFile (importFromFile) threads opts.source_id into PageInput', async () => {
+    const filePath = join(TMP, 'src-foo.md');
+    writeFileSync(
+      filePath,
+      `---
+type: person
+title: Foo
+---
+
+body`,
+    );
+
+    const engine = mockEngine();
+    await importFile(engine, filePath, 'people/foo.md', {
+      noEmbed: true,
+      source_id: 'taniwha',
+    });
+
+    const calls = (engine as any)._calls;
+    const putPageCall = calls.find((c: any) => c.method === 'putPage');
+    expect(putPageCall).toBeDefined();
+    expect(putPageCall.args[1].source_id).toBe('taniwha');
+  });
+
+  test('importCodeFile threads opts.source_id into PageInput', async () => {
+    const engine = mockEngine();
+    await importCodeFile(
+      engine,
+      'src/foo.ts',
+      `export const foo = 'bar';\n`,
+      { noEmbed: true, source_id: 'vault' },
+    );
+
+    const calls = (engine as any)._calls;
+    const putPageCall = calls.find((c: any) => c.method === 'putPage');
+    expect(putPageCall).toBeDefined();
+    expect(putPageCall.args[1].source_id).toBe('vault');
+    expect(putPageCall.args[1].page_kind).toBe('code');
   });
 });

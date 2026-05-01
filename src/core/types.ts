@@ -36,6 +36,16 @@ export interface PageInput {
    * `query --lang` filtering.
    */
   page_kind?: PageKind;
+  /**
+   * v0.22.6.2 #475 Step 5 — per-source slug namespacing. When set, the
+   * write lands in this source; the (source_id, slug) UNIQUE constraint
+   * (added v0.18.0) gives multi-source brains independent slug namespaces
+   * so `gbrain sync --source vault` and `--source taniwha` can both hold
+   * a `people/foo` page without overwriting each other. When omitted, the
+   * write falls back to the schema DEFAULT 'default' so existing
+   * single-source callers work unchanged.
+   */
+  source_id?: string;
 }
 
 export interface PageFilters {
