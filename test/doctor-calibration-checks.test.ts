@@ -28,10 +28,14 @@ function buildMockEngine(opts: {
   gradeAppliedCount?: number;
   voiceTotal?: number;
   voiceFailures?: number;
+  userHolder?: string;
   throwOn?: RegExp;
 }): BrainEngine {
   return {
     kind: 'pglite',
+    async getConfig() {
+      return opts.userHolder ?? null;
+    },
     async executeRaw<T>(sql: string): Promise<T[]> {
       if (opts.throwOn && opts.throwOn.test(sql)) {
         throw new Error('mock engine error: ' + sql.slice(0, 50));
@@ -96,6 +100,18 @@ describe('checkCalibrationFreshness', () => {
     const out = await checkCalibrationFreshness(buildMockEngine({ freshGeneratedAt: d }));
     expect(out.status).toBe('ok');
     expect(out.message).toContain('1d ago');
+  });
+
+  test('queries the configured personal holder', async () => {
+    const engine = buildMockEngine({ freshGeneratedAt: null, userHolder: 'self' });
+    let capturedParams: unknown[] | undefined;
+    const originalExecuteRaw = engine.executeRaw.bind(engine);
+    engine.executeRaw = async <T>(sql: string, params?: unknown[]): Promise<T[]> => {
+      capturedParams = params;
+      return originalExecuteRaw<T>(sql, params);
+    };
+    await checkCalibrationFreshness(engine);
+    expect(capturedParams).toEqual(['self']);
   });
 
   test('stale profile (>7 days) → warn with regenerate hint', async () => {

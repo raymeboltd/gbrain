@@ -27,6 +27,9 @@ beforeAll(async () => {
   engine = new PGLiteEngine();
   await engine.connect({ database_url: '' });
   await engine.initSchema();
+  await engine.executeRaw(
+    `INSERT INTO sources (id, name) VALUES ('vault', 'Vault') ON CONFLICT (id) DO NOTHING`,
+  );
 }, 60_000); // OAuth v25 + full migration chain needs breathing room
 
 afterAll(async () => {
@@ -133,6 +136,23 @@ describe('buildBrainTools', () => {
       ctx,
     );
     expect(res).toBeTruthy();
+  });
+
+  test('explicit sourceId binds put_page to that source, not default', async () => {
+    const tools = buildBrainTools({
+      subagentId: 42,
+      engine,
+      config,
+      sourceId: 'vault',
+    });
+    const putPage = tools.find(t => t.name === 'brain_put_page');
+    const ctx: ToolCtx = { engine, jobId: 2, remote: true };
+    await putPage!.execute(
+      { slug: 'wiki/agents/42/source-bound', content: '---\ntitle: Source bound\n---\nbody' },
+      ctx,
+    );
+    expect(await engine.getPage('wiki/agents/42/source-bound', { sourceId: 'vault' })).not.toBeNull();
+    expect(await engine.getPage('wiki/agents/42/source-bound', { sourceId: 'default' })).toBeNull();
   });
 
   test('execute() on put_page with out-of-namespace slug throws permission_denied', async () => {

@@ -34,6 +34,7 @@ import { patternStatementTemplate, type PatternStatementSlots } from '../calibra
 // pack's calibration_domains declarations into per-domain Brier+accuracy+
 // extras scorecards stored in calibration_profiles.domain_scorecards JSONB.
 import { aggregateDomainScorecards, type DomainScorecards } from '../calibration/domain-aggregators.ts';
+import { resolveUserHolder } from '../calibration/user-holder.ts';
 import { GBrainError } from '../types.ts';
 import type { OperationContext } from '../operations.ts';
 import type { BrainEngine, TakesScorecard } from '../engine.ts';
@@ -96,7 +97,7 @@ export type PatternStatementsGenerator = (input: {
 export type BiasTagsGenerator = (patterns: string[]) => Promise<string[]>;
 
 export interface CalibrationProfileOpts extends BasePhaseOpts {
-  /** Holder to generate the profile for. Default 'garry'. */
+  /** Holder to generate the profile for. Defaults to the configured user holder. */
   holder?: string;
   /** Inject the patterns generator (tests). */
   patternsGenerator?: PatternStatementsGenerator;
@@ -396,7 +397,9 @@ export async function runPhaseCalibrationProfile(
   ctx: OperationContext,
   opts: CalibrationProfileOpts = {},
 ) {
-  return new CalibrationProfilePhase().run(ctx, opts);
+  const holder = await resolveUserHolder(ctx.engine, opts.holder);
+  const resolvedOpts: CalibrationProfileOpts = { ...opts, holder };
+  return new CalibrationProfilePhase().run(ctx, resolvedOpts);
 }
 
 export const __testing = {

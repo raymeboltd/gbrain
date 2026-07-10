@@ -49,6 +49,7 @@ import {
   unlinkSync,
   writeSync,
 } from 'node:fs';
+import { BUNDLED_SCHEMA_PACK_NAMES } from './base/embedded.ts';
 import { extname, join } from 'node:path';
 import { gbrainPath } from '../config.ts';
 import { computeManifestSha8, parseSchemaPackManifest } from './manifest-v1.ts';
@@ -93,7 +94,7 @@ export class SchemaPackMutationError extends Error {
   }
 }
 
-export const BUNDLED_PACK_NAMES = new Set(['gbrain-base', 'gbrain-recommended', 'gbrain-base-v2']);
+export const BUNDLED_PACK_NAMES = new Set(BUNDLED_SCHEMA_PACK_NAMES);
 
 export interface MutateResult {
   /** Pack name that was mutated. */

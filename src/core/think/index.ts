@@ -28,6 +28,7 @@ import { chat as gatewayChat, probeChatModel, type ChatResult } from '../ai/gate
 import { AIConfigError } from '../ai/errors.ts';
 import { normalizeModelId } from '../model-id.ts';
 import { hasAnthropicKey } from '../ai/anthropic-key.ts';
+import { resolveUserHolder } from '../calibration/user-holder.ts';
 
 /** Anthropic Messages client interface — same shape used by subagent.ts so test stubs can be shared. */
 export interface ThinkLLMClient {
@@ -307,8 +308,9 @@ export async function runThink(
   if (opts.withCalibration) {
     try {
       const { getLatestProfile } = await import('../../commands/calibration.ts');
+      const calibrationHolder = await resolveUserHolder(engine, opts.calibrationHolder);
       const profile = await getLatestProfile(engine, {
-        holder: opts.calibrationHolder ?? 'garry',
+        holder: calibrationHolder,
       });
       if (profile) {
         calibrationBlockOpts = {

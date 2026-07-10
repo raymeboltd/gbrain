@@ -61,6 +61,15 @@ export function isSourceFederated(config: unknown): boolean {
 }
 
 /**
+ * Per-source autopilot sync circuit breaker. Default-on preserves existing
+ * behavior; only the literal boolean false disables automatic freshness jobs.
+ * Manual `gbrain sync --source <id>` remains available for operator recovery.
+ */
+export function isSourceAutopilotSyncEnabled(config: unknown): boolean {
+  return parseSourceConfig(config).autopilot_sync !== false;
+}
+
+/**
  * Enumerate every source. Order: 'default' first, then alphabetical by id.
  *
  * Caller filters in-process when the predicate is cheap (federatedOnly,

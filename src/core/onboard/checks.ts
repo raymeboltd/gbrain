@@ -16,6 +16,7 @@
 // when ctx threads — onboard surface threads explicitly per A26.
 
 import type { BrainEngine } from '../engine.ts';
+import { loadConfig } from '../config.ts';
 import type { RemediationStep } from '../remediation-step.ts';
 import { makeRemediationStep } from '../remediation-step.ts';
 
@@ -393,7 +394,7 @@ export async function checkPackUpgradeAvailable(
     try {
       dbConfig = (await engine.getConfig('schema_pack')) ?? undefined;
     } catch { /* engine.config may not exist on very old brains */ }
-    const active = await loadActivePack({ cfg: null, remote: false, dbConfig })
+    const active = await loadActivePack({ cfg: loadConfig(), remote: false, dbConfig })
       .catch(() => null);
     if (!active) {
       return {
