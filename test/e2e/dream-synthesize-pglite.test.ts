@@ -127,7 +127,7 @@ describe('E2E synthesize — gateway-adapter mid-run AIConfigError catch (v0.41 
     // chat transport to throw AIConfigError on every call (simulates a
     // revoked key surfacing mid-run). The expected behavior: each
     // transcript records a "gateway error: ..." reason, worth=false, and
-    // the phase completes with status='ok' (NOT a crash).
+    // the phase completes with status='warn' (NOT a crash or false success).
     const { __setChatTransportForTests, resetGateway } = await import('../../src/core/ai/gateway.ts');
     const { AIConfigError } = await import('../../src/core/ai/errors.ts');
 
@@ -158,11 +158,13 @@ describe('E2E synthesize — gateway-adapter mid-run AIConfigError catch (v0.41 
         // The phase did NOT throw; it converted the AIConfigError into a
         // per-transcript "worth=false, reasons=['gateway error: ...']"
         // verdict and moved on.
-        expect(result.status).toBe('ok');
+        expect(result.status).toBe('warn');
         const verdicts = (result.details as { verdicts: Array<{ worth: boolean; reasons: string[] }> }).verdicts;
         expect(verdicts).toHaveLength(1);
         expect(verdicts[0].worth).toBe(false);
         expect(verdicts[0].reasons[0]).toMatch(/gateway error:.*simulated mid-run provider auth failure/);
+        expect((result.details as { verdict_failure_count: number }).verdict_failure_count).toBe(1);
+        expect(await rig.engine.getConfig('dream.synthesize.last_completion_ts')).toBeNull();
       } finally {
         if (savedKey === undefined) delete process.env.ANTHROPIC_API_KEY;
         else process.env.ANTHROPIC_API_KEY = savedKey;
@@ -190,7 +192,7 @@ describe('E2E synthesize — no API key skip path', () => {
           brainDir: rig.brainDir,
           dryRun: false,
         });
-        expect(result.status).toBe('ok');
+        expect(result.status).toBe('warn');
         expect((result.details as { transcripts_processed: number }).transcripts_processed).toBe(0);
         expect((result.details as { pages_written: number }).pages_written).toBe(0);
         const verdicts = (result.details as { verdicts: Array<{ worth: boolean; reasons: string[] }> }).verdicts;
@@ -223,7 +225,7 @@ describe('E2E synthesize — dry-run skips Sonnet (Codex finding #8)', () => {
           brainDir: rig.brainDir,
           dryRun: true,
         });
-        expect(result.status).toBe('ok');
+        expect(result.status).toBe('warn');
         expect((result.details as { dryRun: boolean }).dryRun).toBe(true);
         expect((result.details as { pages_written: number }).pages_written).toBe(0);
         expect(result.summary).toMatch(/dry-run/);
@@ -269,7 +271,7 @@ describe('E2E synthesize — cooldown', () => {
             dryRun: false,
             inputFile: adHoc,
           });
-          expect(result.status).toBe('ok');
+          expect(result.status).toBe('warn');
           expect((result.details as { reason?: string }).reason).toBeUndefined();
         });
       } finally {
@@ -408,7 +410,7 @@ describe('E2E synthesize — round-trip self-consumption guard (v0.23.2)', () =>
           }),
         );
 
-        expect(result.status).toBe('ok');
+        expect(result.status).toBe('warn');
         // File was discovered — verdict array has the entry, even though
         // the no-key path makes it worth=false.
         const verdicts = (result.details as { verdicts: Array<{ worth: boolean; reasons: string[] }> }).verdicts;
@@ -466,7 +468,7 @@ describe('E2E synthesize — round-trip self-consumption guard (v0.23.2)', () =>
           }),
         );
 
-        expect(result.status).toBe('ok');
+        expect(result.status).toBe('warn');
         const verdicts = (result.details as { verdicts: Array<{ filePath: string; worth: boolean }> }).verdicts;
         // Exactly one verdict — the real transcript. The leaked file was
         // dropped at discovery before the verdict pass even started.

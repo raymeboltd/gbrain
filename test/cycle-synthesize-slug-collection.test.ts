@@ -92,6 +92,17 @@ describe('C6: collectChildPutPageSlugs survives double-encoded jsonb (#745)', ()
     expect(slugs).toContain('wiki/agents/test/double-encoded');
   });
 
+  test('stamps the orchestrator-owned source on every collected ref', async () => {
+    const refs = await collectChildPutPageSlugs(
+      engine as any,
+      [1001, 1002],
+      new Map(),
+      'vault',
+    );
+    expect(refs.length).toBe(2);
+    expect(refs.every((r: { source_id: string }) => r.source_id === 'vault')).toBe(true);
+  });
+
   test('skips rows without a slug field gracefully (no throw)', async () => {
     const db = (engine as any).db;
     await db.query(

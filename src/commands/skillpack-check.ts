@@ -17,8 +17,22 @@
  */
 
 import { execFileSync } from 'child_process';
+import { existsSync } from 'fs';
 import { VERSION } from '../version.ts';
 import { getCliOptions } from '../core/cli-options.ts';
+import { loadConfig } from '../core/config.ts';
+
+interface SpawnTarget {
+  cmd: string;
+  prefix: string[];
+}
+
+interface SpawnResolutionInput {
+  argv1: string;
+  argv0: string;
+  execPath: string;
+  exists: (path: string) => boolean;
+}
 
 /**
  * Resolve the gbrain binary + args for spawning subcommands from
@@ -27,19 +41,35 @@ import { getCliOptions } from '../core/cli-options.ts';
  *   - Running via `bun run src/cli.ts` (argv[1] is a .ts file): prefix with `bun run`.
  *   - Anything else: fall back to `which gbrain` on $PATH.
  */
-function gbrainSpawn(): { cmd: string; prefix: string[] } {
-  const arg1 = process.argv[1] ?? '';
-  if (arg1.endsWith('/gbrain') || arg1.endsWith('\\gbrain.exe')) {
-    return { cmd: arg1, prefix: [] };
+function resolveGbrainSpawn(input: SpawnResolutionInput): SpawnTarget {
+  const { argv1, argv0, execPath, exists } = input;
+  const isVirtual = (path: string) => path.startsWith('/$bunfs/') || path.includes('\\$bunfs\\');
+  const isReal = (path: string) => Boolean(path) && !isVirtual(path) && exists(path);
+  if ((argv1.endsWith('.ts') || argv1.endsWith('.mjs') || argv1.endsWith('.js')) && isReal(argv1)) {
+    const bun = (execPath.endsWith('/bun') || execPath.endsWith('\\bun.exe')) && isReal(execPath)
+      ? execPath
+      : 'bun';
+    return { cmd: bun, prefix: ['run', argv1] };
   }
-  if (arg1.endsWith('.ts') || arg1.endsWith('.mjs') || arg1.endsWith('.js')) {
-    return { cmd: 'bun', prefix: ['run', arg1] };
+  if ((argv1.endsWith('/gbrain') || argv1.endsWith('\\gbrain.exe')) && isReal(argv1)) {
+    return { cmd: argv1, prefix: [] };
   }
-  const execPath = process.execPath ?? '';
-  if (execPath.endsWith('/gbrain') || execPath.endsWith('\\gbrain.exe')) {
+  if ((execPath.endsWith('/gbrain') || execPath.endsWith('\\gbrain.exe')) && isReal(execPath)) {
     return { cmd: execPath, prefix: [] };
   }
+  if ((argv0.endsWith('/gbrain') || argv0.endsWith('\\gbrain.exe')) && isReal(argv0)) {
+    return { cmd: argv0, prefix: [] };
+  }
   return { cmd: 'gbrain', prefix: [] };
+}
+
+function gbrainSpawn(): SpawnTarget {
+  return resolveGbrainSpawn({
+    argv1: process.argv[1] ?? '',
+    argv0: process.argv0 ?? process.argv[0] ?? '',
+    execPath: process.execPath ?? '',
+    exists: existsSync,
+  });
 }
 
 interface DoctorCheck {
@@ -68,6 +98,7 @@ interface SkillpackReport {
     partial_count: number;
     applied_count: number;
     stdout: string;
+    skipped?: boolean;
   } | { error: string };
 }
 
@@ -98,6 +129,15 @@ function runDoctor(): SkillpackReport['doctor'] {
 }
 
 function runMigrationsList(): SkillpackReport['migrations'] {
+  if (loadConfig()?.remote_mcp?.mcp_url) {
+    return {
+      applied_count: 0,
+      pending_count: 0,
+      partial_count: 0,
+      stdout: 'Skipped on thin client; schema migrations are host-owned.',
+      skipped: true,
+    };
+  }
   const { cmd, prefix } = gbrainSpawn();
   try {
     const stdout = execFileSync(cmd, [...prefix, 'apply-migrations', '--list'], {
@@ -262,4 +302,4 @@ function isSkillpackCheckSubcommand(): boolean {
 }
 
 /** Exported for unit tests. */
-export const __testing = { buildReport, runDoctor, runMigrationsList };
+export const __testing = { buildReport, runDoctor, runMigrationsList, resolveGbrainSpawn };

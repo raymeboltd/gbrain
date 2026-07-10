@@ -33,7 +33,7 @@
 import type { BrainEngine, SourceRow } from '../core/engine.ts';
 import type { MinionQueue } from '../core/minions/queue.ts';
 import { NON_GLOBAL_PHASES, GLOBAL_PHASES, LAST_GLOBAL_AT_KEY } from '../core/cycle.ts';
-import { sourceConfigHasRemoteUrl } from '../core/sources-load.ts';
+import { sourceConfigHasRemoteUrl, isSourceAutopilotSyncEnabled } from '../core/sources-load.ts';
 
 const FULL_CYCLE_FLOOR_MIN = 60;
 
@@ -407,6 +407,15 @@ export async function dispatchPerSource(
       log(`[dispatch] job #${job.id} autopilot-cycle (legacy single-source)`);
     }
     return { dispatched: [], skipped_fresh: [], skipped_cap: [], skipped_cooldown: [], legacy_fallback: true };
+  }
+
+  // A source-level circuit breaker disables both freshness sync jobs and the
+  // per-source cycle, whose first phase also syncs. Keep the distinction from
+  // an absent sources table: if every known source is disabled, do no work;
+  // never fall back to an unscoped legacy cycle that would sync it anyway.
+  sources = sources.filter((source) => isSourceAutopilotSyncEnabled(source.config));
+  if (sources.length === 0) {
+    return { dispatched: [], skipped_fresh: [], skipped_cap: [], skipped_cooldown: [], legacy_fallback: false };
   }
 
   // #2194 fix #2: load recent per-source failures + cooldown knobs so a

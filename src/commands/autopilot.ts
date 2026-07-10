@@ -908,12 +908,13 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
         try {
           const { isFederatedV2Enabled } = await import('../core/feature-flags.ts');
           if (await isFederatedV2Enabled(engine)) {
-            const { loadAllSources, sourceConfigHasRemoteUrl } = await import('../core/sources-load.ts');
+            const { loadAllSources, sourceConfigHasRemoteUrl, isSourceAutopilotSyncEnabled } = await import('../core/sources-load.ts');
             const sources = await loadAllSources(engine);
             const intervalMs = baseInterval * 1000;
             const now = Date.now();
             for (const src of sources) {
               if (!src.local_path) continue;
+              if (!isSourceAutopilotSyncEnabled(src.config)) continue;
               const lastSyncMs = src.last_sync_at ? new Date(src.last_sync_at).getTime() : 0;
               const ageMs = now - lastSyncMs;
               if (ageMs < intervalMs) continue; // fresh enough

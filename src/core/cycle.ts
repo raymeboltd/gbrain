@@ -1848,15 +1848,13 @@ export async function runCycle(
         const { result, duration_ms } = await timePhase(() => runPhaseSynthesize(engine, {
           brainDir,
           dryRun,
+          sourceId: cycleSourceId,
           yieldDuringPhase: opts.yieldDuringPhase,
           inputFile: opts.synthInputFile,
           date: opts.synthDate,
           from: opts.synthFrom,
           to: opts.synthTo,
           bypassDreamGuard: opts.synthBypassDreamGuard,
-          // #1586: scope synthesized writes to the cycle's resolved source
-          // (explicit --source wins, else derived from the checkout dir).
-          sourceId: cycleSourceId,
           once: opts.onceForPhase === 'synthesize',
         }));
         result.duration_ms = duration_ms;

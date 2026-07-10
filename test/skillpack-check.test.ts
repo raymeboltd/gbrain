@@ -19,6 +19,7 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { execFileSync } from 'child_process';
+import { __testing } from '../src/commands/skillpack-check.ts';
 
 const CLI = join(__dirname, '..', 'src', 'cli.ts');
 
@@ -57,6 +58,70 @@ afterEach(() => {
 });
 
 describe('gbrain skillpack-check', () => {
+  test('compiled binary rejects nonexistent bunfs argv and uses real process.execPath', () => {
+    const target = __testing.resolveGbrainSpawn({
+      argv1: '/$bunfs/root/gbrain',
+      argv0: '/usr/local/bin/gbrain',
+      execPath: '/usr/local/bin/gbrain',
+      exists: () => true,
+    });
+
+    expect(target).toEqual({ cmd: '/usr/local/bin/gbrain', prefix: [] });
+  });
+
+  test('compiled binary falls back to PATH when every self path is virtual', () => {
+    const target = __testing.resolveGbrainSpawn({
+      argv1: '/$bunfs/root/gbrain',
+      argv0: '/$bunfs/root/gbrain',
+      execPath: '/$bunfs/root/gbrain',
+      exists: () => true,
+    });
+
+    expect(target).toEqual({ cmd: 'gbrain', prefix: [] });
+  });
+
+  test('source shim reuses the absolute Bun executable outside interactive PATH', () => {
+    const target = __testing.resolveGbrainSpawn({
+      argv1: '/srv/gbrain/repo/src/cli.ts',
+      argv0: '/home/gbrain/.bun/bin/bun',
+      execPath: '/home/gbrain/.bun/bin/bun',
+      exists: () => true,
+    });
+
+    expect(target).toEqual({
+      cmd: '/home/gbrain/.bun/bin/bun',
+      prefix: ['run', '/srv/gbrain/repo/src/cli.ts'],
+    });
+  });
+
+  test('thin client skips host-owned migration inspection', () => {
+    const configDir = join(tmp, '.gbrain');
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(join(configDir, 'config.json'), JSON.stringify({
+      engine: 'postgres',
+      remote_mcp: {
+        issuer_url: 'http://127.0.0.1:3131',
+        mcp_url: 'http://127.0.0.1:3131/mcp',
+        oauth_client_id: 'test-client',
+      },
+    }));
+    const previous = process.env.HOME;
+    process.env.HOME = tmp;
+    try {
+      const migrations = __testing.runMigrationsList();
+      expect(migrations).toEqual({
+        applied_count: 0,
+        pending_count: 0,
+        partial_count: 0,
+        stdout: 'Skipped on thin client; schema migrations are host-owned.',
+        skipped: true,
+      });
+    } finally {
+      if (previous === undefined) delete process.env.HOME;
+      else process.env.HOME = previous;
+    }
+  });
+
   test('healthy fresh install → exit 0, healthy:true, empty actions', () => {
     const result = run(['skillpack-check']);
     expect(result.exitCode).toBe(0);

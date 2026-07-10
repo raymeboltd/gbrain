@@ -32,6 +32,13 @@ describe('loadActivePack boundary helper', () => {
     expect(pack.manifest.page_types.length).toBeGreaterThan(0);
   });
 
+  test('canonical successor loads from the bundled asset registry', async () => {
+    _resetPackCacheForTests();
+    const pack = await loadActivePack({ cfg: null, remote: false, perCall: 'gbrain-base-v2' });
+    expect(pack.manifest.name).toBe('gbrain-base-v2');
+    expect(pack.manifest.page_types.length).toBeGreaterThan(0);
+  });
+
   test('tier-1 per-call wins when remote=false', async () => {
     _resetPackCacheForTests();
     const result = resolveActivePackNameOnly({

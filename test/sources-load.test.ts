@@ -13,6 +13,7 @@ import {
   parseSourceConfig,
   normalizeSourceConfig,
   isSourceFederated,
+  isSourceAutopilotSyncEnabled,
 } from '../src/core/sources-load.ts';
 
 let engine: PGLiteEngine;
@@ -194,5 +195,16 @@ describe('isSourceFederated', () => {
     expect(isSourceFederated({})).toBe(false);
     expect(isSourceFederated(null)).toBe(false);
     expect(isSourceFederated(['{"remote_url":"x"}', { federated: true }])).toBe(true);
+  });
+});
+
+describe('isSourceAutopilotSyncEnabled', () => {
+  test('defaults on and disables only for literal false', () => {
+    expect(isSourceAutopilotSyncEnabled({})).toBe(true);
+    expect(isSourceAutopilotSyncEnabled(null)).toBe(true);
+    expect(isSourceAutopilotSyncEnabled({ autopilot_sync: true })).toBe(true);
+    expect(isSourceAutopilotSyncEnabled({ autopilot_sync: 'false' })).toBe(true);
+    expect(isSourceAutopilotSyncEnabled({ autopilot_sync: false })).toBe(false);
+    expect(isSourceAutopilotSyncEnabled('{"autopilot_sync":false}')).toBe(false);
   });
 });
