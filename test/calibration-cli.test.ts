@@ -18,7 +18,7 @@ import { GBrainError } from '../src/core/types.ts';
 
 const { parseArgs } = __testing;
 
-function buildMockEngine(opts: { rows: CalibrationProfileRow[] }): {
+function buildMockEngine(opts: { rows: CalibrationProfileRow[]; userHolder?: string }): {
   engine: BrainEngine;
   capturedSql: string[];
   capturedParams: unknown[][];
@@ -27,6 +27,9 @@ function buildMockEngine(opts: { rows: CalibrationProfileRow[] }): {
   const capturedParams: unknown[][] = [];
   const engine = {
     kind: 'pglite',
+    async getConfig() {
+      return opts.userHolder ?? null;
+    },
     async executeRaw<T>(sql: string, params?: unknown[]): Promise<T[]> {
       capturedSql.push(sql);
       capturedParams.push(params ?? []);
@@ -199,6 +202,15 @@ describe('getCalibrationProfileOp (MCP)', () => {
     const ctx = buildCtx(engine);
     const result = await getCalibrationProfileOp(ctx, {});
     expect(result?.holder).toBe('garry');
+  });
+
+  test('uses the configured personal holder when omitted', async () => {
+    const { engine } = buildMockEngine({
+      rows: [buildProfile({ holder: 'self' })],
+      userHolder: 'self',
+    });
+    const result = await getCalibrationProfileOp(buildCtx(engine), {});
+    expect(result?.holder).toBe('self');
   });
 
   test('routes through sourceScopeOpts: scalar source-bound client gets source-scoped result', async () => {

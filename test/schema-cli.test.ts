@@ -58,11 +58,27 @@ describe('gbrain schema CLI (Phase C)', () => {
     expect(r.stdout + r.stderr).toMatch(/schema|active|list|show|validate|use/i);
   });
 
-  test('schema list shows gbrain-base bundled', () => {
+  test('schema list shows every bundled pack', () => {
     const r = gbrain(['schema', 'list']);
     expect(r.code).toBe(0);
     expect(r.stdout).toContain('Bundled packs:');
-    expect(r.stdout).toContain('gbrain-base');
+    for (const name of [
+      'gbrain-base',
+      'gbrain-recommended',
+      'gbrain-creator',
+      'gbrain-investor',
+      'gbrain-engineer',
+      'gbrain-everything',
+      'gbrain-base-v2',
+    ]) {
+      expect(r.stdout).toContain(name);
+    }
+  });
+
+  test('schema show can load the bundled canonical successor', () => {
+    const r = gbrain(['schema', 'show', 'gbrain-base-v2']);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain('gbrain-base-v2 v1.0.0');
   });
 
   test('schema show gbrain-base prints manifest details', () => {

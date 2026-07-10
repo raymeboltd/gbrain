@@ -29,10 +29,15 @@ beforeEach(async () => {
 const NOW = Date.parse('2026-05-22T12:00:00.000Z');
 const agoH = (h: number) => new Date(NOW - h * 3600_000).toISOString();
 
-async function seed(id: string, lastFullCycleAt?: string, opts: { local_path?: string | null } = {}): Promise<void> {
-  const config = lastFullCycleAt
-    ? JSON.stringify({ last_full_cycle_at: lastFullCycleAt })
-    : '{}';
+async function seed(
+  id: string,
+  lastFullCycleAt?: string,
+  opts: { local_path?: string | null; autopilot_sync?: boolean } = {},
+): Promise<void> {
+  const config = JSON.stringify({
+    ...(lastFullCycleAt ? { last_full_cycle_at: lastFullCycleAt } : {}),
+    ...(opts.autopilot_sync === undefined ? {} : { autopilot_sync: opts.autopilot_sync }),
+  });
   const localPath = opts.local_path === undefined ? `/tmp/${id}` : opts.local_path;
   await engine.executeRaw(
     `INSERT INTO sources (id, name, local_path, config, archived, created_at)
@@ -48,7 +53,7 @@ describe('doctor checkCycleFreshness', () => {
     await engine.executeRaw(`UPDATE sources SET local_path = NULL WHERE id = 'default'`);
     const result = await checkCycleFreshness(engine, { nowMs: NOW });
     expect(result.status).toBe('ok');
-    expect(result.message).toMatch(/No federated sources/);
+    expect(result.message).toMatch(/No autopilot-enabled sources/);
   });
 
   test('source with last_full_cycle_at 2h ago returns ok (under 6h warn)', async () => {
@@ -119,6 +124,14 @@ describe('doctor checkCycleFreshness', () => {
     // No federated sources to check; default is unsynced but filtered.
     const result = await checkCycleFreshness(engine, { nowMs: NOW });
     expect(result.status).toBe('ok');
-    expect(result.message).toMatch(/No federated sources/);
+    expect(result.message).toMatch(/No autopilot-enabled sources/);
+  });
+
+  test('autopilot-disabled source is excluded from cycle freshness', async () => {
+    await engine.executeRaw(`UPDATE sources SET local_path = NULL WHERE id = 'default'`);
+    await seed('raw-evidence', agoH(72), { autopilot_sync: false });
+    const result = await checkCycleFreshness(engine, { nowMs: NOW });
+    expect(result.status).toBe('ok');
+    expect(result.message).toMatch(/No autopilot-enabled sources/);
   });
 });

@@ -37,7 +37,7 @@ import type { BrainEngine } from '../engine.ts';
 import type { PhaseResult, PhaseError } from '../cycle.ts';
 import { MinionQueue } from '../minions/queue.ts';
 import { waitForCompletion, TimeoutError } from '../minions/wait-for-completion.ts';
-import type { MinionJobInput, SubagentHandlerData } from '../minions/types.ts';
+import type { MinionJob, MinionJobInput, SubagentHandlerData } from '../minions/types.ts';
 import { discoverTranscripts, type DiscoveredTranscript } from './transcript-discovery.ts';
 import { serializeMarkdown, serializePageToMarkdown } from '../markdown.ts';
 import type { Page, PageType } from '../types.ts';
@@ -75,6 +75,12 @@ const MIN_PROMPT_TOKENS = 100_000;
 const DEFAULT_MAX_CHUNKS = 24;
 /** Conservative default budget when model is unknown (200K × HEADROOM_RATIO). */
 const UNKNOWN_MODEL_BUDGET_TOKENS = 180_000;
+/**
+ * A terminal idempotent child may be retried once its last state change is a
+ * day old. retryJob() updates updated_at, so repeated dream cycles cannot
+ * hammer a broken provider more than once per window.
+ */
+const STALE_TERMINAL_RETRY_MS = 24 * 60 * 60 * 1000;
 
 /**
  * Compute per-chunk character budget for the resolved model + config override.
@@ -225,6 +231,8 @@ export function rewriteChunkedSlug(slug: string, hash6: string, idx: number): st
 export interface SynthesizePhaseOpts {
   brainDir: string;
   dryRun: boolean;
+  /** Source represented by brainDir. Omitted preserves legacy `default`. */
+  sourceId?: string;
   /** Generic in-cycle keepalive for cycle-lock TTL renewal during long waits. */
   yieldDuringPhase?: () => Promise<void>;
   /**
@@ -323,6 +331,7 @@ export async function runPhaseSynthesize(
     // Significance verdicts (cached in dream_verdicts; Haiku on miss).
     const worthProcessing: DiscoveredTranscript[] = [];
     const verdicts: Array<{ filePath: string; worth: boolean; reasons: string[]; cached: boolean }> = [];
+    let verdictFailureCount = 0;
     // Provider-aware judge client routes through gateway.chat, so any
     // configured provider works (Anthropic, DeepSeek, OpenRouter, Voyage,
     // Ollama, llama-server, etc.). Returns null when the resolved verdict
@@ -345,6 +354,7 @@ export async function runPhaseSynthesize(
           reasons: [`no configured provider for verdict model: ${config.verdictModel}`],
           cached: false,
         });
+        verdictFailureCount++;
         continue;
       }
       try {
@@ -364,6 +374,7 @@ export async function runPhaseSynthesize(
             reasons: [`gateway error: ${e.message}`],
             cached: false,
           });
+          verdictFailureCount++;
           continue;
         }
         throw e;
@@ -374,25 +385,39 @@ export async function runPhaseSynthesize(
     // but no Sonnet synthesis. Codex finding #8: --dry-run does NOT mean
     // "zero LLM calls"; it means "skip Sonnet."
     if (opts.dryRun) {
-      return ok(`dry-run: ${worthProcessing.length} of ${transcripts.length} transcripts would synthesize`, {
+      const details = {
         transcripts_discovered: transcripts.length,
         transcripts_processed: 0,
         pages_written: 0,
         verdicts,
+        verdict_failure_count: verdictFailureCount,
         dryRun: true,
-      });
+      };
+      return verdictFailureCount > 0
+        ? warn(
+            `dry-run incomplete: ${verdictFailureCount} significance verdict(s) could not run`,
+            details,
+          )
+        : ok(`dry-run: ${worthProcessing.length} of ${transcripts.length} transcripts would synthesize`, details);
     }
 
     if (worthProcessing.length === 0) {
       // Even with verdicts, the cooldown timestamp is updated only on a
       // real successful run — not on "nothing worth processing." Lets a
       // re-run pick up if a new transcript lands later.
-      return ok('all transcripts skipped by significance filter', {
+      const details = {
         transcripts_discovered: transcripts.length,
         transcripts_processed: 0,
         pages_written: 0,
         verdicts,
-      });
+        verdict_failure_count: verdictFailureCount,
+      };
+      return verdictFailureCount > 0
+        ? warn(
+            `synthesize incomplete: ${verdictFailureCount} significance verdict(s) could not run`,
+            details,
+          )
+        : ok('all transcripts skipped by significance filter', details);
     }
 
     // Fan-out: submit one subagent per worth-processing transcript (or one
@@ -405,6 +430,7 @@ export async function runPhaseSynthesize(
 
     const queue = new MinionQueue(engine);
     const childIds: number[] = [];
+    const retriedChildIds: number[] = [];
     /** Map child job_id → chunk metadata for D6 orchestrator-side slug rewrite. */
     const chunkInfo = new Map<number, { idx: number; hash6: string }>();
     /** Skip reasons for the cycle report (D5 cap hits, D8 legacy-key skips). */
@@ -463,6 +489,7 @@ export async function runPhaseSynthesize(
           prompt: buildSynthesisPrompt(t, chunks[i], i, chunks.length, priorContradictionsBlock),
           model: subagentModel,
           max_turns: 30,
+          source_id: opts.sourceId,
           allowed_slug_prefixes: allowedSlugPrefixes,
         };
         // Idempotency key parity:
@@ -480,17 +507,46 @@ export async function runPhaseSynthesize(
           idempotency_key,
           timeout_ms: 30 * 60 * 1000, // 30 min per chunk
         };
-        const child = await queue.add(
+        const existingOrNewChild = await queue.add(
           'subagent',
           childData as unknown as Record<string, unknown>,
           submitOpts,
           { allowProtectedSubmit: true },
         );
+        const { job: child, retried } = await maybeRetryStaleTerminalJob(
+          queue,
+          existingOrNewChild,
+        );
+        if (retried) retriedChildIds.push(child.id);
         childIds.push(child.id);
         if (isChunked) {
           chunkInfo.set(child.id, { idx: i, hash6 });
         }
       }
+    }
+
+    if (childIds.length === 0) {
+      const blockingSkips = skipReports.filter(
+        report => report.reason !== 'already_synthesized_legacy_single_chunk',
+      );
+      const details = {
+        transcripts_discovered: transcripts.length,
+        transcripts_processed: 0,
+        pages_written: 0,
+        written_slugs: [],
+        reverse_write_count: 0,
+        child_outcomes: [],
+        children_submitted: 0,
+        children_retried: retriedChildIds,
+        skips: skipReports,
+        verdicts,
+        verdict_failure_count: verdictFailureCount,
+        completion_timestamp_written: false,
+      };
+      if (verdictFailureCount > 0 || blockingSkips.length > 0) {
+        return warn('synthesize incomplete: no runnable child jobs were submitted', details);
+      }
+      return ok('all worth-processing transcripts were already synthesized', details);
     }
 
     // Wait for every child to reach a terminal state. Tick yieldDuringPhase
@@ -521,12 +577,23 @@ export async function runPhaseSynthesize(
     // D6 orchestrator slug rewrite: chunkInfo drives post-hoc rewrite of
     // bare-hash slugs to `<hash6>-c<idx>` so chunked siblings can't collide
     // even if Sonnet drops the chunk suffix.
-    // v0.32.8: refs carry source_id so reverseWriteRefs picks the correct
-    // (source, slug) row (currently always 'default' from subagent put_page).
-    const writtenRefs = await collectChildPutPageSlugs(engine, childIds, chunkInfo);
+    // Refs carry the active cycle source so reverseWriteRefs reads the exact
+    // (source, slug) rows written by the subagents.
+    const activeSourceId = opts.sourceId ?? 'default';
+    const writtenRefs = await collectChildPutPageSlugs(
+      engine,
+      childIds,
+      chunkInfo,
+      activeSourceId,
+    );
 
     // Dual-write: reverse-render each DB row → markdown file.
-    const reverseWriteCount = await reverseWriteRefs(engine, opts.brainDir, writtenRefs);
+    const reverseWriteCount = await reverseWriteRefs(
+      engine,
+      opts.brainDir,
+      writtenRefs,
+      activeSourceId,
+    );
 
     // Summary index page (deterministic; orchestrator-written via direct
     // engine.putPage so no allow-list path needed).
@@ -535,15 +602,40 @@ export async function runPhaseSynthesize(
     // Back-compat: writeSummaryPage takes string[] for display; map refs back to slugs.
     const writtenSlugs = writtenRefs.map(r => r.slug);
     if (SUMMARY_SLUG_RE.test(summarySlug)) {
-      await writeSummaryPage(engine, opts.brainDir, summarySlug, summaryDate, writtenSlugs, childOutcomes);
+      await writeSummaryPage(
+        engine,
+        opts.brainDir,
+        summarySlug,
+        summaryDate,
+        writtenSlugs,
+        childOutcomes,
+        activeSourceId,
+      );
     }
-
-    // Write completion timestamp ON SUCCESS only.
-    await engine.setConfig('dream.synthesize.last_completion_ts', new Date().toISOString());
 
     const ms = Date.now() - start;
     const submittedTranscripts = worthProcessing.length - skipReports.length;
-    return ok(`${submittedTranscripts} transcript(s) synthesized in ${(ms / 1000).toFixed(1)}s`, {
+    const incompleteChildren = childOutcomes.filter(outcome => outcome.status !== 'completed');
+    const warningReasons: string[] = [];
+    if (verdictFailureCount > 0) {
+      warningReasons.push(`${verdictFailureCount} significance verdict(s) failed`);
+    }
+    if (incompleteChildren.length > 0) {
+      warningReasons.push(`${incompleteChildren.length}/${childOutcomes.length} child job(s) incomplete`);
+    }
+    if (writtenSlugs.length === 0) {
+      warningReasons.push('no brain pages were written');
+    }
+
+    // Cooldown is evidence of a genuinely completed synthesis, not merely a
+    // terminal queue state. Failed/dead/cancelled children and zero-output
+    // runs stay immediately visible and retryable.
+    const completionTimestampWritten = warningReasons.length === 0;
+    if (completionTimestampWritten) {
+      await engine.setConfig('dream.synthesize.last_completion_ts', new Date().toISOString());
+    }
+
+    const details = {
       transcripts_discovered: transcripts.length,
       transcripts_processed: submittedTranscripts,
       pages_written: writtenSlugs.length,
@@ -557,11 +649,21 @@ export async function runPhaseSynthesize(
       // transcript for single-chunk). Differs from transcripts_processed
       // when chunking is in play.
       children_submitted: childIds.length,
+      children_retried: retriedChildIds,
       // D5 cap hits + D8 legacy-key skips. Empty when nothing skipped.
       skips: skipReports,
       summary_slug: summarySlug,
       verdicts,
-    });
+      verdict_failure_count: verdictFailureCount,
+      completion_timestamp_written: completionTimestampWritten,
+      warning_reasons: warningReasons,
+    };
+    return warningReasons.length > 0
+      ? warn(
+          `${submittedTranscripts} transcript(s) dispatched but synthesis is incomplete: ${warningReasons.join('; ')}`,
+          details,
+        )
+      : ok(`${submittedTranscripts} transcript(s) synthesized in ${(ms / 1000).toFixed(1)}s`, details);
   } catch (e) {
     return failed(makeError('InternalError', 'SYNTH_PHASE_FAIL',
       e instanceof Error ? (e.message || 'synthesize phase threw') : String(e)));
@@ -1011,6 +1113,7 @@ async function collectChildPutPageSlugs(
   engine: BrainEngine,
   childIds: number[],
   chunkInfo: Map<number, { idx: number; hash6: string }>,
+  sourceId = 'default',
 ): Promise<Array<{ slug: string; source_id: string }>> {
   if (childIds.length === 0) return [];
   // Raw fetch — NO SELECT DISTINCT. Preserves per-child slug duplicates so
@@ -1018,12 +1121,9 @@ async function collectChildPutPageSlugs(
   // properly-stored jsonb objects (input->>'slug') and double-encoded jsonb
   // strings from pre-fix data ((input #>> '{}')::jsonb->>'slug').
   //
-  // v0.32.8: returns Array<{slug, source_id}> instead of string[]. Subagent
-  // put_page tool schema doesn't expose source_id (subagents are scoped to
-  // a single source); default to 'default' for the current dream-cycle
-  // product behavior. Threading the source_id through reverseWriteRefs
-  // guarantees getPage targets the correct (source, slug) row instead of
-  // the first DB match.
+  // Subagents are bound to one source by handler data; tool input therefore
+  // does not expose source_id. Stamp the orchestrator-owned source here.
+  validateSourceId(sourceId);
   const rows = await engine.executeRaw<{ job_id: number; slug: string }>(
     `SELECT job_id,
             COALESCE(input->>'slug', (input #>> '{}')::jsonb->>'slug') AS slug
@@ -1039,7 +1139,7 @@ async function collectChildPutPageSlugs(
     const ci = chunkInfo.get(r.job_id);
     rewritten.add(ci ? rewriteChunkedSlug(r.slug, ci.hash6, ci.idx) : r.slug);
   }
-  return Array.from(rewritten).sort().map(slug => ({ slug, source_id: 'default' }));
+  return Array.from(rewritten).sort().map(slug => ({ slug, source_id: sourceId }));
 }
 
 /**
@@ -1074,7 +1174,9 @@ async function reverseWriteRefs(
   engine: BrainEngine,
   brainDir: string,
   refs: Array<{ slug: string; source_id: string }>,
+  activeSourceId = 'default',
 ): Promise<number> {
+  validateSourceId(activeSourceId);
   let count = 0;
   for (const { slug, source_id } of refs) {
     // v0.32.8 F6: validate source_id is filesystem-safe before any join().
@@ -1084,10 +1186,9 @@ async function reverseWriteRefs(
     const tags = await engine.getTags(slug, { sourceId: source_id });
     try {
       const md = renderPageToMarkdown(page, tags);
-      // v0.32.8 F6: non-default sources land at brainDir/.sources/<id>/<slug>.md
-      // so same-slug-different-source pages don't collide. Default-source
-      // pages stay at brainDir/<slug>.md so single-source brains see no change.
-      const filePath = source_id === 'default'
+      // brainDir is the checkout for activeSourceId. Foreign-source refs use
+      // the reserved shadow tree so same-slug pages cannot collide.
+      const filePath = source_id === activeSourceId
         ? join(brainDir, `${slug}.md`)
         : join(brainDir, '.sources', source_id, `${slug}.md`);
       mkdirSync(dirname(filePath), { recursive: true });
@@ -1134,7 +1235,9 @@ async function writeSummaryPage(
   summaryDate: string,
   writtenSlugs: string[],
   childOutcomes: Array<{ jobId: number; status: string }>,
+  sourceId = 'default',
 ): Promise<void> {
+  validateSourceId(sourceId);
   const completed = childOutcomes.filter(c => c.status === 'completed').length;
   const failed = childOutcomes.length - completed;
 
@@ -1177,7 +1280,7 @@ async function writeSummaryPage(
     compiled_truth: parsed.compiled_truth,
     timeline: parsed.timeline,
     frontmatter: parsed.frontmatter,
-  });
+  }, { sourceId });
 
   // Also write to disk (orchestrator dual-write).
   try {
@@ -1207,8 +1310,27 @@ function today(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
+async function maybeRetryStaleTerminalJob(
+  queue: MinionQueue,
+  job: MinionJob,
+  nowMs = Date.now(),
+): Promise<{ job: MinionJob; retried: boolean }> {
+  if (job.status !== 'failed' && job.status !== 'dead') {
+    return { job, retried: false };
+  }
+  if (nowMs - job.updated_at.getTime() < STALE_TERMINAL_RETRY_MS) {
+    return { job, retried: false };
+  }
+  const retried = await queue.retryJob(job.id);
+  return retried ? { job: retried, retried: true } : { job, retried: false };
+}
+
 function ok(summary: string, details: Record<string, unknown> = {}): PhaseResult {
   return { phase: 'synthesize', status: 'ok', duration_ms: 0, summary, details };
+}
+
+function warn(summary: string, details: Record<string, unknown> = {}): PhaseResult {
+  return { phase: 'synthesize', status: 'warn', duration_ms: 0, summary, details };
 }
 
 function skipped(reason: string, summary: string): PhaseResult {
@@ -1242,4 +1364,7 @@ function makeError(cls: string, code: string, message: string, hint?: string): P
 // double-encoded jsonb regression). Not part of the runtime contract.
 export const __testing = {
   collectChildPutPageSlugs,
+  maybeRetryStaleTerminalJob,
+  reverseWriteRefs,
+  writeSummaryPage,
 };

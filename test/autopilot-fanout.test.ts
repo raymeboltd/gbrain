@@ -205,6 +205,25 @@ describe('dispatchPerSource — integration with stubbed engine + queue', () => 
     expect(added.length).toBe(1);
   });
 
+  test('autopilot-disabled sources are omitted without legacy fallback', async () => {
+    const disabled = src('gmail-raw', undefined, { autopilot_sync: false });
+    const { engine, queue, added, fanoutOpts } = makeStubs([disabled]);
+    const result = await dispatchPerSource(engine, queue, fanoutOpts);
+    expect(result.legacy_fallback).toBe(false);
+    expect(result.dispatched).toEqual([]);
+    expect(added).toEqual([]);
+  });
+
+  test('autopilot-disabled source does not block healthy source dispatch', async () => {
+    const disabled = src('gmail-raw', undefined, { autopilot_sync: false });
+    const enabled = src('vault');
+    const { engine, queue, added, fanoutOpts } = makeStubs([disabled, enabled]);
+    const result = await dispatchPerSource(engine, queue, fanoutOpts);
+    expect(result.dispatched).toEqual(['vault']);
+    expect(added).toHaveLength(1);
+    expect((added[0].data as Record<string, unknown>).source_id).toBe('vault');
+  });
+
   test('per-source fan-out: 2 stale sources, both dispatched with distinct keys', async () => {
     const { engine, queue, added, fanoutOpts } = makeStubs([src('alpha'), src('beta')]);
     const result = await dispatchPerSource(engine, queue, fanoutOpts);

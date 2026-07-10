@@ -437,6 +437,14 @@ export interface SubagentHandlerData {
    */
   brain_id?: string;
   /**
+   * Source bound to every brain tool call made by this subagent.
+   *
+   * Omitted preserves the legacy `default` source. Dream-cycle callers set
+   * this to the active cycle source so synthesis cannot drift into a host
+   * source that is unrelated to the checkout being processed.
+   */
+  source_id?: string;
+  /**
    * Trusted-workspace allow-list for put_page (v0.23 dream cycle).
    *
    * When set, the subagent's put_page calls are bounded to slugs matching

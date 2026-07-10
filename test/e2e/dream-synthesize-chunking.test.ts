@@ -139,7 +139,7 @@ describe('E2E synthesize chunking — D5 cap hit', () => {
           dryRun: false,
         });
 
-        expect(result.status).toBe('ok');
+        expect(result.status).toBe('warn');
         const details = result.details as {
           children_submitted: number;
           skips: Array<{ filePath: string; reason: string }>;
@@ -235,7 +235,9 @@ describe('E2E synthesize chunking — fan-out shape', () => {
             dryRun: false,
           });
           const details = result.details as { children_submitted: number };
+          expect(result.status).toBe('warn');
           expect(details.children_submitted).toBe(1);
+          expect(await rig.engine.getConfig('dream.synthesize.last_completion_ts')).toBeNull();
         });
       });
 
@@ -275,6 +277,7 @@ describe('E2E synthesize chunking — fan-out shape', () => {
             dryRun: false,
           });
           const details = result.details as { children_submitted: number };
+          expect(result.status).toBe('warn');
           expect(details.children_submitted).toBeGreaterThan(1);
         });
       });
@@ -296,6 +299,90 @@ describe('E2E synthesize chunking — fan-out shape', () => {
         .sort((a, b) => a - b);
       const expected = Array.from({ length: rows.length }, (_, i) => i);
       expect(indices).toEqual(expected);
+    } finally {
+      await rig.cleanup();
+    }
+  }, 30_000);
+});
+
+describe('E2E synthesize idempotency — bounded retry and truthful status', () => {
+  test('dead child older than 24h is re-queued once and reported as retried', async () => {
+    const rig = await setupRig();
+    try {
+      await rig.engine.setConfig('dream.synthesize.enabled', 'true');
+      await rig.engine.setConfig('dream.synthesize.session_corpus_dir', rig.corpusDir);
+
+      const basename = '2026-05-10-stale-dead.txt';
+      const filePath = corpusPath(rig.corpusDir, basename);
+      const content = 'stale dead child retry evidence\n'.repeat(200);
+      writeFileSync(filePath, content);
+      const contentHash = await seedVerdict(rig.engine, filePath, content);
+      const key = `dream:synth:${filePath}:${contentHash.slice(0, 16)}`;
+      const seeded = await rig.engine.executeRaw<{ id: number }>(
+        `INSERT INTO minion_jobs
+           (name, queue, status, idempotency_key, error_text, finished_at, updated_at)
+         VALUES ('subagent', 'default', 'dead', $1, 'provider unavailable',
+                 now() - interval '25 hours', now() - interval '25 hours')
+         RETURNING id`,
+        [key],
+      );
+
+      await withSubagentAutoCancel(rig.engine, async () => {
+        const result = await runPhaseSynthesize(rig.engine, {
+          brainDir: rig.brainDir,
+          dryRun: false,
+        });
+        expect(result.status).toBe('warn');
+        const details = result.details as {
+          children_retried: number[];
+          child_outcomes: Array<{ jobId: number; status: string }>;
+          completion_timestamp_written: boolean;
+        };
+        expect(details.children_retried).toEqual([seeded[0].id]);
+        expect(details.child_outcomes).toEqual([{ jobId: seeded[0].id, status: 'cancelled' }]);
+        expect(details.completion_timestamp_written).toBe(false);
+      });
+
+      expect(await rig.engine.getConfig('dream.synthesize.last_completion_ts')).toBeNull();
+    } finally {
+      await rig.cleanup();
+    }
+  }, 30_000);
+
+  test('recent dead child is not re-queued and cannot stamp the cooldown', async () => {
+    const rig = await setupRig();
+    try {
+      await rig.engine.setConfig('dream.synthesize.enabled', 'true');
+      await rig.engine.setConfig('dream.synthesize.session_corpus_dir', rig.corpusDir);
+
+      const basename = '2026-05-10-recent-dead.txt';
+      const filePath = corpusPath(rig.corpusDir, basename);
+      const content = 'recent dead child remains quarantined\n'.repeat(200);
+      writeFileSync(filePath, content);
+      const contentHash = await seedVerdict(rig.engine, filePath, content);
+      const key = `dream:synth:${filePath}:${contentHash.slice(0, 16)}`;
+      const seeded = await rig.engine.executeRaw<{ id: number }>(
+        `INSERT INTO minion_jobs
+           (name, queue, status, idempotency_key, error_text, finished_at)
+         VALUES ('subagent', 'default', 'dead', $1, 'provider unavailable', now())
+         RETURNING id`,
+        [key],
+      );
+
+      const result = await runPhaseSynthesize(rig.engine, {
+        brainDir: rig.brainDir,
+        dryRun: false,
+      });
+      expect(result.status).toBe('warn');
+      const details = result.details as {
+        children_retried: number[];
+        child_outcomes: Array<{ jobId: number; status: string }>;
+        completion_timestamp_written: boolean;
+      };
+      expect(details.children_retried).toEqual([]);
+      expect(details.child_outcomes).toEqual([{ jobId: seeded[0].id, status: 'dead' }]);
+      expect(details.completion_timestamp_written).toBe(false);
+      expect(await rig.engine.getConfig('dream.synthesize.last_completion_ts')).toBeNull();
     } finally {
       await rig.cleanup();
     }

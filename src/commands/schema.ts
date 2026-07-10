@@ -47,7 +47,11 @@ import {
 } from '../core/schema-pack/index.ts';
 import type { SchemaPackManifest, PackPrimitive } from '../core/schema-pack/manifest-v1.ts';
 import { PACK_PRIMITIVES } from '../core/schema-pack/manifest-v1.ts';
-import { gbrainPath, loadConfig, configPath } from '../core/config.ts';
+import { gbrainPath, loadConfig, loadConfigFileOnly, configPath } from '../core/config.ts';
+import {
+  BUNDLED_SCHEMA_PACK_NAMES,
+  bundledSchemaPackPath,
+} from '../core/schema-pack/base/embedded.ts';
 
 export async function runSchema(args: string[]): Promise<void> {
   const sub = args[0];
@@ -179,7 +183,6 @@ async function runActive(_args: string[]): Promise<void> {
 }
 
 function runList(_args: string[]): void {
-  const bundled = ['gbrain-base', 'gbrain-recommended'];
   const installedDir = gbrainPath('schema-packs');
   const installed: string[] = [];
   if (existsSync(installedDir)) {
@@ -194,7 +197,7 @@ function runList(_args: string[]): void {
     }
   }
   console.log('Bundled packs:');
-  for (const name of bundled) console.log(`  ${name}`);
+  for (const name of BUNDLED_SCHEMA_PACK_NAMES) console.log(`  ${name}`);
   if (installed.length > 0) {
     console.log('\nInstalled packs (~/.gbrain/schema-packs/):');
     for (const name of installed) console.log(`  ${name}`);
@@ -355,7 +358,10 @@ function runUse(args: string[]): void {
   // Write to file-plane config (~/.gbrain/config.json schema_pack field).
   // Tier 6 in the resolution chain — tiers 1-5 (per-call, env, DB) can
   // still override this without editing the file.
-  const cfg = loadConfig() ?? { engine: 'pglite' as const };
+  // Preserve only durable file-plane state. loadConfig() includes transient
+  // env overrides and would persist DATABASE_URL-driven engine changes or
+  // environment-only secrets while merely switching a schema pack.
+  const cfg = loadConfigFileOnly() ?? { engine: 'pglite' as const };
   const updated = { ...cfg, schema_pack: packName };
   const cfgPath = configPath();
   mkdirSync(dirname(cfgPath), { recursive: true });
@@ -366,18 +372,8 @@ function runUse(args: string[]): void {
 }
 
 function packPathByName(name: string): string | null {
-  if (name === 'gbrain-base') {
-    // Resolve bundled YAML — try a few locations.
-    const here = dirname(new URL(import.meta.url).pathname);
-    const candidates = [
-      join(here, '..', 'core', 'schema-pack', 'base', 'gbrain-base.yaml'),
-      join(here, '..', '..', 'src', 'core', 'schema-pack', 'base', 'gbrain-base.yaml'),
-    ];
-    for (const c of candidates) {
-      if (existsSync(c)) return c;
-    }
-    return null;
-  }
+  const bundledPath = bundledSchemaPackPath(name);
+  if (bundledPath) return existsSync(bundledPath) ? bundledPath : null;
   const baseDir = gbrainPath('schema-packs', name);
   for (const c of ['pack.yaml', 'pack.yml', 'pack.json']) {
     const candidate = join(baseDir, c);

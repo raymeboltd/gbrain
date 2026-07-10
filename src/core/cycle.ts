@@ -1669,6 +1669,7 @@ export async function runCycle(
         const { result, duration_ms } = await timePhase(() => runPhaseSynthesize(engine, {
           brainDir,
           dryRun,
+          sourceId: cycleSourceId,
           yieldDuringPhase: opts.yieldDuringPhase,
           inputFile: opts.synthInputFile,
           date: opts.synthDate,
@@ -1877,6 +1878,7 @@ export async function runCycle(
         const { result, duration_ms } = await timePhase(() => runPhasePatterns(engine, {
           brainDir,
           dryRun,
+          sourceId: cycleSourceId,
           yieldDuringPhase: opts.yieldDuringPhase,
         }));
         result.duration_ms = duration_ms;

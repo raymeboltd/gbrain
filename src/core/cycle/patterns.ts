@@ -31,6 +31,8 @@ import type { Page, PageType } from '../types.ts';
 export interface PatternsPhaseOpts {
   brainDir: string;
   dryRun: boolean;
+  /** Source represented by brainDir. Omitted preserves legacy `default`. */
+  sourceId?: string;
   yieldDuringPhase?: () => Promise<void>;
 }
 
@@ -47,7 +49,8 @@ export async function runPhasePatterns(
     }
 
     // Gather reflections within lookback window.
-    const reflections = await gatherReflections(engine, config.lookbackDays);
+    const activeSourceId = opts.sourceId ?? 'default';
+    const reflections = await gatherReflections(engine, config.lookbackDays, activeSourceId);
     if (reflections.length < config.minEvidence) {
       return skipped(
         'insufficient_evidence',
@@ -79,6 +82,7 @@ export async function runPhasePatterns(
       prompt: buildPatternsPrompt(reflections, config.minEvidence),
       model: config.model,
       max_turns: 30,
+      source_id: activeSourceId,
       allowed_slug_prefixes: allowedSlugPrefixes,
     };
     const submitOpts: Partial<MinionJobInput> = {
@@ -108,10 +112,15 @@ export async function runPhasePatterns(
     // Collect refs the subagent wrote (codex finding #2 — query tool exec rows).
     // v0.32.8: refs carry source_id so reverseWriteRefs targets the right
     // (source, slug) row instead of the first DB match.
-    const writtenRefs = await collectChildPutPageSlugs(engine, [job.id]);
+    const writtenRefs = await collectChildPutPageSlugs(engine, [job.id], activeSourceId);
 
     // Reverse-write to fs.
-    const reverseWriteCount = await reverseWriteRefs(engine, opts.brainDir, writtenRefs);
+    const reverseWriteCount = await reverseWriteRefs(
+      engine,
+      opts.brainDir,
+      writtenRefs,
+      activeSourceId,
+    );
 
     return ok(`${writtenRefs.length} pattern page(s) written/updated (${outcome})`, {
       reflections_considered: reflections.length,
@@ -169,16 +178,20 @@ interface ReflectionRef {
 async function gatherReflections(
   engine: BrainEngine,
   lookbackDays: number,
+  sourceId = 'default',
 ): Promise<ReflectionRef[]> {
+  validateSourceId(sourceId);
   const since = new Date(Date.now() - lookbackDays * 24 * 60 * 60 * 1000).toISOString();
   const rows = await engine.executeRaw<{ slug: string; title: string | null; compiled_truth: string | null }>(
     `SELECT slug, title, compiled_truth
-       FROM pages
+      FROM pages
       WHERE slug LIKE 'wiki/personal/reflections/%'
+        AND source_id = $2
+        AND deleted_at IS NULL
         AND updated_at >= $1::timestamptz
       ORDER BY updated_at DESC
       LIMIT 100`,
-    [since],
+    [since, sourceId],
   );
   return rows.map(r => ({
     slug: r.slug,
@@ -224,13 +237,10 @@ When done, briefly list the pattern slugs you wrote/updated in your final messag
 async function collectChildPutPageSlugs(
   engine: BrainEngine,
   childIds: number[],
+  sourceId = 'default',
 ): Promise<Array<{ slug: string; source_id: string }>> {
   if (childIds.length === 0) return [];
-  // v0.32.8: subagent put_page tool schema doesn't expose source_id (subagents
-  // are scoped to a single source). Default to 'default' here; multi-source
-  // dream cycles are a v0.33 follow-up. The point of threading source_id is
-  // so reverseWriteRefs can pass it through getPage and pick the correct
-  // (source_id, slug) row instead of whatever the DB happens to return.
+  validateSourceId(sourceId);
   const rows = await engine.executeRaw<{ slug: string }>(
     `SELECT DISTINCT
             COALESCE(input->>'slug', (input #>> '{}')::jsonb->>'slug') AS slug
@@ -244,7 +254,7 @@ async function collectChildPutPageSlugs(
   return rows
     .map(r => r.slug)
     .filter((s): s is string => typeof s === 'string' && s.length > 0)
-    .map(slug => ({ slug, source_id: 'default' }));
+    .map(slug => ({ slug, source_id: sourceId }));
 }
 
 // ── Reverse-write ────────────────────────────────────────────────────
@@ -255,7 +265,9 @@ async function reverseWriteRefs(
   engine: BrainEngine,
   brainDir: string,
   refs: Array<{ slug: string; source_id: string }>,
+  activeSourceId = 'default',
 ): Promise<number> {
+  validateSourceId(activeSourceId);
   let count = 0;
   for (const { slug, source_id } of refs) {
     // v0.32.8 F6: guard against malformed source_id (would let join() break
@@ -266,11 +278,9 @@ async function reverseWriteRefs(
     const tags = await engine.getTags(slug, { sourceId: source_id });
     try {
       const md = renderPageToMarkdown(page, tags);
-      // v0.32.8 F6: non-default sources land under brainDir/.sources/<id>/<slug>.md
-      // so same-slug-different-source pages don't collide on disk. Default-source
-      // pages stay at brainDir/<slug>.md so single-source brains see no change.
-      // `.sources/` is a reserved prefix; walkBrainRepo skips dot-dirs.
-      const filePath = source_id === 'default'
+      // brainDir is the checkout for activeSourceId. Foreign-source refs use
+      // the reserved shadow tree so same-slug pages cannot collide on disk.
+      const filePath = source_id === activeSourceId
         ? join(brainDir, `${slug}.md`)
         : join(brainDir, '.sources', source_id, `${slug}.md`);
       mkdirSync(dirname(filePath), { recursive: true });
@@ -349,3 +359,9 @@ function failed(error: PhaseError): PhaseResult {
 function makeError(cls: string, code: string, message: string, hint?: string): PhaseError {
   return hint ? { class: cls, code, message, hint } : { class: cls, code, message };
 }
+
+export const __testing = {
+  gatherReflections,
+  collectChildPutPageSlugs,
+  reverseWriteRefs,
+};

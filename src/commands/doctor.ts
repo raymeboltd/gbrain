@@ -42,6 +42,7 @@ import { isSourceUnchangedSinceSync } from '../core/git-head.ts';
 // v0.41.32.0: remote staleness reads the stored newest_content_at column via
 // this pure comparator (no git subprocess on the HTTP MCP doctor path).
 import { lagFromContentMs } from '../core/source-health.ts';
+import { isSourceAutopilotSyncEnabled } from '../core/sources-load.ts';
 import { CHUNKER_VERSION } from '../core/chunkers/code.ts';
 import { LINK_EXTRACTOR_VERSION_TS } from '../core/link-extraction.ts';
 import { isUndefinedColumnError } from '../core/utils.ts';
@@ -51,6 +52,7 @@ import { isUndefinedColumnError } from '../core/utils.ts';
 // drift from what search actually filters.
 import { resolveHardExcludes, DEFAULT_HARD_EXCLUDES } from '../core/search/source-boost.ts';
 import { escapeLikePattern, buildVisibilityClause } from '../core/search/sql-ranking.ts';
+import { resolveUserHolder } from '../core/calibration/user-holder.ts';
 
 export interface Check {
   name: string;
@@ -1223,14 +1225,16 @@ export async function checkAbandonedThreads(engine: BrainEngine): Promise<Check>
 
 /**
  * calibration_freshness: warns when the active calibration profile is
- * older than 7 days (configurable). Default holder 'garry'. Multi-source
+ * older than 7 days (configurable). Uses the configured user holder. Multi-source
  * brains see one row per source; this check uses the most recent across
  * all sources.
  */
 export async function checkCalibrationFreshness(engine: BrainEngine): Promise<Check> {
   try {
+    const holder = await resolveUserHolder(engine);
     const rows = await engine.executeRaw<{ generated_at: Date | null }>(
-      `SELECT MAX(generated_at) AS generated_at FROM calibration_profiles WHERE holder = 'garry'`,
+      `SELECT MAX(generated_at) AS generated_at FROM calibration_profiles WHERE holder = $1`,
+      [holder],
     );
     const generated = rows[0]?.generated_at;
     if (!generated) {
@@ -3790,12 +3794,13 @@ export async function checkCycleFreshness(
   opts?: { nowMs?: number },
 ): Promise<Check> {
   try {
-    const sources = await engine.listAllSources({ localPathOnly: true });
+    const allSources = await engine.listAllSources({ localPathOnly: true });
+    const sources = allSources.filter((source) => isSourceAutopilotSyncEnabled(source.config));
     if (sources.length === 0) {
       return {
         name: 'cycle_freshness',
         status: 'ok',
-        message: 'No federated sources to cycle',
+        message: 'No autopilot-enabled sources to cycle',
       };
     }
 
@@ -3858,7 +3863,7 @@ export async function checkCycleFreshness(
     return {
       name: 'cycle_freshness',
       status: 'ok',
-      message: `All ${sources.length} federated source(s) cycled recently`,
+      message: `All ${sources.length} autopilot-enabled source(s) cycled recently`,
     };
   } catch (e) {
     return {
