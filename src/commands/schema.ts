@@ -430,15 +430,11 @@ function parseFlags(args: string[]): ParsedFlags {
 async function withConnectedEngine<T>(fn: (engine: import('../core/engine.ts').BrainEngine) => Promise<T>): Promise<T> {
   const { createEngine } = await import('../core/engine-factory.ts');
   const cfg = loadConfig() ?? {};
-  const engineKind = (cfg as { engine?: string }).engine === 'postgres' ? 'postgres' : 'pglite';
   // PR #1321 (closed) defensive fix retained: build the EngineConfig once and
   // pass it to BOTH createEngine and engine.connect. The factory captures
   // config at construction; explicit re-pass at connect() is defense in depth
   // against future engine implementations that read URL from connect-time.
-  const connectConfig: import('../core/types.ts').EngineConfig = {
-    engine: engineKind,
-    database_url: (cfg as { database_url?: string }).database_url,
-  };
+  const connectConfig = schemaEngineConfig(cfg);
   const engine = await createEngine(connectConfig);
   await engine.connect(connectConfig);
   try {
@@ -446,6 +442,16 @@ async function withConnectedEngine<T>(fn: (engine: import('../core/engine.ts').B
   } finally {
     await engine.disconnect();
   }
+}
+
+export function schemaEngineConfig(
+  cfg: { engine?: string; database_url?: string; database_path?: string },
+): import('../core/types.ts').EngineConfig {
+  return {
+    engine: cfg.engine === 'postgres' ? 'postgres' : 'pglite',
+    database_url: cfg.database_url,
+    database_path: cfg.database_path,
+  };
 }
 
 // ------------- T2: schema detect ----------------------------------

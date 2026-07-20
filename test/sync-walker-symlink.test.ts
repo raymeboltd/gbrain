@@ -13,9 +13,11 @@
  * 6. Multimodal preservation under markdown-strategy (codex C5).
  * 7. Deterministic ordering — runImport's index-based resume depends on it
  *    (codex C8).
+ * 8. Git and filesystem enumeration share canonical admission policy.
  */
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync } from 'fs';
+import { execSync } from 'child_process';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { collectSyncableFiles } from '../src/commands/import.ts';
@@ -34,7 +36,7 @@ afterEach(() => {
 describe('collectSyncableFiles symlink + cycle hardening', () => {
   test('1. self-referencing symlink does not loop', async () => {
     await withEnv({ GBRAIN_EMBEDDING_MULTIMODAL: undefined }, () => {
-      writeFileSync(join(tmp, 'README.md'), '# top\n');
+      writeFileSync(join(tmp, 'page.md'), '# top\n');
       // Symlink "loop" inside tempdir pointing back to itself.
       symlinkSync(tmp, join(tmp, 'loop'));
 
@@ -43,7 +45,7 @@ describe('collectSyncableFiles symlink + cycle hardening', () => {
       const ms = Date.now() - t0;
 
       expect(ms).toBeLessThan(1000); // would hang if walker followed the loop
-      expect(files).toContain(join(tmp, 'README.md'));
+      expect(files).toContain(join(tmp, 'page.md'));
       expect(files.every(f => !f.includes('/loop/'))).toBe(true);
     });
   });
@@ -88,7 +90,7 @@ describe('collectSyncableFiles symlink + cycle hardening', () => {
 
   test('4. strategy filter admits the right files', async () => {
     await withEnv({ GBRAIN_EMBEDDING_MULTIMODAL: undefined }, () => {
-      writeFileSync(join(tmp, 'README.md'), '# r\n');
+      writeFileSync(join(tmp, 'page.md'), '# r\n');
       writeFileSync(join(tmp, 'foo.ts'), '// f\n');
       writeFileSync(join(tmp, 'bar.py'), '# b\n');
 
@@ -97,8 +99,8 @@ describe('collectSyncableFiles symlink + cycle hardening', () => {
       const auto = collectSyncableFiles(tmp, { strategy: 'auto' });
 
       expect(code.map(f => f.split('/').pop()).sort()).toEqual(['bar.py', 'foo.ts']);
-      expect(markdown.map(f => f.split('/').pop())).toEqual(['README.md']);
-      expect(auto.map(f => f.split('/').pop()).sort()).toEqual(['README.md', 'bar.py', 'foo.ts']);
+      expect(markdown.map(f => f.split('/').pop())).toEqual(['page.md']);
+      expect(auto.map(f => f.split('/').pop()).sort()).toEqual(['bar.py', 'foo.ts', 'page.md']);
     });
   });
 
@@ -159,6 +161,27 @@ describe('collectSyncableFiles symlink + cycle hardening', () => {
       expect(first.map(f => f.replace(tmp, ''))).toEqual([
         '/a.md', '/b.md', '/sub/c.md',
       ]);
+    });
+  });
+
+  test('8. Git and filesystem walkers share ops + metafile admission policy', async () => {
+    await withEnv({ GBRAIN_EMBEDDING_MULTIMODAL: undefined }, () => {
+      writeFileSync(join(tmp, 'page.md'), 'page\n');
+      writeFileSync(join(tmp, 'README.md'), 'meta\n');
+      mkdirSync(join(tmp, 'ops'), { recursive: true });
+      writeFileSync(join(tmp, 'ops/secret.md'), 'operational state\n');
+      mkdirSync(join(tmp, 'nested'), { recursive: true });
+      writeFileSync(join(tmp, 'nested/log.md'), 'meta\n');
+
+      execSync('git init -q', { cwd: tmp, stdio: 'pipe' });
+      execSync('git add -f page.md README.md ops/secret.md nested/log.md', { cwd: tmp, stdio: 'pipe' });
+      const gitFiles = collectSyncableFiles(tmp, { strategy: 'markdown' });
+
+      rmSync(join(tmp, '.git'), { recursive: true, force: true });
+      const fsFiles = collectSyncableFiles(tmp, { strategy: 'markdown' });
+
+      expect(gitFiles).toEqual([join(tmp, 'page.md')]);
+      expect(fsFiles).toEqual(gitFiles);
     });
   });
 });

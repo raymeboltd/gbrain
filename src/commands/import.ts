@@ -11,6 +11,7 @@ import {
   isCodeFilePath,
   isMarkdownFilePath,
   isImageFilePath as isImageFilePathFromSync,
+  isSyncable,
   pruneDir,
   type SyncStrategy,
 } from '../core/sync.ts';
@@ -514,6 +515,24 @@ function isCollectibleForWalker(
 }
 
 /**
+ * One admission contract for both the Git fast path and recursive walker.
+ * Strategy decides the file kind; isSyncable adds canonical path, metafile,
+ * include/exclude, and pruned-directory policy. Markdown's historical
+ * multimodal carve-out is preserved by checking images through auto strategy.
+ */
+function isAdmittedForCollection(
+  path: string,
+  strategy: SyncStrategy,
+  multimodalOn: boolean,
+): boolean {
+  if (!isCollectibleForWalker(path, strategy, multimodalOn)) return false;
+  if (strategy === 'markdown' && multimodalOn && isImageFilePathFromSync(path)) {
+    return isSyncable(path, { strategy: 'auto' });
+  }
+  return isSyncable(path, { strategy });
+}
+
+/**
  * Git-aware fast path for `collectSyncableFiles`. Returns the strategy-filtered
  * list of syncable files when `dir` is inside a git work tree (paths absolute,
  * sorted), or `null` when `dir` is not a git repo / git is unavailable — in
@@ -544,7 +563,7 @@ function gitListSyncableFiles(
   const files: string[] = [];
   for (const rel of stdout.split('\0')) {
     if (!rel) continue;
-    if (!isCollectibleForWalker(rel, strategy, multimodalOn)) continue;
+    if (!isAdmittedForCollection(rel, strategy, multimodalOn)) continue;
     const full = join(dir, rel);
     let st;
     try {
@@ -636,7 +655,8 @@ export function collectSyncableFiles(dir: string, opts: CollectOpts = {}): strin
         visitedInodes.set(inodeKey, true);
         walk(full, depth + 1);
       } else if (stat.isFile()) {
-        if (!isCollectibleForWalker(entry, strategy, multimodalOn)) continue;
+        const rel = relative(dir, full);
+        if (!isAdmittedForCollection(rel, strategy, multimodalOn)) continue;
         files.push(full);
       }
     }
