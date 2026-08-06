@@ -70,6 +70,8 @@ const RESCUE_SLUG_PREFIXES = ['meetings/', 'personal/', 'daily/'] as const;
 const ELIGIBLE_TYPES: PageType[] = [
   // gbrain-base (legacy) types
   'note', 'meeting', 'slack', 'email', 'calendar-event', 'source', 'writing',
+  // personal pack (fdb82e58): granola collector types meetings as meeting-note
+  'meeting-note',
   // gbrain-base-v2 canonical types declared extractable in the pack
   // (concept deliberately omitted — see above)
   'media', 'tweet', 'atom', 'analysis',
