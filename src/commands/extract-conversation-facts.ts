@@ -190,7 +190,7 @@ export const DEFAULT_MAX_COST_USD = 5.0;
  */
 export const ALLOWED_TYPE_ALIASES: Record<AllowedType, readonly string[]> = {
   conversation: ['conversation'],
-  meeting: ['meeting'],
+  meeting: ['meeting', 'meeting-note'], // personal pack (fdb82e58): granola collector types meetings as meeting-note
   slack: ['slack', 'slack-dm-day', 'slack-thread'],
   email: ['email', 'email-digest'],
   imessage: ['imessage'],
