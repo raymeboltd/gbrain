@@ -72,6 +72,9 @@ const ELIGIBLE_TYPES: PageType[] = [
   'note', 'meeting', 'slack', 'email', 'calendar-event', 'source', 'writing',
   // personal pack (fdb82e58): granola collector types meetings as meeting-note
   'meeting-note',
+  // personal pack: chat day-rollups (chat-rollup.py, both beeper/WhatsApp and
+  // iMessage networks) reuse upstream's imessage-daily input contract
+  'imessage-daily',
   // gbrain-base-v2 canonical types declared extractable in the pack
   // (concept deliberately omitted — see above)
   'media', 'tweet', 'atom', 'analysis',
