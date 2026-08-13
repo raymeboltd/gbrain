@@ -31,7 +31,7 @@ import { CJK_SLUG_CHARS } from './cjk.ts';
 import { stripCodeBlocks } from './link-extraction.ts';
 
 /** D2: hardcoded entity types for v1. Pack-aware extension is TODO-1. */
-export const LINKABLE_ENTITY_TYPES = ['person', 'company', 'organization', 'entity'] as const;
+export const LINKABLE_ENTITY_TYPES = ['person', 'company', 'organization', 'entity', 'project', 'deal'] as const;
 
 /**
  * Minimum title length for gazetteer inclusion. Filters out 2-3 char names
