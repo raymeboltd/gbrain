@@ -20,6 +20,8 @@ writes_to:
   - people/
   - companies/
   - concepts/
+  - originals/
+  - ideas/
 ---
 
 # Signal Detector — Ambient Brain Capture
