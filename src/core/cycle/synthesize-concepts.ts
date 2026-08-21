@@ -50,6 +50,14 @@ const TIER_T3_MIN = 2;
 
 export interface SynthesizeConceptsOpts {
   brainDir?: string;
+  /**
+   * 2026-08-21 (fork): the cycle's resolved source scope (cycleSourceId).
+   * Without it every write below fell through to the engine's `?? 'default'`
+   * literal — fatal on a brain whose sole source is not named `default`
+   * (createVersion threw "page ... (source=default) not found" on the first
+   * global-maintenance run after the one-source migration).
+   */
+  sourceId?: string;
   dryRun?: boolean;
   yieldDuringPhase?: (() => Promise<void>) | undefined;
   /**
@@ -256,6 +264,7 @@ export async function runPhaseSynthesizeConcepts(
       );
       await importFromContent(engine, `concepts/${title}`, md, {
         noEmbed: !isAvailable('embedding'),
+        sourceId: opts.sourceId,
       });
     }
     conceptsWritten++;
@@ -269,15 +278,16 @@ export async function runPhaseSynthesizeConcepts(
   }
 
   // v0.42 Wave B3: receipt + rollup for synthesize_concepts. Brain-global
-  // phase — uses 'default' source_id because concepts span sources. Receipt
-  // only fires when concepts were actually written; rollup always fires so
-  // doctor sees the phase ran.
+  // phase — receipt/rollup carry the cycle's resolved source (opts.sourceId);
+  // the 'default' fallback survives only for engines with a real default
+  // source. Receipt only fires when concepts were actually written; rollup
+  // always fires so doctor sees the phase ran.
   if (!opts.dryRun && conceptsWritten > 0) {
     const runId = `concepts-${Date.now().toString(36)}`;
     try {
       await writeReceipt(engine, {
         kind: 'concepts',
-        source_id: 'default',
+        source_id: opts.sourceId ?? 'default',
         run_id: runId,
         round: 'single',
         extracted_at: new Date().toISOString(),
@@ -295,7 +305,7 @@ export async function runPhaseSynthesizeConcepts(
   if (!opts.dryRun) {
     await upsertExtractRollup(engine, {
       kind: 'concepts',
-      source_id: 'default',
+      source_id: opts.sourceId ?? 'default',
       cost_delta: estimatedSpendUsd,
       round_completed_delta: failures.length === 0 ? 1 : 0,
       halt_delta: failures.length > 0 ? 1 : 0,
