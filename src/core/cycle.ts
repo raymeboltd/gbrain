@@ -2698,6 +2698,8 @@ export async function runCycle(
             dryRun,
             brainDir: brainDir ?? undefined,
             forceEnabled: opts.onceForPhase === 'drift',
+            // fork(2026-08-24): thread the cycle source — see DriftPhaseOpts.sourceId
+            sourceId: cycleSourceId,
           });
           const status: PhaseStatus =
             r.status === 'complete' ? 'ok' :
