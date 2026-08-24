@@ -434,8 +434,21 @@ export async function dispatchPerSource(
     cooldownOpts = { baseMin: 0, capMin: FAILURE_COOLDOWN_CAP_MIN };
   }
 
+  // fork(2026-08-24): configurable per-source floor. The hardcoded 60-min
+  // floor means any brain whose cycles run via a nightly cron lane (8d ruling:
+  // fan-out enrichment retired) gets HOURLY full per-source cycles the moment
+  // last_source_cycle_at first gets stamped - 24x the intended cadence, each
+  // tick spending propose_takes/extract_atoms budgets. Mirrors
+  // autopilot.global_floor_min (read at :552).
+  let sourceFloorMin = FULL_CYCLE_FLOOR_MIN;
+  try {
+    const sfRaw = await engine.getConfig('autopilot.source_floor_min');
+    const sf = sfRaw ? parseInt(sfRaw, 10) : NaN;
+    if (Number.isFinite(sf) && sf > 0) sourceFloorMin = sf;
+  } catch { /* default stands */ }
+
   const { dispatch, skippedFresh, skippedCap, skippedCooldown } =
-    selectSourcesForDispatch(sources, opts.fanoutMax, Date.now(), FULL_CYCLE_FLOOR_MIN, recentFailures, cooldownOpts);
+    selectSourcesForDispatch(sources, opts.fanoutMax, Date.now(), sourceFloorMin, recentFailures, cooldownOpts);
 
   const dispatched: string[] = [];
   for (const src of dispatch) {
