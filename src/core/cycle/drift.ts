@@ -34,6 +34,14 @@ export interface DriftPhaseOpts {
   auditPath?: string;
   /** issue #2860 --once: bypass the dream.drift.enabled gate for this run only. */
   forceEnabled?: boolean;
+  /**
+   * fork(2026-08-24): the brain source the cycle is scoped to (cycleSourceId).
+   * Without it the report putPage falls back to the literal 'default' source
+   * (postgres-engine substitutes it), which throws an FK violation on brains
+   * where 'default' was removed — same bug class as b133e58a's
+   * synthesize_concepts fix, and the throw is uncontained (kills the cycle).
+   */
+  sourceId?: string;
   /** Inject the judge model call (tests). Defaults to gateway chat. */
   judge?: DriftJudgeFn;
 }
@@ -350,7 +358,7 @@ export async function runPhaseDrift(
       type: 'report',
       title: `Drift report ${date}`,
       compiled_truth: buildReportBody(judged, config, modelId),
-    });
+    }, opts.sourceId ? { sourceId: opts.sourceId } : undefined);
   }
 
   const detail =
