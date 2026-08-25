@@ -46,6 +46,12 @@ export interface ExtractNerResult {
   created: number;
   /** Pages where the active schema pack had no link_types at all. */
   pack_unavailable: boolean;
+  /** Insert batches that failed (rows silently lost before #2057-NER). */
+  batch_errors: number;
+  /** Candidate rows dropped by failed batches. */
+  rows_dropped: number;
+  /** First batch failure message, for the command surface. */
+  first_batch_error?: string;
 }
 
 /** Context window scanned around each mention for verb-pattern matching. */
@@ -116,12 +122,12 @@ export async function extractNerLinks(
   // and could not see a DB-side pack flip.
   const pack = await loadActivePackForLocalEngine(engine);
   if (!pack || !packSupportsNerInference(pack)) {
-    return { pages: 0, created: 0, pack_unavailable: true };
+    return { pages: 0, created: 0, pack_unavailable: true, batch_errors: 0, rows_dropped: 0 };
   }
 
   const gazetteer = opts.gazetteer ?? await buildGazetteer(engine);
   if (gazetteer.size === 0) {
-    return { pages: 0, created: 0, pack_unavailable: false };
+    return { pages: 0, created: 0, pack_unavailable: false, batch_errors: 0, rows_dropped: 0 };
   }
 
   // Pre-fetch target entity types so inferLinkType has the type signal
@@ -135,6 +141,9 @@ export async function extractNerLinks(
 
   let processed = 0;
   let created = 0;
+  let batchErrors = 0;
+  let rowsDropped = 0;
+  let firstBatchError: string | undefined;
   const batch: LinkBatchInput[] = [];
   const BATCH_SIZE = 500;
   const sinceMs = opts.since ? new Date(opts.since).getTime() : null;
@@ -144,8 +153,15 @@ export async function extractNerLinks(
     if (!dryRun) {
       try {
         created += await engine.addLinksBatch(batch); // gbrain-allow-direct-insert: extract-ner — typed NER link write
-      } catch {
-        // batch error: drop; the per-page progress continues
+      } catch (err) {
+        // #2057-NER: a dropped batch must be countable at the command surface,
+        // not silently absorbed - `created == DB` cannot detect it (both count
+        // only successful inserts).
+        batchErrors++;
+        rowsDropped += batch.length;
+        if (firstBatchError === undefined) {
+          firstBatchError = err instanceof Error ? err.message : String(err);
+        }
       }
     } else {
       created += batch.length;
@@ -194,7 +210,14 @@ export async function extractNerLinks(
   }
 
   await flush();
-  return { pages: processed, created, pack_unavailable: false };
+  return {
+    pages: processed,
+    created,
+    pack_unavailable: false,
+    batch_errors: batchErrors,
+    rows_dropped: rowsDropped,
+    ...(firstBatchError !== undefined ? { first_batch_error: firstBatchError } : {}),
+  };
 }
 
 /**
