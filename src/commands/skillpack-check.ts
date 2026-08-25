@@ -19,6 +19,7 @@
 import { execFileSync } from 'child_process';
 import { VERSION } from '../version.ts';
 import { getCliOptions } from '../core/cli-options.ts';
+import { loadConfig, isThinClient } from '../core/config.ts';
 
 /**
  * Resolve the gbrain binary + args for spawning subcommands from
@@ -74,6 +75,8 @@ interface SkillpackReport {
     partial_count: number;
     applied_count: number;
     stdout: string;
+    /** fork: set on thin clients, where schema migrations are host-owned. */
+    skipped?: boolean;
   } | { error: string };
 }
 
@@ -104,6 +107,20 @@ function runDoctor(): SkillpackReport['doctor'] {
 }
 
 function runMigrationsList(): SkillpackReport['migrations'] {
+  // fork: on a thin client (`remote_mcp`, i.e. the laptop talking to the
+  // tunnel-fronted host) there is no local schema to migrate — spawning
+  // `apply-migrations --list` reports against the wrong plane, or nothing.
+  // Migrations are host-owned. Uses upstream's canonical isThinClient()
+  // rather than poking config.remote_mcp directly.
+  if (isThinClient(loadConfig())) {
+    return {
+      applied_count: 0,
+      pending_count: 0,
+      partial_count: 0,
+      stdout: 'Skipped on thin client; schema migrations are host-owned.',
+      skipped: true,
+    };
+  }
   const { cmd, prefix } = gbrainSpawn();
   try {
     const stdout = execFileSync(cmd, [...prefix, 'apply-migrations', '--list'], {

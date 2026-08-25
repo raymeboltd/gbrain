@@ -50,7 +50,7 @@ import {
 import type { SchemaPackManifest, PackPrimitive } from '../core/schema-pack/manifest-v1.ts';
 import { PACK_PRIMITIVES } from '../core/schema-pack/manifest-v1.ts';
 import { bundledPackPath } from '../core/schema-pack/bundled-assets.ts';
-import { gbrainPath, loadConfig, configPath, toEngineConfig } from '../core/config.ts';
+import { gbrainPath, loadConfig, loadConfigFileOnly, configPath, toEngineConfig } from '../core/config.ts';
 
 export async function runSchema(args: string[]): Promise<void> {
   const sub = args[0];
@@ -377,7 +377,10 @@ function runUse(args: string[]): void {
   // Write to file-plane config (~/.gbrain/config.json schema_pack field).
   // Tier 6 in the resolution chain — tiers 1-5 (per-call, env, DB) can
   // still override this without editing the file.
-  const cfg = loadConfig() ?? { engine: 'pglite' as const };
+  // Preserve only durable file-plane state. loadConfig() includes transient
+  // env overrides and would persist DATABASE_URL-driven engine changes or
+  // environment-only secrets while merely switching a schema pack.
+  const cfg = loadConfigFileOnly() ?? { engine: 'pglite' as const };
   const updated = { ...cfg, schema_pack: packName };
   const cfgPath = configPath();
   mkdirSync(dirname(cfgPath), { recursive: true });
