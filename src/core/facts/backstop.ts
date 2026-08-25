@@ -254,6 +254,36 @@ export async function runFactsBackstop(
       : { mode: 'inline', inserted: 0, duplicate: 0, superseded: 0, fact_ids: [], skipped };
   }
 
+  // Operator content-exclusion (config-driven, default off). Brain-level
+  // policy: a page whose body matches facts.content_exclusion_regex never
+  // reaches the extractor, on ANY path (sync, put_page, capture, background
+  // jobs). Engine-level on purpose - host-side filters cannot cover every
+  // entry point (2026-08-07: a host feeder wrote medical content into entity
+  // pages because only its own path filtered). Invalid regex fails OPEN with
+  // a once-per-process warning rather than silently blocking all extraction.
+  //
+  // R9 re-anchor (2026-08-25): upstream inserted the availability gate below
+  // between this block's original anchors. Placement is deliberate — the
+  // exclusion runs immediately after eligibility and BEFORE the availability
+  // gate, so an excluded page pays no gateway round-trip and is dropped on
+  // every path, exactly as before the rebase.
+  const exclRaw = await ctx.engine.getConfig('facts.content_exclusion_regex');
+  if (exclRaw && exclRaw.trim()) {
+    let excl: RegExp | null = null;
+    try { excl = new RegExp(exclRaw, 'i'); } catch { excl = null; }
+    if (excl === null) {
+      warnOnce(
+        'facts-content-exclusion-regex',
+        `[facts] invalid facts.content_exclusion_regex - exclusion DISABLED: ${exclRaw}`,
+      );
+    } else if (excl.test(parsedPage.compiled_truth)) {
+      const skipped = 'eligibility_failed:content_excluded' as const;
+      return mode === 'queue'
+        ? { mode: 'queue', enqueued: false, queueDepth: 0, skipped }
+        : { mode: 'inline', inserted: 0, duplicate: 0, superseded: 0, fact_ids: [], skipped };
+    }
+  }
+
   // --- Extraction availability gate (engine-aware, EXECUTION-process only) ---
   // Resolves the ACTUAL extraction model (facts.extraction_model /
   // models.default / tier config / GBRAIN_MODEL / key-aware tier default) and
