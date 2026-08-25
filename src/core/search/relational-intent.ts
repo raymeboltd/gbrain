@@ -80,6 +80,14 @@ export const KNOWN_LINK_TYPES: ReadonlySet<string> = new Set([
   'source',
   'related_to',
   'wikilink_basename',
+  // R6-F1 (fork, 2026-08-25): the active pack robin-base-v2 v0.0.5 declares
+  // `introduced_by` as a link_type WITH an inference regex, so ingest writes
+  // these edges — but the query side could not name the type, so validateVocab
+  // rejected any verb mapping to it and no relation phrase could ever traverse
+  // an introduced_by edge. Verified against the live pack: of its 6
+  // inference-bearing link types (founded, invested_in, advises, introduced_by,
+  // attended, works_at) this was the only one missing from this set.
+  'introduced_by',
 ]);
 
 // Seeds that are pronouns / generic nouns, not entities. If a pattern's seed
