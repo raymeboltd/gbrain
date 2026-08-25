@@ -769,7 +769,10 @@ describe('buildGazetteer — engine integration', () => {
   test('LINKABLE_ENTITY_TYPES exposes the hardcoded contract', () => {
     // Regression: if anyone changes the hardcoded type list, this test
     // forces a deliberate change (and a corresponding test update).
-    expect(LINKABLE_ENTITY_TYPES).toEqual(['person', 'company', 'organization', 'entity']);
+    // fork(a494f4ce3): widened with 'project','deal' so the personal pack's
+    // project/deal entity pages participate in mention linking. This is the
+    // deliberate companion update the assertion above asks for.
+    expect(LINKABLE_ENTITY_TYPES).toEqual(['person', 'company', 'organization', 'entity', 'project', 'deal']);
   });
 
   // CJK — engine-backed tests

@@ -1079,12 +1079,14 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
         try {
           const { isFederatedV2Enabled } = await import('../core/feature-flags.ts');
           if (await isFederatedV2Enabled(engine)) {
-            const { loadAllSources, sourceConfigHasRemoteUrl } = await import('../core/sources-load.ts');
+            const { loadAllSources, sourceConfigHasRemoteUrl, isSourceAutopilotSyncEnabled } = await import('../core/sources-load.ts');
             const sources = await loadAllSources(engine);
             const intervalMs = baseInterval * 1000;
             const now = Date.now();
             for (const src of sources) {
               if (!src.local_path) continue;
+              // fork: per-source autopilot circuit breaker (autopilot_sync).
+              if (!isSourceAutopilotSyncEnabled(src.config)) continue;
               // #3696: a RELATIVE local_path is meaningless in the daemon
               // (cwd is launchd's, not the registering shell's) — dispatching
               // it would sync a phantom path. Skip loudly; the fix is

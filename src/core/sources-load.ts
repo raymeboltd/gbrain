@@ -161,6 +161,22 @@ export function isSourceFederated(config: unknown): boolean {
 }
 
 /**
+ * Per-source autopilot sync circuit breaker. Default-on preserves existing
+ * behavior; only the literal boolean false disables automatic freshness jobs.
+ * Manual `gbrain sync --source <id>` remains available for operator recovery.
+ *
+ * R9 (2026-08-25): KEPT across the 0.46.29.0 rebase against the plan's lean to
+ * drop it. Production has exactly one source (`personal`) and its config
+ * carries `autopilot_sync: false` TODAY. Upstream reads this key nowhere, so
+ * dropping the breaker would not "simplify" — it would silently re-enable
+ * automatic per-source dispatch on the only source, while the key stayed in
+ * the DB looking meaningful. See repair/phase-R9-rehearsal-receipt.md.
+ */
+export function isSourceAutopilotSyncEnabled(config: unknown): boolean {
+  return parseSourceConfig(config).autopilot_sync !== false;
+}
+
+/**
  * Three-way federation state for display (CLI `sources list`, etc.).
  *
  * `isSourceFederated` collapses to a boolean for the inclusion check (does

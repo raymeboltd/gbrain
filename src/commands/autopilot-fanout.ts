@@ -33,7 +33,7 @@
 import type { BrainEngine, SourceRow } from '../core/engine.ts';
 import type { MinionQueue } from '../core/minions/queue.ts';
 import { SOURCE_FRESHNESS_PHASES, MAINTENANCE_PHASES, LAST_GLOBAL_AT_KEY } from '../core/cycle.ts';
-import { sourceConfigHasRemoteUrl } from '../core/sources-load.ts';
+import { sourceConfigHasRemoteUrl, isSourceAutopilotSyncEnabled } from '../core/sources-load.ts';
 import { AUTOPILOT_FULL_CYCLE_FLOOR_MINUTES } from './autopilot-remediation-policy.ts';
 
 // #2194 fix #2: failure cooldown. A source whose autopilot-cycle keeps
@@ -435,6 +435,26 @@ export async function dispatchPerSource(
       skipped_cap: [],
       skipped_cooldown: [],
       legacy_fallback: true,
+      all_sources_fresh: false,
+    };
+  }
+
+  // A source-level circuit breaker disables both freshness sync jobs and the
+  // per-source cycle, whose first phase also syncs. Keep the distinction from
+  // an absent sources table: if every known source is disabled, do no work;
+  // never fall back to an unscoped legacy cycle that would sync it anyway.
+  //
+  // R9 (2026-08-25): return shape re-fitted to upstream's FanoutResult, which
+  // gained `coalesced` and `all_sources_fresh` since the fork pin.
+  sources = sources.filter((source) => isSourceAutopilotSyncEnabled(source.config));
+  if (sources.length === 0) {
+    return {
+      dispatched: [],
+      coalesced: [],
+      skipped_fresh: [],
+      skipped_cap: [],
+      skipped_cooldown: [],
+      legacy_fallback: false,
       all_sources_fresh: false,
     };
   }
