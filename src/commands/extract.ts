@@ -983,6 +983,16 @@ export async function runExtract(engine: BrainEngine, args: string[]) {
           if (r.pack_unavailable && !jsonMode) {
             console.log('Note: no active schema pack with link_types[].inference.regex — NER pass produced 0 links.');
           }
+          // #2057-NER (mirrors the timeline fix above): failed insert batches
+          // were silently dropped; surface them on stderr and exit non-zero.
+          if (r.batch_errors > 0) {
+            console.error(
+              `[extract ner] ${r.batch_errors} batch(es) failed to insert (${r.rows_dropped} rows dropped)` +
+              (r.first_batch_error ? ` (first error: ${r.first_batch_error})` : '') +
+              ` — typed-NER links are incomplete.`,
+            );
+            setCliExitVerdict(1);
+          }
           result.links_created += r.created;
           // pages already counted by by-mention if both ran; else count here.
           if (!byMention) result.pages_processed += r.pages;
