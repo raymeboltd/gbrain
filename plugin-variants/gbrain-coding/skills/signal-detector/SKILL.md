@@ -21,6 +21,8 @@ writes_to:
   - people/
   - companies/
   - concepts/
+  - originals/
+  - ideas/
 ---
 
 # Signal Detector — Ambient Brain Capture
@@ -91,6 +93,8 @@ When the user expresses a novel thought, observation, thesis, or framework:
 - If it's a **world concept** they're referencing → create/update `concepts/{slug}`
 - If it's a **product or business idea** → create/update `ideas/{slug}`
 
+**Updating an existing page:** `get_page {slug, include_content: true}` first, carry the full document forward, change only what this phase owns -- `put_page` clears `aliases` and recomputes `title`.
+
 **Capture exact phrasing.** The user's language IS the insight. Don't paraphrase.
 
 **Cross-linking (MANDATORY):** Every original MUST link to related people, companies,
@@ -106,10 +110,11 @@ meetings, and concepts. An original without cross-links is a dead original.
    - If page exists and RICH → no action
 3. For new FACTS with specific dates → call `gbrain timeline-add <slug> <date> "<summary>"`
 
-**Auto-link (v0.10.1):** When you write/update an originals or ideas page that
-references a person or company, the auto-link post-hook on `put_page`
-automatically creates the link from the new page to that entity. You don't
-need to call `gbrain link` manually. Timeline entries still need explicit calls.
+**Auto-link reality (corrected 2026-08-26):** the `put_page` auto-link post-hook
+runs for TRUSTED LOCAL writers only - remote MCP callers are skipped (the response
+reports `auto_links: {skipped: "remote"}`). Writing through MCP: create the entity
+links explicitly with `add_link` (or accept that the periodic relink lane backfills
+mention links later). Timeline entries always need explicit calls.
 
 ### Phase 3: Signal Logging
 

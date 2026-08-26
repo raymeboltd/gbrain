@@ -94,7 +94,7 @@ Extract people, companies, concepts from the incoming signal.
 
 For each entity:
 - `gbrain search "name"` -- does a page already exist?
-- **If yes:** UPDATE path (add new signal, update compiled truth if material)
+- **If yes:** UPDATE path (add new signal, update compiled truth if material). Load it now: `get_page {slug, include_content: true}` -- the outcome may be an update.
 - **If no:** CREATE path (check notability gate first, then create)
 
 ### Step 3: Extract signal from source
@@ -178,6 +178,7 @@ the raw data shows exactly what the API returned.
 3. Update State section with new facts
 4. Flag contradictions between new signal and existing compiled truth
 5. Don't overwrite user-written assessments with API boilerplate
+6. `put_page` sends the FULL loaded document with your changes applied -- never a fragment (`put_page` clears `aliases` and recomputes `title`)
 
 #### Person page template
 

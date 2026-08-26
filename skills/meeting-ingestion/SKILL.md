@@ -306,7 +306,7 @@ For EACH attendee:
    only ephemeral third-party mentions (a name invoked about someone not
    present, with no standalone context) and non-participants (a server taking
    orders).
-3. If YES → update compiled truth with meeting context (subject to Phase 6).
+3. If YES → `get_page {slug, include_content: true}` → edit the full document → `put_page` the full document with the meeting context added (subject to Phase 6).
 4. Add a timeline entry on the person's page:
    `gbrain timeline-add {person-slug} {date} "Attended {meeting-title}"`
 

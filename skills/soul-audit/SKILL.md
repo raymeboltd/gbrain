@@ -48,7 +48,10 @@ This skill guarantees:
   backs the old file up under `.gbrain-bootstrap-backups/<ts>/` first — nothing
   is clobbered without a recoverable copy.
 - Each phase is independent and re-runnable; updating one answer and
-  re-rendering one file is a complete, valid run.
+  re-rendering one file is a complete, valid run. A re-run touches only its
+  own phase's keys in the bank -- render regenerates the FULL file from every
+  key already in the bank, carrying every other phase's answers forward
+  verbatim.
 
 ## The command loop
 

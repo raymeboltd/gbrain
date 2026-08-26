@@ -98,7 +98,9 @@ gbrain query "type:concept" --limit 10000 --json
 
 # 4. Phase 3 synthesis — for each T1/T2, agent reads the timeline
 #    + associated source pages and writes a synthesis section
-#    onto the concept page via put_page.
+#    onto the concept page via put_page. Load with get_page
+#    {slug, include_content: true} first, add/replace only the
+#    synthesis section, put_page the full document.
 
 # 5. Phase 4 clustering — agent reads the tiered concept list
 #    and writes concepts/README.md with the full intellectual map.

@@ -60,7 +60,7 @@ Every fact written to a brain page must carry an inline `[Source: ...]` citation
 1. **Parse the source.** Extract people, companies, dates, and events from the input.
 2. **For each entity mentioned:**
    - Read the entity's page from gbrain to check if it exists
-   - If exists: update compiled_truth (rewrite State section with new info, don't append)
+   - If exists: `get_page {slug, include_content: true}`, rewrite ONLY the State section inside the full document (with new info, don't append), then `put_page` the full document
    - If new: check notability gate, then store the page in gbrain with the appropriate type and slug
 3. **Append to timeline.** Add a timeline entry in gbrain for each event, with date, summary, and source citation.
 4. **Create cross-reference links.** Link entities in gbrain for every entity pair mentioned together, using the appropriate relationship type.

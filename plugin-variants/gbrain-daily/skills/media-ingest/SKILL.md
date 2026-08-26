@@ -105,7 +105,7 @@ File by primary subject (not format). Use this template:
 ### Phase 4: Entity extraction and propagation
 
 For every person and company mentioned:
-1. Check brain for existing page
+1. Check brain for existing page. If it exists, `get_page {slug, include_content: true}` first -- `put_page` sends the full document back, never a fragment.
 2. Create/enrich if needed (delegate to enrich skill)
 3. Add back-link from entity page to this media page
 4. Add timeline entry on entity page

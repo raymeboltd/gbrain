@@ -62,7 +62,7 @@ Format: `- **YYYY-MM-DD** | Referenced in [page title](path) — brief context`
 3. **Identify the author — MANDATORY people page.** Anyone whose thinking is worth ingesting is worth tracking.
    - Search brain for existing author page
    - If no page → CREATE ONE with compiled truth + timeline format
-   - If page exists → update timeline with this new publication
+   - If page exists → prefer `add_timeline_entry` for the new publication (append-only, no full-page rewrite); if a body edit is also needed, `get_page {slug, include_content: true}` first
    - Cross-link both directions
 
 4. **Save to brain.** File by PRIMARY SUBJECT (read `skills/_brain-filing-rules.md`):

@@ -123,12 +123,13 @@ pages immediately with attribution `[Source: User, YYYY-MM-DD]`.
 
 ### Phase 2.5: Structured Graph Updates (automatic)
 
-Every `put_page` call automatically extracts entity references and writes them
-to the graph (`links` table) with inferred relationship types. Stale links
-(refs no longer in the page text) are removed in the same call. This is
-"auto-link" reconciliation.
+`put_page` auto-link reconciliation (extract entity references -> `links` table,
+remove stale refs) runs for TRUSTED LOCAL writers only. Remote MCP callers are
+SKIPPED - the response reports `auto_links: {skipped: "remote"}` - so an MCP write
+needs explicit `add_link` calls for its graph edges (or the periodic relink lane
+backfills mention links later).
 
-- No manual `add_link` calls needed for ordinary page writes.
+- No manual `add_link` calls needed for LOCAL page writes; MCP writes DO need them.
 - Inferred link types: `attended` (meeting -> person), `works_at`, `invested_in`,
   `founded`, `advises`, `source` (frontmatter), `mentions` (default).
 - The `put_page` MCP response includes `auto_links: { created, removed, errors }`
