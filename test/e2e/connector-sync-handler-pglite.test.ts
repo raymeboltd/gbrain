@@ -60,6 +60,11 @@ describe('connector-sync handler', () => {
     await expect(handler(fakeJob({ provider: 'bogus' }))).rejects.toThrow(/invalid provider/i);
   });
 
+  test('missing sourceId fails closed before the handler acquires a lock', async () => {
+    const handler = makeConnectorSyncHandler(engine);
+    await expect(handler(fakeJob({ provider: 'chatgpt' }))).rejects.toThrow(/sourceId is required/i);
+  });
+
   test('no credential → returns auth_required (NOT thrown), releases the lock', async () => {
     const handler = makeConnectorSyncHandler(engine);
     const r = (await handler(fakeJob({ provider: 'chatgpt', sourceId: 'default' }))) as { status: string };

@@ -98,8 +98,8 @@ export interface ConnectorSyncDeps {
 
 export interface ConnectorSyncOpts {
   provider: ConnectorProviderName;
-  /** Target source; default 'default'. */
-  sourceId?: string;
+  /** Explicit target source. Connector writes never inherit an ambient fallback. */
+  sourceId: string;
   /** Ignore the watermark (first backfill / repair). */
   full?: boolean;
   /** List-only preview: no detail fetches, no writes, no watermark change. */
@@ -154,7 +154,14 @@ export async function runConnectorSync(
   const deps = opts.deps ?? {};
   const now = deps.now ?? Date.now;
   const runIngest = deps.runIngest ?? runTranscriptsIngest;
-  const sourceId = opts.sourceId ?? 'default';
+  const sourceId = opts.sourceId.trim();
+  if (!sourceId) {
+    throw new Error('connector sync requires an explicit sourceId');
+  }
+  const sources = await engine.listAllSources({ includeArchived: false });
+  if (!sources.some((source) => source.id === sourceId)) {
+    throw new Error(`connector sync target source '${sourceId}' is not registered or is archived`);
+  }
   const windowDays = opts.windowDays ?? DEFAULT_WINDOW_DAYS;
   const log = deps.log ?? (() => {});
   const provider = getConnectorProvider(opts.provider);

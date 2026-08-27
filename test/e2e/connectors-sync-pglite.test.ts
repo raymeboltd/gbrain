@@ -93,6 +93,21 @@ async function runChatgpt(state: FixtureState, opts: Record<string, unknown> = {
   }
 }
 
+describe('source boundary', () => {
+  test('an unregistered source fails before provider fetch or ingest', async () => {
+    saveChatgptCookie();
+    const state = newFixtureState([
+      conv('wrong-source', 'Wrong source', T0 + 1, [
+        { role: 'user', text: 'must not land in another source' },
+      ]),
+    ]);
+    await expect(runChatgpt(state, { sourceId: 'personal' })).rejects.toThrow(
+      /target source 'personal' is not registered/i,
+    );
+    expect(state.hits.list ?? 0).toBe(0);
+  });
+});
+
 // ── A. Full pipeline ────────────────────────────────────────────────────────
 describe('A. full pipeline', () => {
   test('A1 chatgpt: paginated list → detail → ingest → searchable page (canonical path only)', async () => {

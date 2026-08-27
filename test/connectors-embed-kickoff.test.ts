@@ -15,7 +15,7 @@ function fakeEngine(kind: 'postgres' | 'pglite', config: Record<string, string> 
   } as unknown as BrainEngine;
 }
 
-const baseOpts = { provider: 'chatgpt' as const };
+const baseOpts = { provider: 'chatgpt' as const, sourceId: 'default' };
 
 describe('maybeKickoffEmbed', () => {
   test('below threshold → no embed, neither path called', async () => {

@@ -697,7 +697,13 @@ export async function maybeDispatchConnectorSyncs(
     const n = parseInt(floorCfg, 10);
     if (Number.isFinite(n) && n >= 1) floorMin = n;
   }
-  const sourceId = (await engine.getConfig(sourceIdKey())) || 'default';
+  const sourceId = (await engine.getConfig(sourceIdKey()))?.trim();
+  if (!sourceId) {
+    if (opts.jsonMode) {
+      emit(JSON.stringify({ event: 'connector_sync_skipped', reason: 'source_unconfigured' }));
+    }
+    return { dispatched: [] };
+  }
   const dispatched: string[] = [];
 
   for (const provider of connectorProviderNames()) {

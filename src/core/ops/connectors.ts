@@ -91,6 +91,9 @@ const connector_sync: Operation = {
     if (!isConnectorProviderName(provider)) {
       throw new OperationError('invalid_params', `unknown connector provider '${provider}' (expected chatgpt|claude)`);
     }
+    if (!ctx.sourceId) {
+      throw new OperationError('invalid_params', 'connector_sync requires an explicit source_id');
+    }
     return runConnectorSync(ctx.engine, {
       provider,
       sourceId: ctx.sourceId,

@@ -38,7 +38,10 @@ function parseParams(data: Record<string, unknown>): ConnectorSyncJobParams {
   if (!isConnectorProviderName(provider)) {
     throw new Error(`connector-sync: invalid provider '${String(data.provider)}' (expected chatgpt|claude)`);
   }
-  const sourceId = typeof data.sourceId === 'string' && data.sourceId ? data.sourceId : 'default';
+  const sourceId = typeof data.sourceId === 'string' ? data.sourceId.trim() : '';
+  if (!sourceId) {
+    throw new Error('connector-sync: sourceId is required (ambient/default fallback is forbidden)');
+  }
   return {
     provider,
     sourceId,

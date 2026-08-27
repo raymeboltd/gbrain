@@ -17,6 +17,7 @@ import {
   selectSourcesForDispatch,
   resolveFanoutMax,
   dispatchPerSource,
+  maybeDispatchConnectorSyncs,
 } from '../src/commands/autopilot-fanout.ts';
 import {
   autopilotRemediationIdempotencyKey,
@@ -76,6 +77,34 @@ describe('isSourceStale', () => {
     const past = new Date(NOW - 6 * 60_000).toISOString();
     expect(isSourceStale(src('a', past), NOW, 5)).toBe(true);
     expect(isSourceStale(src('a', past), NOW, 60)).toBe(false);
+  });
+});
+
+describe('connector source ownership', () => {
+  test('Autopilot skips connector dispatch when connectors.source_id is unset', async () => {
+    const events: string[] = [];
+    const engine = {
+      kind: 'postgres' as const,
+      getConfig: async () => null,
+    } as unknown as BrainEngine;
+    const queue = {
+      add: async () => {
+        throw new Error('queue.add must not be called without an explicit source');
+      },
+    } as unknown as Parameters<typeof maybeDispatchConnectorSyncs>[1];
+
+    const result = await maybeDispatchConnectorSyncs(engine, queue, {
+      slot: '2026-08-27',
+      timeoutMs: 1,
+      jsonMode: true,
+      emit: (line) => events.push(line),
+    });
+
+    expect(result.dispatched).toEqual([]);
+    expect(events.map((line) => JSON.parse(line))).toContainEqual({
+      event: 'connector_sync_skipped',
+      reason: 'source_unconfigured',
+    });
   });
 });
 
