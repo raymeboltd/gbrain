@@ -4,9 +4,10 @@ import { join } from 'node:path';
 import { maybeDispatchSourceEventProjection } from '../src/commands/autopilot-fanout.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import type { MinionQueue } from '../src/core/minions/queue.ts';
+import { isProtectedJobName } from '../src/core/minions/protected-names.ts';
 
 function harness(opts: { enabled?: string; sourceIds?: string; coalesced?: boolean; sources?: Array<{ id: string; config: Record<string, unknown> }> } = {}) {
-  const added: Array<{ name: string; data: unknown; options: Record<string, unknown> }> = [];
+  const added: Array<{ name: string; data: unknown; options: Record<string, unknown>; trusted: unknown }> = [];
   const engine = {
     getConfig: async (key: string) => key === 'source_events.enabled'
       ? opts.enabled
@@ -14,8 +15,8 @@ function harness(opts: { enabled?: string; sourceIds?: string; coalesced?: boole
     listAllSources: async () => opts.sources ?? [],
   } as unknown as BrainEngine;
   const queue = {
-    add: async (name: string, data: unknown, options: Record<string, unknown>) => {
-      added.push({ name, data, options });
+    add: async (name: string, data: unknown, options: Record<string, unknown>, trusted: unknown) => {
+      added.push({ name, data, options, trusted });
       return { id: added.length, coalesced: opts.coalesced === true };
     },
   } as unknown as MinionQueue;
@@ -54,7 +55,12 @@ describe('Autopilot source-event projection dispatch', () => {
         queue: 'default', idempotency_key: 'source-event-projection:personal:s1',
         max_attempts: 2, timeout_ms: 1000, maxPending: 1,
       },
+      trusted: { allowProtectedSubmit: true },
     }]);
+  });
+
+  test('is protected from remote/generic submission', () => {
+    expect(isProtectedJobName('source-event-projection')).toBe(true);
   });
 
   test('has no legacy/default fallback when the source registry is empty', async () => {

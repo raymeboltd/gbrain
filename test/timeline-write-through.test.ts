@@ -579,6 +579,66 @@ describe('writeTimelineEntryThrough helper', () => {
     expect(out.handled).toBe(false);
     expect(out.error).toContain('boom');
   });
+
+  test('crash retry repairs derived rows without duplicating the canonical bullet', async () => {
+    await engine.setConfig('sync.repo_path', brainDir);
+    const slug = 'notes/retry-safe';
+    const filePath = await seedPage(slug);
+    const entry = {
+      date: '2026-07-15',
+      source: 'source-event:abc123',
+      summary: 'Evidence mentions Retry Safe.',
+    };
+
+    const first = await writeTimelineEntryThrough(engine, slug, 'default', entry);
+    expect(first.handled).toBe(true);
+    expect(first.file?.written).toBe(true);
+
+    // Simulate loss/rollback of the derived rows after the canonical rename.
+    await engine.executeRaw('DELETE FROM timeline_entries');
+    await engine.executeRaw("UPDATE pages SET timeline='' WHERE source_id='default' AND slug=$1", [slug]);
+
+    const retry = await writeTimelineEntryThrough(engine, slug, 'default', entry);
+    expect(retry.handled).toBe(true);
+    expect(retry.file?.written).toBe(false);
+    expect(await timelineRowCount(slug)).toBe(1);
+    const disk = fs.readFileSync(filePath, 'utf8');
+    expect(disk.match(/source-event:abc123/g)?.length).toBe(1);
+  });
+
+  test('a vanished target row is not reported handled and retry repairs without a second bullet', async () => {
+    await engine.setConfig('sync.repo_path', brainDir);
+    const slug = 'notes/vanished-row';
+    const filePath = await seedPage(slug);
+    const entry = {
+      date: '2026-07-16',
+      source: 'source-event:def456',
+      summary: 'Evidence mentions Vanished Row.',
+    };
+    const vanished = new Proxy(engine, {
+      get(target, prop, receiver) {
+        if (prop === 'executeRaw') {
+          return async (sql: string, params?: unknown[]) => {
+            if (sql.includes('UPDATE pages SET timeline')) return [];
+            return engine.executeRaw(sql, params);
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as unknown as PGLiteEngine;
+
+    const failed = await writeTimelineEntryThrough(vanished, slug, 'default', entry);
+    expect(failed.handled).toBe(false);
+    expect(failed.error).toContain('target page disappeared');
+    expect(fs.readFileSync(filePath, 'utf8').match(/source-event:def456/g)?.length).toBe(1);
+
+    const retry = await writeTimelineEntryThrough(engine, slug, 'default', entry);
+    expect(retry.handled).toBe(true);
+    expect(retry.file?.written).toBe(false);
+    expect(await timelineRowCount(slug)).toBe(1);
+    expect(fs.readFileSync(filePath, 'utf8').match(/source-event:def456/g)?.length).toBe(1);
+  });
 });
 
 describe('renderTimelineEntry / spliceTimelineBlock units', () => {

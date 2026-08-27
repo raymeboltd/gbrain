@@ -63,6 +63,10 @@ export const PROTECTED_JOB_NAMES: ReadonlySet<string> = new Set([
   // auto-drain branch, an explicit `gbrain jobs submit extract-atoms-drain
   // --allow-protected`) can insert it.
   'extract-atoms-drain',
+  // This job projects imported private-source evidence onto entity timelines.
+  // Keep it local-only and require the
+  // handler's independent feature/source admission gate as defense in depth.
+  'source-event-projection',
 ]);
 
 /** Check a job name against the protected set. Normalizes whitespace first. */

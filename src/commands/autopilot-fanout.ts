@@ -34,6 +34,7 @@ import type { BrainEngine, SourceRow } from '../core/engine.ts';
 import type { MinionQueue } from '../core/minions/queue.ts';
 import { SOURCE_FRESHNESS_PHASES, MAINTENANCE_PHASES, LAST_GLOBAL_AT_KEY } from '../core/cycle.ts';
 import { sourceConfigHasRemoteUrl, isSourceAutopilotSyncEnabled } from '../core/sources-load.ts';
+import { readSourceEventPolicy, sourceEventAdmissionReason } from '../core/source-events/policy.ts';
 import { AUTOPILOT_FULL_CYCLE_FLOOR_MINUTES } from './autopilot-remediation-policy.ts';
 
 // #2194 fix #2: failure cooldown. A source whose autopilot-cycle keeps
@@ -753,17 +754,14 @@ export async function maybeDispatchSourceEventProjection(
   queue: MinionQueue,
   opts: { slot: string; timeoutMs: number },
 ): Promise<{ dispatched: string[]; reason: 'disabled' | 'source_unconfigured' | 'no_sources' | 'enabled' }> {
-  const enabled = (await engine.getConfig('source_events.enabled'))?.trim().toLowerCase();
-  if (!enabled || !['1', 'true', 'yes', 'on'].includes(enabled)) {
+  const policy = await readSourceEventPolicy(engine);
+  if (!policy.enabled) {
     return { dispatched: [], reason: 'disabled' };
   }
-
-  const approvedRaw = (await engine.getConfig('source_events.source_ids'))?.trim();
-  const approved = new Set((approvedRaw ?? '').split(',').map((id) => id.trim()).filter(Boolean));
-  if (approved.size === 0) return { dispatched: [], reason: 'source_unconfigured' };
+  if (policy.approvedSourceIds.size === 0) return { dispatched: [], reason: 'source_unconfigured' };
 
   const sources = (await engine.listAllSources({ includeArchived: false }))
-    .filter((source) => approved.has(source.id) && isSourceAutopilotSyncEnabled(source.config));
+    .filter((source) => sourceEventAdmissionReason(policy, source) === null);
   if (sources.length === 0) return { dispatched: [], reason: 'no_sources' };
 
   const dispatched: string[] = [];
@@ -778,6 +776,7 @@ export async function maybeDispatchSourceEventProjection(
         timeout_ms: opts.timeoutMs,
         maxPending: 1,
       },
+      { allowProtectedSubmit: true },
     );
     if (!job.coalesced) dispatched.push(source.id);
   }

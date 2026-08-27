@@ -1,6 +1,8 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { LATEST_VERSION, runMigrations } from '../src/core/migrate.ts';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 let engine: PGLiteEngine;
 
@@ -23,6 +25,11 @@ describe('migration v143 source-event receipts', () => {
     for (const name of ['source_key', 'processor_version', 'target_results', 'status']) {
       expect(names).toContain(name);
     }
+  });
+
+  test('fresh Postgres schema includes receipt metadata in the RLS seal', () => {
+    const schema = readFileSync(join(import.meta.dir, '../src/schema.sql'), 'utf8');
+    expect(schema).toContain('ALTER TABLE source_event_receipts ENABLE ROW LEVEL SECURITY');
   });
 
   test('upgrades a pre-identity receipt table instead of trusting CREATE IF NOT EXISTS', async () => {

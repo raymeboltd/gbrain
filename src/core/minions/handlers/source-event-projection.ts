@@ -2,6 +2,7 @@ import { tryAcquireDbLock } from '../../db-lock.ts';
 import type { BrainEngine } from '../../engine.ts';
 import type { MinionJobContext } from '../types.ts';
 import { SOURCE_EVENT_PROCESSOR_VERSION, projectSourceEvent } from '../../source-events/projector.ts';
+import { assertSourceEventAdmission, readSourceEventPolicy } from '../../source-events/policy.ts';
 
 const SUPPORTED_SOURCE_EVENT_TYPES = [
   'message',
@@ -45,17 +46,18 @@ async function listCandidates(engine: BrainEngine, sourceId: string, limit: numb
   return engine.executeRaw<CandidateRow>(
     `SELECT p.slug, p.type, COALESCE(p.compiled_truth, '') AS compiled_truth,
             COALESCE(p.timeline, '') AS timeline,
-            COALESCE(NULLIF(p.content_hash, ''), md5(COALESCE(p.compiled_truth, '') || E'\n' || COALESCE(p.timeline, ''))) AS projection_hash,
+            md5(COALESCE(p.compiled_truth, '') || E'\n' || COALESCE(p.timeline, '')) AS projection_hash,
             p.updated_at, p.effective_date, p.frontmatter
        FROM pages p
       WHERE p.source_id=$1
         AND p.deleted_at IS NULL
         AND p.type = ANY($2::text[])
+        AND COALESCE(p.frontmatter->>'dream_generated', '') <> 'true'
         AND NOT EXISTS (
           SELECT 1 FROM source_event_receipts r
            WHERE r.source_id=p.source_id
              AND r.source_slug=p.slug
-             AND r.content_hash=COALESCE(NULLIF(p.content_hash, ''), md5(COALESCE(p.compiled_truth, '') || E'\n' || COALESCE(p.timeline, '')))
+             AND r.content_hash=md5(COALESCE(p.compiled_truth, '') || E'\n' || COALESCE(p.timeline, ''))
              AND r.processor_version=$4
              AND r.status IN ('applied','partial','skipped','review')
         )
@@ -101,52 +103,71 @@ export function makeSourceEventProjectionHandler(engine: BrainEngine) {
   return async function sourceEventProjectionHandler(job: MinionJobContext): Promise<unknown> {
     const { sourceId, limit } = parseParams(job.data);
     const sources = await engine.listAllSources({ includeArchived: false });
-    if (!sources.some((source) => source.id === sourceId)) {
+    const source = sources.find((candidate) => candidate.id === sourceId);
+    if (!source) {
       throw new Error(`source-event-projection: sourceId '${sourceId}' is not a registered source`);
     }
+    assertSourceEventAdmission(await readSourceEventPolicy(engine), source);
     const lock = await tryAcquireDbLock(engine, sourceEventProjectionLockId(sourceId), LOCK_TTL_MIN);
     if (!lock) return { status: 'already_in_progress', sourceId };
 
     try {
       const candidates = await listCandidates(engine, sourceId, limit);
       let applied = 0;
+      let partial = 0;
       let skipped = 0;
       let reviews = 0;
+      let failed = 0;
       let errors = 0;
       for (let index = 0; index < candidates.length; index++) {
         if (job.signal.aborted) throw job.signal.reason ?? new Error('source-event-projection aborted');
         const row = candidates[index]!;
-        const content = [row.compiled_truth, row.timeline].filter(Boolean).join('\n\n');
+        // Keep byte shape aligned with the SQL projection_hash expression.
+        // The projector verifies this digest before accepting the event.
+        const content = `${row.compiled_truth}\n${row.timeline}`;
         const identity = sourceIdentity(row);
-        const receipt = await projectSourceEvent(engine, {
-          sourceId,
-          sourceKind: row.type,
-          sourceKey: identity.sourceKey,
-          sourceUri: identity.sourceUri,
-          sourceSlug: row.slug,
-          contentHash: row.projection_hash,
-          processorVersion: SOURCE_EVENT_PROCESSOR_VERSION,
-          occurredAt: timestamp(row),
-          content,
-        });
-        if (receipt.status === 'applied' || receipt.status === 'partial') applied++;
-        else if (receipt.status === 'review') reviews++;
-        else skipped++;
-        errors += receipt.errors.length;
+        try {
+          const receipt = await projectSourceEvent(engine, {
+            sourceId,
+            sourceKind: row.type,
+            sourceKey: identity.sourceKey,
+            sourceUri: identity.sourceUri,
+            sourceSlug: row.slug,
+            contentHash: row.projection_hash,
+            processorVersion: SOURCE_EVENT_PROCESSOR_VERSION,
+            occurredAt: timestamp(row),
+            content,
+          });
+          if (receipt.status === 'applied') applied++;
+          else if (receipt.status === 'partial') partial++;
+          else if (receipt.status === 'review') reviews++;
+          else skipped++;
+          errors += receipt.errors.length;
+        } catch (error) {
+          failed++;
+          errors++;
+          await job.log(error instanceof Error ? error.message : String(error));
+        }
         await job.updateProgress({
           phase: 'source-event-projection',
           scanned: index + 1,
           total: candidates.length,
           applied,
+          partial,
           skipped,
           reviews,
+          failed,
           errors,
         });
       }
-      return {
-        status: 'completed', sourceId, scanned: candidates.length,
-        applied, skipped, reviews, errors,
-      };
+      if (failed > 0) {
+        throw new Error(
+          `source-event-projection: ${failed} item(s) failed canonical projection ` +
+          `(scanned=${candidates.length}, applied=${applied}, partial=${partial}, skipped=${skipped}, review=${reviews})`,
+        );
+      }
+      const status = partial > 0 || skipped > 0 || reviews > 0 || failed > 0 || errors > 0 ? 'partial' : 'completed';
+      return { status, sourceId, scanned: candidates.length, applied, partial, skipped, reviews, failed, errors };
     } finally {
       await lock.release();
     }

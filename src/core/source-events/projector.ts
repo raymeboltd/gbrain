@@ -8,6 +8,8 @@ import {
 } from '../by-mention.ts';
 import type { BrainEngine } from '../engine.ts';
 import { stripCodeBlocks } from '../link-extraction.ts';
+import { writeTimelineEntryThrough } from '../timeline-write-through.ts';
+import { assertSourceEventAdmission, readSourceEventPolicy } from './policy.ts';
 
 export interface SourceEventProjectionInput {
   sourceId: string;
@@ -35,7 +37,12 @@ export interface SourceEventProjectionReceipt {
   replayed: boolean;
 }
 
-export const SOURCE_EVENT_PROCESSOR_VERSION = 'source-event-v1';
+// v2 changes event identity and replaces derived-only projection with
+// filesystem-canonical timeline write-through. The feature remained unarmed
+// during v1, so there is no production v1 receipt migration path.
+export const SOURCE_EVENT_PROCESSOR_VERSION = 'source-event-v2';
+export const MAX_SOURCE_EVENT_CONTENT_BYTES = 256 * 1024;
+export const MAX_SOURCE_EVENT_TARGETS = 25;
 
 interface ReceiptRow {
   source_id: string;
@@ -64,6 +71,10 @@ export function sourceEventKey(input: SourceEventProjectionInput): string {
     .update('\0')
     .update(required(input.sourceKey, 'sourceKey'))
     .update('\0')
+    .update(required(input.sourceUri, 'sourceUri'))
+    .update('\0')
+    .update(required(input.sourceSlug, 'sourceSlug'))
+    .update('\0')
     .update(required(input.contentHash, 'contentHash'))
     .update('\0')
     .update(required(input.processorVersion, 'processorVersion'))
@@ -87,8 +98,8 @@ function rowToReceipt(row: ReceiptRow, replayed: boolean): SourceEventProjection
   };
 }
 
-function evidenceSummary(kind: string, target: string, sourceSlug: string): string {
-  return `${kind} evidence mentions ${target}. Source: ${sourceSlug}`;
+function evidenceSummary(kind: string, target: string): string {
+  return `${kind} evidence mentions ${target}.`;
 }
 
 function containsTokenSequence(contentTokens: string[], aliasTokens: string[]): boolean {
@@ -154,15 +165,21 @@ export async function projectSourceEvent(
   const sourceSlug = required(raw.sourceSlug, 'sourceSlug');
   const contentHash = required(raw.contentHash, 'contentHash');
   const processorVersion = required(raw.processorVersion, 'processorVersion');
-  const content = required(raw.content, 'content');
+  const content = raw.content.trim();
   const observedAt = new Date(raw.occurredAt);
   if (Number.isNaN(observedAt.getTime())) throw new Error('source-event: occurredAt must be an ISO timestamp');
   const eventDate = observedAt.toISOString().slice(0, 10);
   const eventKey = sourceEventKey({ ...raw, sourceId, sourceKind, sourceKey, sourceUri, contentHash, processorVersion });
 
   const sources = await engine.listAllSources({ includeArchived: false });
-  if (!sources.some((source) => source.id === sourceId)) {
+  const source = sources.find((candidate) => candidate.id === sourceId);
+  if (!source) {
     throw new Error(`source-event: sourceId '${sourceId}' is not a registered source`);
+  }
+  assertSourceEventAdmission(await readSourceEventPolicy(engine), source);
+  const actualContentHash = createHash('md5').update(raw.content).digest('hex');
+  if (contentHash !== actualContentHash) {
+    throw new Error('source-event: contentHash does not match scanned content');
   }
 
   return engine.transaction(async (tx) => {
@@ -200,19 +217,46 @@ export async function projectSourceEvent(
       return rowToReceipt(raced[0], true);
     }
 
-    const reviewErrors = await findAmbiguousIdentity(tx, sourceId, content);
-    if (reviewErrors.length > 0) {
+    if (!content) {
+      const emptyErrors = [{ code: 'empty_content' }];
       const rows = await tx.executeRaw<ReceiptRow>(
         `UPDATE source_event_receipts SET
-           status='review', candidates_count=$3, skipped_count=$3,
-           error_count=$3, errors=$4::text::jsonb, updated_at=now()
+           status='skipped', skipped_count=1, error_count=1,
+           errors=$3::text::jsonb, updated_at=now()
          WHERE source_id=$1 AND event_key=$2
          RETURNING source_id, event_key, status, candidates_count, resolved_count,
                    links_written, timeline_written, facts_written, skipped_count, errors`,
-        [sourceId, eventKey, reviewErrors.length, JSON.stringify(reviewErrors)],
+        [sourceId, eventKey, JSON.stringify(emptyErrors)],
       );
-      if (!rows[0]) throw new Error('source-event: failed to quarantine ambiguous receipt');
+      if (!rows[0]) throw new Error('source-event: failed to finalize empty-content receipt');
       return rowToReceipt(rows[0], false);
+    }
+
+    const finalizeReview = async (
+      reviewErrors: Array<{ code: string; detail?: string }>,
+      candidatesCount = reviewErrors.length,
+    ): Promise<SourceEventProjectionReceipt> => {
+      const rows = await tx.executeRaw<ReceiptRow>(
+        `UPDATE source_event_receipts SET
+           status='review', candidates_count=$3, skipped_count=$3,
+           error_count=$4, errors=$5::text::jsonb, updated_at=now()
+         WHERE source_id=$1 AND event_key=$2
+         RETURNING source_id, event_key, status, candidates_count, resolved_count,
+                   links_written, timeline_written, facts_written, skipped_count, errors`,
+        [sourceId, eventKey, candidatesCount, reviewErrors.length, JSON.stringify(reviewErrors)],
+      );
+      if (!rows[0]) throw new Error('source-event: failed to finalize review receipt');
+      return rowToReceipt(rows[0], false);
+    };
+
+    const contentBytes = Buffer.byteLength(content, 'utf8');
+    if (contentBytes > MAX_SOURCE_EVENT_CONTENT_BYTES) {
+      return finalizeReview([{ code: 'content_too_large', detail: String(contentBytes) }], 0);
+    }
+
+    const reviewErrors = await findAmbiguousIdentity(tx, sourceId, content);
+    if (reviewErrors.length > 0) {
+      return finalizeReview(reviewErrors);
     }
 
     const gazetteer = await buildGazetteer(tx);
@@ -220,40 +264,50 @@ export async function projectSourceEvent(
       fromSlug: sourceSlug,
       fromSourceId: sourceId,
     });
-    const errors = mentions.length === 0 ? [{ code: 'no_known_entity_mentions' }] : [];
-    const targetResults = mentions.map((mention) => ({
-      slug: mention.slug,
-      source_id: mention.source_id,
-      link: 'applied',
-      timeline: 'applied',
-      facts: 'deferred',
-    }));
-
-    const linksWritten = mentions.length === 0 ? 0 : await tx.addLinksBatch(
-      mentions.map((mention) => ({
-        from_slug: sourceSlug,
-        to_slug: mention.slug,
-        link_type: 'evidence',
-        context: mention.name,
-        link_source: 'source-event',
-        from_source_id: sourceId,
-        to_source_id: sourceId,
-      })),
-      { auditSite: 'source-event.links' },
-    );
-    const timelineWritten = mentions.length === 0 ? 0 : await tx.addTimelineEntriesBatch(
-      mentions.map((mention) => ({
-        slug: mention.slug,
-        source_id: sourceId,
+    if (mentions.length > MAX_SOURCE_EVENT_TARGETS) {
+      return finalizeReview(
+        [{ code: 'too_many_entity_mentions', detail: String(mentions.length) }],
+        mentions.length,
+      );
+    }
+    const errors: Array<{ code: string; detail?: string }> = mentions.length === 0
+      ? [{ code: 'no_known_entity_mentions' }]
+      : [];
+    const targetResults: Array<Record<string, string>> = [];
+    let timelineWritten = 0;
+    for (const mention of mentions) {
+      const timeline = await writeTimelineEntryThrough(tx, mention.slug, sourceId, {
         date: eventDate,
         source: `source-event:${eventKey}`,
-        summary: evidenceSummary(sourceKind, mention.name, sourceSlug),
-        detail: `Evidence: ${sourceSlug}`,
-      })),
-      { auditSite: 'source-event.timeline' },
-    );
+        summary: evidenceSummary(sourceKind, mention.name),
+        detail: `Evidence receipt: ${eventKey}`,
+      });
+      if (!timeline.handled) {
+        // Roll the receipt transaction back. The handler contains this item
+        // failure and leaves the page eligible for the next Autopilot pass;
+        // committing a partial receipt here would strand it forever because
+        // receipt identity is this processor version's replay boundary.
+        throw new Error(
+          `source-event: canonical timeline write required for '${mention.slug}' ` +
+          `(${timeline.skipped ?? timeline.error ?? 'unknown'})`,
+        );
+      }
+      timelineWritten++;
+      targetResults.push({
+        slug: mention.slug,
+        source_id: mention.source_id,
+        // Body-text mention links are reconstructible through upstream's
+        // `extract links --by-mention --source db` pass. Do not write a
+        // parallel DB-only edge here; the receipt stays partial until that
+        // reconciliation stage is wired and proven.
+        link: 'deferred_to_by_mention',
+        timeline: 'applied',
+        facts: 'deferred',
+      });
+    }
+    const linksWritten = 0;
 
-    // v1 deliberately stops before LLM fact extraction. Mark the journey
+    // v2 deliberately stops before LLM fact extraction. Mark the journey
     // partial so an evidence-only projection can never masquerade as full
     // distillation; a later processor version can resume the same event.
     const status: SourceEventProjectionReceipt['status'] = mentions.length > 0 ? 'partial' : 'skipped';

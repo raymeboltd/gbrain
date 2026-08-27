@@ -44,10 +44,10 @@
  * eventual-consistency contract as the facts fence lane.
  */
 
-import { existsSync, readFileSync, writeFileSync, renameSync, unlinkSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { basename, dirname } from 'node:path';
-import { randomBytes } from 'node:crypto';
 import type { BrainEngine } from './engine.ts';
+import { atomicWriteFileSync } from './atomic-write.ts';
 import { sanitizeForJsonb } from './batch-rows.ts';
 import {
   isWriteThroughDisabled,
@@ -371,7 +371,19 @@ export async function writeTimelineEntryThrough(
         }
 
         const beforeText = readFileSync(filePath, 'utf8');
-        const afterText = spliceTimelineIntoFileText(beforeText, entry.date, rendered.block);
+        // A process can crash after the atomic file rename but before its DB
+        // transaction/receipt commits. On retry, treat the exact canonical
+        // tuple already present on disk as success and repair the derived DB
+        // rows without appending a second bullet.
+        const alreadyOnDisk = extractTimelineFromContent(beforeText, slug).some(
+          (e) =>
+            e.date === rendered.canonical.date &&
+            (e.source ?? '') === rendered.canonical.source &&
+            e.summary === rendered.canonical.summary,
+        );
+        const afterText = alreadyOnDisk
+          ? beforeText
+          : spliceTimelineIntoFileText(beforeText, entry.date, rendered.block);
 
         // fence-write's parse-before-rename analog: the spliced text must
         // re-extract the canonical tuple, or the file is not touched.
@@ -385,41 +397,61 @@ export async function writeTimelineEntryThrough(
           return { handled: false, skipped: 'splice_not_roundtrippable' };
         }
 
-        // Atomic write: unique temp sibling + rename (writePageThrough's
-        // convention). Clean the temp up on failure — never leak a stray.
-        const tmpPath = `${filePath}.tmp.${process.pid}.${randomBytes(4).toString('hex')}`;
-        try {
-          writeFileSync(tmpPath, afterText, 'utf8');
-          renameSync(tmpPath, filePath);
-        } catch (writeErr) {
-          try {
-            if (existsSync(tmpPath)) unlinkSync(tmpPath);
-          } catch {
-            // best-effort cleanup; surface the original write error below
-          }
-          throw writeErr;
+        // Shared hardened atomic writer: short-write loop, fsync, verified
+        // temp bytes, rename, then best-effort parent-directory fsync.
+        if (!alreadyOnDisk) {
+          atomicWriteFileSync(filePath, afterText, {
+            verify: (onDiskText) => {
+              const verified = extractTimelineFromContent(onDiskText, slug).some(
+                (e) =>
+                  e.date === rendered.canonical.date &&
+                  (e.source ?? '') === rendered.canonical.source &&
+                  e.summary === rendered.canonical.summary,
+              );
+              if (!verified) throw new Error('timeline write-through: atomic verify failed');
+            },
+          });
         }
         onDisk = rendered.canonical;
 
-        const newTimeline = sanitizeForJsonb(
-          spliceTimelineBlock(page.timeline ?? '', entry.date, rendered.block),
+        const alreadyInPageRow = extractTimelineFromContent(page.timeline ?? '', slug).some(
+          (e) =>
+            e.date === rendered.canonical.date &&
+            (e.source ?? '') === rendered.canonical.source &&
+            e.summary === rendered.canonical.summary,
         );
-        await engine.executeRaw(
+        const newTimeline = sanitizeForJsonb(alreadyInPageRow
+          ? (page.timeline ?? '')
+          : spliceTimelineBlock(page.timeline ?? '', entry.date, rendered.block));
+        const updated = await engine.executeRaw<{ slug: string }>(
           `UPDATE pages SET timeline = $1, updated_at = now()
-            WHERE slug = $2 AND source_id = $3 AND deleted_at IS NULL`,
+            WHERE slug = $2 AND source_id = $3 AND deleted_at IS NULL
+            RETURNING slug`,
           [newTimeline, slug, sourceId],
         );
+        if (!updated[0]) throw new Error('timeline write-through: target page disappeared before row update');
 
         // Store the tuple the FS extractor recovers from the bullet just
         // spliced in, so every later sync/rebuild re-extraction
         // conflicts-no-ops instead of duplicating (#1856's dedup-tuple
         // divergence).
-        await engine.addTimelineEntry(slug, { // gbrain-allow-direct-insert: timeline write-through — the canonical markdown gains the same entry in this call, and the stored tuple is derived from the rendered bullet so sync/extract reconciliation dedups against it
+        const inserted = await engine.addTimelineEntry(slug, { // gbrain-allow-direct-insert: timeline write-through — the canonical markdown gains the same entry in this call, and the stored tuple is derived from the rendered bullet so sync/extract reconciliation dedups against it
           date: rendered.canonical.date,
           source: rendered.canonical.source,
           summary: rendered.canonical.summary,
           detail: entry.detail || '',
         }, { sourceId, skipExistenceCheck: true });
+        if (!inserted) {
+          const present = await engine.executeRaw<{ one: number }>(
+            `SELECT 1 AS one
+               FROM timeline_entries te JOIN pages p ON p.id=te.page_id
+              WHERE p.slug=$1 AND p.source_id=$2 AND te.date=$3::date
+                AND te.summary=$4 AND te.source=$5
+              LIMIT 1`,
+            [slug, sourceId, rendered.canonical.date, rendered.canonical.summary, rendered.canonical.source],
+          );
+          if (!present[0]) throw new Error('timeline write-through: canonical row insert was not persisted');
+        }
 
         // #2426 mirror (writePageThrough): on a durability-hardened repo,
         // commit the artifact so it reaches git. Best-effort — a commit
@@ -428,7 +460,7 @@ export async function writeTimelineEntryThrough(
         let pushed: 'pending' | undefined;
         let lastPushStatus: PushLogOutcome | undefined;
         try {
-          if (isDurabilityHardened(writeRoot)) {
+          if (!alreadyOnDisk && isDurabilityHardened(writeRoot)) {
             committed = commitWriteThroughFile(writeRoot, filePath, slug);
             if (committed) {
               pushed = 'pending';
@@ -438,7 +470,7 @@ export async function writeTimelineEntryThrough(
         } catch { /* best-effort */ }
 
         const file: WriteThroughResult = {
-          written: true,
+          written: !alreadyOnDisk,
           path: filePath,
           ...(committed ? { committed, pushed, lastPushStatus } : {}),
         };
