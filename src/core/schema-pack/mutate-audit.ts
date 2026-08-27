@@ -40,6 +40,7 @@ export type MutationOp =
   | 'add_link_type'
   | 'remove_link_type'
   | 'set_extractable'
+  | 'set_linkable'
   | 'set_expert_routing';
 
 export type MutationActor = 'cli' | `mcp:${string}` | 'autopilot' | 'test';

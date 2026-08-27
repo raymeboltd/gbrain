@@ -493,6 +493,7 @@ export interface AddTypeOpts {
   primitive: PackPrimitive;
   prefix: string;
   extractable?: boolean;
+  linkable?: boolean;
   expertRouting?: boolean;
   aliases?: string[];
 }
@@ -522,6 +523,7 @@ function buildAddTypeMutator(opts: AddTypeOpts): (m: SchemaPackManifest) => Sche
       path_prefixes: [opts.prefix],
       aliases: opts.aliases ?? [],
       extractable: opts.extractable ?? false,
+      linkable: opts.linkable ?? false,
       expert_routing: opts.expertRouting ?? false,
     };
     return { ...m, page_types: [...m.page_types, newType] };
@@ -683,6 +685,10 @@ export async function setExtractableOnType(packName: string, typeName: string, v
   return updateTypeOnPack(packName, { name: typeName, patch: { extractable: value } }, { ...mutateOpts });
 }
 
+export async function setLinkableOnType(packName: string, typeName: string, value: boolean, mutateOpts: MutateOpts = {}): Promise<MutateResult> {
+  return updateTypeOnPack(packName, { name: typeName, patch: { linkable: value } }, { ...mutateOpts });
+}
+
 export async function setExpertRoutingOnType(packName: string, typeName: string, value: boolean, mutateOpts: MutateOpts = {}): Promise<MutateResult> {
   return updateTypeOnPack(packName, { name: typeName, patch: { expert_routing: value } }, { ...mutateOpts });
 }
@@ -739,6 +745,7 @@ function buildBatchMutator(
           primitive: m.primitive as never,
           prefix: m.prefix as string,
           extractable: m.extractable as boolean | undefined,
+          linkable: m.linkable as boolean | undefined,
           expertRouting: m.expert_routing as boolean | undefined,
           aliases: m.aliases as string[] | undefined,
         }),
@@ -779,6 +786,11 @@ function buildBatchMutator(
     case 'set_extractable':
       return {
         mutate: buildUpdateTypeMutator({ name: m.type as string, patch: { extractable: m.value as boolean } }),
+        auditContext: { type: m.type as string },
+      };
+    case 'set_linkable':
+      return {
+        mutate: buildUpdateTypeMutator({ name: m.type as string, patch: { linkable: m.value as boolean } }),
         auditContext: { type: m.type as string },
       };
     case 'set_expert_routing':

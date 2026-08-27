@@ -56,7 +56,7 @@ export interface FactsBackstopCtx {
    *   - 'code_import'        — code import path
    *   - 'hook:compact'       — compaction-boundary checkpoint harvest (cathedral 5)
    */
-  source: 'sync:import' | 'mcp:put_page' | 'mcp:extract_facts' | 'file_upload' | 'code_import' | 'hook:compact';
+  source: 'sync:import' | 'mcp:put_page' | 'mcp:extract_facts' | 'file_upload' | 'code_import' | 'hook:compact' | 'source-event';
   /** Execution mode — D8. Default 'queue' (fire-and-forget). */
   mode?: 'queue' | 'inline';
   /** Notability filter — D4. Default 'all'; sync uses 'high-only'. */
@@ -67,6 +67,13 @@ export interface FactsBackstopCtx {
   remote?: boolean;
   /** Optional entity hints (extract_facts MCP op forwards these). */
   entityHints?: string[];
+  /**
+   * Optional fail-closed entity allowlist for automated source-event
+   * projection. When present, extracted facts without a resolved entity or
+   * resolving outside this set are discarded before dedup/write. Ordinary
+   * interactive and sync callers omit it and retain the upstream behavior.
+   */
+  allowedEntitySlugs?: string[];
   /** Optional visibility tier (default 'private'). extract_facts forwards `world` when caller asks. */
   visibility?: 'private' | 'world';
   /** Override the chat model (extract_facts forwards user's model param when set). */
@@ -628,6 +635,11 @@ async function runPipelineBodyInner(
     const resolvedSlug = f.entity_slug
       ? await resolveEntitySlug(ctx.engine, ctx.sourceId, f.entity_slug)
       : null;
+
+    if (ctx.allowedEntitySlugs) {
+      const allowed = new Set(ctx.allowedEntitySlugs);
+      if (resolvedSlug === null || !allowed.has(resolvedSlug)) continue;
+    }
 
     // Dedup against DB candidates (correct per Codex Q7: fence rows
     // have no embeddings; FS lock + sync invariant means DB == fence

@@ -124,7 +124,7 @@ Authoring (v0.40.6.0):
   edit <name>             Print the on-disk pack file path
   diff <a> <b>            Compare page_type sets across two packs
 
-  add-type <name> --primitive <p> --prefix <dir/>
+  add-type <name> --primitive <p> --prefix <dir/> [--linkable]
                           [--extractable] [--expert] [--alias <a>]* [--pack <name>]
   remove-type <name>      [--pack <name>]
   update-type <name>      [--extractable BOOL] [--expert BOOL] [--primitive P] [--pack <name>]
@@ -265,6 +265,7 @@ async function runShow(args: string[]): Promise<void> {
         directory: pt.path_prefixes[0] ?? null,
         path_prefixes: pt.path_prefixes,
         extractable: pt.extractable,
+        linkable: pt.linkable ?? false,
         expert_routing: pt.expert_routing,
         aliases: pt.aliases ?? [],
       })),
@@ -293,6 +294,7 @@ async function runShow(args: string[]): Promise<void> {
   for (const pt of manifest.page_types) {
     const flags: string[] = [];
     if (pt.extractable) flags.push('extractable');
+    if (pt.linkable) flags.push('linkable');
     if (pt.expert_routing) flags.push('expert');
     const flagStr = flags.length > 0 ? ` [${flags.join(', ')}]` : '';
     const prefixStr = pt.path_prefixes.length > 0 ? ` (${pt.path_prefixes.join(', ')})` : '';
@@ -814,6 +816,7 @@ async function runExplainCmd(args: string[]): Promise<void> {
   console.log(`  path_prefixes: ${found.path_prefixes.join(', ')}`);
   console.log(`  aliases:       ${(found.aliases ?? []).join(', ') || '<none>'}`);
   console.log(`  extractable:   ${found.extractable}`);
+  console.log(`  linkable:      ${found.linkable ?? false}`);
   console.log(`  expert_routing: ${found.expert_routing}`);
 }
 
@@ -1069,6 +1072,7 @@ async function runAddTypeCmd(args: string[]): Promise<void> {
   let primitive: string | undefined;
   let prefix: string | undefined;
   let extractable = false;
+  let linkable = false;
   let expert = false;
   const aliases: string[] = [];
   for (let i = 0; i < args.length; i++) {
@@ -1078,6 +1082,7 @@ async function runAddTypeCmd(args: string[]): Promise<void> {
     else if (a === '--prefix') prefix = args[++i];
     else if (a?.startsWith('--prefix=')) prefix = a.slice('--prefix='.length);
     else if (a === '--extractable') extractable = true;
+    else if (a === '--linkable') linkable = true;
     else if (a === '--expert' || a === '--expert-routing') expert = true;
     else if (a === '--alias') aliases.push(args[++i]!);
     else if (a?.startsWith('--alias=')) aliases.push(a.slice('--alias='.length));
@@ -1090,7 +1095,7 @@ async function runAddTypeCmd(args: string[]): Promise<void> {
   try {
     const result = await addTypeToPack(packName, {
       name, primitive: primitive as PackPrimitive, prefix,
-      extractable, expertRouting: expert, aliases,
+      extractable, linkable, expertRouting: expert, aliases,
     });
     emitMutateResult(result, json);
   } catch (e) { handleMutationError(e); }
@@ -1109,7 +1114,7 @@ async function runUpdateTypeCmd(args: string[]): Promise<void> {
   const { json } = parseFlags(args);
   const packName = pickPackName({}, args);
   const name = args.filter((a) => !a.startsWith('--'))[0];
-  if (!name) { console.error('Usage: gbrain schema update-type <name> [--extractable BOOL] [--expert BOOL] [--primitive P]'); process.exit(2); }
+  if (!name) { console.error('Usage: gbrain schema update-type <name> [--extractable BOOL] [--linkable BOOL] [--expert BOOL] [--primitive P]'); process.exit(2); }
   const patch: Record<string, unknown> = {};
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -1117,6 +1122,10 @@ async function runUpdateTypeCmd(args: string[]): Promise<void> {
       const v = parseBool(args[++i]);
       if (v === null) { console.error('--extractable requires true|false'); process.exit(2); }
       patch.extractable = v;
+    } else if (a === '--linkable') {
+      const v = parseBool(args[++i]);
+      if (v === null) { console.error('--linkable requires true|false'); process.exit(2); }
+      patch.linkable = v;
     } else if (a === '--expert' || a === '--expert-routing') {
       const v = parseBool(args[++i]);
       if (v === null) { console.error('--expert requires true|false'); process.exit(2); }

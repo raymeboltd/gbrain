@@ -22,7 +22,7 @@ describe('migration v143 source-event receipts', () => {
         WHERE table_name='source_event_receipts' ORDER BY column_name`,
     );
     const names = columns.map((row) => row.column_name);
-    for (const name of ['source_key', 'processor_version', 'target_results', 'status']) {
+    for (const name of ['source_key', 'processor_version', 'target_results', 'status', 'event_id', 'revision_id', 'artifact_slug']) {
       expect(names).toContain(name);
     }
   });
@@ -67,11 +67,15 @@ describe('migration v143 source-event receipts', () => {
        VALUES ('default','legacy-key','email','legacy://1','raw/legacy/1','hash',now(),'2026-01-01','partial')`,
     );
     await engine.setConfig('version', '142');
-    expect(await runMigrations(engine)).toEqual({ applied: 1, current: LATEST_VERSION });
+    expect(await runMigrations(engine)).toEqual({ applied: 2, current: LATEST_VERSION });
 
-    const rows = await engine.executeRaw<{ source_key: string; processor_version: string }>(
-      `SELECT source_key, processor_version FROM source_event_receipts WHERE event_key='legacy-key'`,
+    const rows = await engine.executeRaw<{ source_key: string; processor_version: string; event_id: string; revision_id: string; artifact_slug: string }>(
+      `SELECT source_key,processor_version,event_id,revision_id,artifact_slug
+         FROM source_event_receipts WHERE event_key='legacy-key'`,
     );
-    expect(rows[0]).toEqual({ source_key: 'page:raw/legacy/1', processor_version: 'legacy' });
+    expect(rows[0]).toEqual({
+      source_key: 'page:raw/legacy/1', processor_version: 'legacy',
+      event_id: 'legacy-key', revision_id: 'legacy-key', artifact_slug: 'source-events/legacy-key',
+    });
   });
 });

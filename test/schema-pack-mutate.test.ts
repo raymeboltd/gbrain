@@ -1,4 +1,4 @@
-// v0.40.6.0 — mutate.ts contract tests for the 11 primitives + withMutation skeleton.
+// mutate.ts contract tests for schema-pack mutation primitives + withMutation skeleton.
 
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -18,6 +18,7 @@ import {
   SchemaPackMutationError,
   setExpertRoutingOnType,
   setExtractableOnType,
+  setLinkableOnType,
   updateTypeOnPack,
 } from '../src/core/schema-pack/mutate.ts';
 import { loadPackFromFile, parseYamlMini } from '../src/core/schema-pack/loader.ts';
@@ -409,7 +410,7 @@ describe('addLinkTypeToPack / removeLinkTypeFromPack', () => {
 
 // ─── flag setters ──────────────────────────────────────────────────────
 
-describe('setExtractableOnType / setExpertRoutingOnType', () => {
+describe('type capability setters', () => {
   it('setExtractable flips the flag', async () => {
     await withEnv({ GBRAIN_HOME: tmpDir, GBRAIN_AUDIT_DIR: auditDir }, async () => {
       const path = seedPack('mine', 'json');
@@ -425,6 +426,16 @@ describe('setExtractableOnType / setExpertRoutingOnType', () => {
       const path = seedPack('mine', 'json');
       await setExpertRoutingOnType('mine', 'person', true, { lockDir });
       expect(loadPackFromFile(path).page_types[0]!.expert_routing).toBe(true);
+    });
+  });
+
+  it('setLinkable flips the pack-driven mention policy', async () => {
+    await withEnv({ GBRAIN_HOME: tmpDir, GBRAIN_AUDIT_DIR: auditDir }, async () => {
+      const path = seedPack('mine', 'json');
+      await setLinkableOnType('mine', 'person', false, { lockDir });
+      expect(loadPackFromFile(path).page_types[0]!.linkable).toBe(false);
+      await setLinkableOnType('mine', 'person', true, { lockDir });
+      expect(loadPackFromFile(path).page_types[0]!.linkable).toBe(true);
     });
   });
 

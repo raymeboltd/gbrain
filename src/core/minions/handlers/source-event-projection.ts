@@ -1,7 +1,7 @@
 import { tryAcquireDbLock } from '../../db-lock.ts';
 import type { BrainEngine } from '../../engine.ts';
 import type { MinionJobContext } from '../types.ts';
-import { SOURCE_EVENT_PROCESSOR_VERSION, projectSourceEvent } from '../../source-events/projector.ts';
+import { SOURCE_EVENT_PROCESSOR_VERSION, projectSourceEvent, retractSourceEvent } from '../../source-events/projector.ts';
 import { assertSourceEventAdmission, readSourceEventPolicy } from '../../source-events/policy.ts';
 
 const SUPPORTED_SOURCE_EVENT_TYPES = [
@@ -9,6 +9,9 @@ const SUPPORTED_SOURCE_EVENT_TYPES = [
   'email',
   'calendar-event',
   'meeting-note',
+  'meeting',
+  'imessage-daily',
+  'slack',
   'event',
   'conversation',
 ] as const;
@@ -51,15 +54,17 @@ async function listCandidates(engine: BrainEngine, sourceId: string, limit: numb
        FROM pages p
       WHERE p.source_id=$1
         AND p.deleted_at IS NULL
-        AND p.type = ANY($2::text[])
+        AND (p.type = ANY($2::text[]) OR COALESCE(p.frontmatter->>'source_event', '') = 'true')
         AND COALESCE(p.frontmatter->>'dream_generated', '') <> 'true'
+        AND COALESCE(p.frontmatter->>'source_event_artifact', '') <> 'true'
         AND NOT EXISTS (
           SELECT 1 FROM source_event_receipts r
            WHERE r.source_id=p.source_id
              AND r.source_slug=p.slug
              AND r.content_hash=md5(COALESCE(p.compiled_truth, '') || E'\n' || COALESCE(p.timeline, ''))
              AND r.processor_version=$4
-             AND r.status IN ('applied','partial','skipped','review')
+             AND r.status IN ('applied','partial','skipped')
+             AND NOT (r.errors @> '[{"code":"source_retracted"}]'::jsonb)
         )
       ORDER BY p.updated_at, p.slug
       LIMIT $3`,
@@ -79,13 +84,43 @@ function metadata(row: CandidateRow): Record<string, unknown> {
 
 function sourceIdentity(row: CandidateRow): { sourceKey: string; sourceUri: string } {
   const meta = metadata(row);
-  const keyFields = ['provider_item_id', 'message_id', 'event_id', 'session_id', 'thread_id'];
-  const sourceKey = keyFields
+  const transcript = meta.transcript_import && typeof meta.transcript_import === 'object'
+    ? meta.transcript_import as Record<string, unknown>
+    : null;
+  const transcriptSession = transcript?.session_id;
+  const transcriptHarness = transcript?.harness;
+  const transcriptPart = transcript?.part;
+  if (typeof transcriptSession === 'string' && transcriptSession.trim()) {
+    const harness = typeof transcriptHarness === 'string' && transcriptHarness.trim()
+      ? transcriptHarness.trim()
+      : 'unknown';
+    const part = typeof transcriptPart === 'number' && Number.isInteger(transcriptPart)
+      ? String(transcriptPart)
+      : '1';
+    return {
+      sourceKey: `conversation:${harness}:session_id:${transcriptSession.trim()}:part:${part}`,
+      sourceUri: typeof meta.source_uri === 'string' && meta.source_uri.trim()
+        ? meta.source_uri.trim()
+        : `gbrain://${encodeURIComponent(row.slug)}`,
+    };
+  }
+  const keyFields = [
+    'provider_item_id', 'message_id', 'event_id', 'note_id', 'session_id',
+    'thread_id', 'capture_id', 'revision_id', 'conversation_id', 'id',
+  ];
+  const matched = keyFields
+    .map((field) => ({ field, value: meta[field] }))
+    .find(({ value }) => typeof value === 'string' && value.trim());
+  const providerFields = ['provider', 'source_tool', 'network'];
+  const provider = providerFields
     .map((field) => meta[field])
     .find((value) => typeof value === 'string' && value.trim()) as string | undefined;
+  const namespace = provider ? `${provider.trim()}:` : '';
   const uri = meta.source_uri;
   return {
-    sourceKey: sourceKey?.trim() ?? `page:${row.slug}`,
+    sourceKey: matched
+      ? `${namespace}${matched.field}:${String(matched.value).trim()}`
+      : `page:${row.slug}`,
     sourceUri: typeof uri === 'string' && uri.trim()
       ? uri.trim()
       : `gbrain://${encodeURIComponent(row.slug)}`,
@@ -112,6 +147,23 @@ export function makeSourceEventProjectionHandler(engine: BrainEngine) {
     if (!lock) return { status: 'already_in_progress', sourceId };
 
     try {
+      const retractions = await engine.executeRaw<{ event_id: string; artifact_slug: string }>(
+        `SELECT DISTINCT ON (r.event_id) r.event_id,r.artifact_slug
+           FROM source_event_receipts r
+           JOIN pages p ON p.source_id=r.source_id AND p.slug=r.source_slug
+          WHERE r.source_id=$1 AND p.deleted_at IS NOT NULL
+            AND NOT (r.errors @> '[{"code":"source_retracted"}]'::jsonb)
+          ORDER BY r.event_id,r.observed_at DESC,r.id DESC`,
+        [sourceId],
+      );
+      for (const row of retractions) {
+        await retractSourceEvent(engine, {
+          sourceId,
+          eventId: row.event_id,
+          artifactSlug: row.artifact_slug,
+          reason: 'source page deleted',
+        });
+      }
       const candidates = await listCandidates(engine, sourceId, limit);
       let applied = 0;
       let partial = 0;
@@ -166,8 +218,19 @@ export function makeSourceEventProjectionHandler(engine: BrainEngine) {
           `(scanned=${candidates.length}, applied=${applied}, partial=${partial}, skipped=${skipped}, review=${reviews})`,
         );
       }
+      const silentRows = await engine.executeRaw<{ count: number }>(
+        `SELECT COUNT(*)::int AS count FROM source_event_receipts
+          WHERE source_id=$1 AND processor_version=$2
+            AND status IN ('partial','skipped','review','error')
+            AND jsonb_array_length(errors)=0`,
+        [sourceId, SOURCE_EVENT_PROCESSOR_VERSION],
+      );
+      const silentSkips = Number(silentRows[0]?.count ?? 0);
+      if (silentSkips > 0) {
+        throw new Error(`source-event-projection: ${silentSkips} non-applied receipt(s) have no explicit cause`);
+      }
       const status = partial > 0 || skipped > 0 || reviews > 0 || failed > 0 || errors > 0 ? 'partial' : 'completed';
-      return { status, sourceId, scanned: candidates.length, applied, partial, skipped, reviews, failed, errors };
+      return { status, sourceId, scanned: candidates.length, applied, partial, skipped, reviews, failed, errors, retracted: retractions.length, silent_skips: silentSkips };
     } finally {
       await lock.release();
     }

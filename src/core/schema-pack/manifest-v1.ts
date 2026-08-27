@@ -126,6 +126,18 @@ const PageTypeSchema = z.object({
    */
   extractable: z.union([z.boolean(), ExtractableSpecSchema]).default(false),
   /**
+   * Whether ordinary body mentions may create derived links to pages of
+   * this type. This is deliberately independent from `primitive`: some
+   * entity-shaped types are sensitive or too ambiguous for automatic
+   * linking, while user-defined concept/temporal types (for example a
+   * project or deal) may be safe and useful to link.
+   *
+   * Optional for manifests authored before this field existed. The
+   * accessor owns the narrow legacy fallback; new pack types opt in with
+   * `linkable: true` and never require a core-code change.
+   */
+  linkable: z.boolean().optional(),
+  /**
    * Whether this type is an "expert" for find_experts / whoknows queries
    * (replaces hardcoded ['person','company'] at whoknows.ts:89 + the
    * find_experts SQL hardcodes).

@@ -3432,10 +3432,10 @@ single canonical `src/core/model-pricing.ts` with `canonicalLookup`.
 
 ## v0.41.18.0 onboard wave follow-ups (v0.42.1+)
 
-- **TODO-A (P2)**: Pack-aware `linkable: boolean` per-type field on schema-pack
-  manifests. Both `gbrain extract links --by-mention` and `--ner` would consult
-  it to gate which entity types participate in gazetteer construction. Currently
-  uses a hardcoded `['person', 'company', 'organization', 'entity']` list.
+- **DONE 2026-08-27 — TODO-A (P2)**: Pack-aware `linkable: boolean` per-type
+  field now drives the shared gazetteer used by `--by-mention`, `--ner` and
+  source-event projection. Explicit pack declarations win; pre-field packs use
+  a narrow legacy-name bridge; pack-load failure fails empty.
 
 - **TODO-B (P3)**: LLM-based entity disambiguation for `--ner`. v0.42.0 ships
   regex+gazetteer only; misses cases like "Anthropic's founders" → `Anthropic`
@@ -3744,7 +3744,11 @@ PR bisectable.
   soft-delete + restore infrastructure.
 ## v0.41.10.0 follow-ups (orphan-reduction + surrogate fix wave)
 
-- [ ] **TODO-1 (P2) — Pack-aware `--by-mention` gazetteer.** Add `linkable: boolean` per-type field to the schema-pack manifest (`src/core/schema-pack/manifest-v1.ts`, currently has `extractable` + `expert_routing`). New accessor `linkableTypesFromPack(pack: ResolvedPack)` in a new `schema-pack/linkable-types.ts` module mirroring `expert-types.ts`. `src/core/by-mention.ts:buildGazetteer` consults the pack-aware filter first via `loadActivePackBestEffort(ctx)`, falls back to the hardcoded `LINKABLE_ENTITY_TYPES` const for non-pack brains. Respects the D4 fail-empty contract (pack-load failure → empty filter, NOT hardcoded defaults). User-defined types like `researcher` get auto-linked. Requires: pack-schema bump, rubric/registry updates, regression test that pack-aware + non-pack brains produce expected gazetteer shapes.
+- [x] **TODO-1 (P2) — Pack-aware `--by-mention` gazetteer (2026-08-27).**
+  `PageTypeSchema.linkable`, `linkableTypesFromPack`, active-pack fail-empty
+  loading, CLI authoring flags and custom-type regression coverage are shipped.
+  `LINKABLE_ENTITY_TYPES` remains only the compatibility bridge for manifests
+  authored before the field.
 
 - [ ] **TODO-2 (P2) — Cycle integration for `--by-mention`.** v0.41.10.0 ships CLI-only. Wire the mention pass into the dream-cycle extract phase so brains running autopilot get incremental auto-link without manual cron. Two paths: (a) refactor `runExtractCore` (currently FS-only at `extract.ts:320`) to support DB-source, then cycle calls it as before; (b) add a dedicated `extractMentionsFromDbForCycle()` callable directly from `runPhaseExtract` at `core/cycle.ts:810` so `runExtractCore` stays focused. Add `auto_link_mentions` config gate (default OFF for safety — opt-in). Also resolve the `sourceScopeOpts(ctx)` issue: cycle context doesn't have an `OperationContext`; need a new helper that produces equivalent scoping for the trusted-workspace cycle write context.
 

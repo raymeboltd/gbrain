@@ -75,6 +75,9 @@ const ELIGIBLE_TYPES: PageType[] = [
   // personal pack: chat day-rollups (chat-rollup.py, both beeper/WhatsApp and
   // iMessage networks) reuse upstream's imessage-daily input contract
   'imessage-daily',
+  // Normalized source-event lanes. These are still subject to the minimum
+  // body, Dream exclusion, content exclusion and explicit feature gates.
+  'message', 'event', 'conversation',
   // gbrain-base-v2 canonical types declared extractable in the pack
   // (concept deliberately omitted — see above)
   'media', 'tweet', 'atom', 'analysis',

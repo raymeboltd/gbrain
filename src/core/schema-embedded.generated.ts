@@ -573,7 +573,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_timeline_event_dedup ON timeline_entries(e
 CREATE TABLE IF NOT EXISTS source_event_receipts (
   id                BIGSERIAL PRIMARY KEY,
   source_id         TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  event_id          TEXT NOT NULL,
+  revision_id       TEXT NOT NULL,
   event_key         TEXT NOT NULL,
+  artifact_slug     TEXT NOT NULL,
   source_kind       TEXT NOT NULL,
   source_key        TEXT NOT NULL,
   source_uri        TEXT NOT NULL,
@@ -604,6 +607,8 @@ CREATE INDEX IF NOT EXISTS idx_source_event_receipts_observed
   ON source_event_receipts(source_id, observed_at, source_slug);
 CREATE INDEX IF NOT EXISTS idx_source_event_receipts_lookup
   ON source_event_receipts(source_id, source_slug, content_hash, processor_version);
+CREATE INDEX IF NOT EXISTS idx_source_event_receipts_event
+  ON source_event_receipts(source_id, event_id, observed_at);
 
 -- ============================================================
 -- page_versions: snapshot history for compiled_truth
@@ -1528,6 +1533,7 @@ BEGIN
     ALTER TABLE tags ENABLE ROW LEVEL SECURITY;
     ALTER TABLE raw_data ENABLE ROW LEVEL SECURITY;
     ALTER TABLE timeline_entries ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE source_event_receipts ENABLE ROW LEVEL SECURITY;
     ALTER TABLE page_versions ENABLE ROW LEVEL SECURITY;
     ALTER TABLE ingest_log ENABLE ROW LEVEL SECURITY;
     ALTER TABLE config ENABLE ROW LEVEL SECURITY;

@@ -6313,6 +6313,26 @@ export const MIGRATIONS: Migration[] = [
         ON source_event_receipts(source_id, source_slug, content_hash, processor_version);
     `,
   },
+  {
+    version: 144,
+    name: 'source_event_stable_identity_and_artifact',
+    idempotent: true,
+    sql: `
+      ALTER TABLE source_event_receipts ADD COLUMN IF NOT EXISTS event_id TEXT;
+      ALTER TABLE source_event_receipts ADD COLUMN IF NOT EXISTS revision_id TEXT;
+      ALTER TABLE source_event_receipts ADD COLUMN IF NOT EXISTS artifact_slug TEXT;
+      UPDATE source_event_receipts
+         SET event_id=COALESCE(event_id, event_key),
+             revision_id=COALESCE(revision_id, event_key),
+             artifact_slug=COALESCE(artifact_slug, 'source-events/' || event_key)
+       WHERE event_id IS NULL OR revision_id IS NULL OR artifact_slug IS NULL;
+      ALTER TABLE source_event_receipts ALTER COLUMN event_id SET NOT NULL;
+      ALTER TABLE source_event_receipts ALTER COLUMN revision_id SET NOT NULL;
+      ALTER TABLE source_event_receipts ALTER COLUMN artifact_slug SET NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_source_event_receipts_event
+        ON source_event_receipts(source_id, event_id, observed_at);
+    `,
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

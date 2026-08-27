@@ -56,6 +56,7 @@ from the markdown contract.
 | **Facts** | `## Facts` fenced table between `<!--- gbrain:facts:begin -->` / `:end -->` markers | `facts` | `extract_facts` cycle phase |
 | **Links** | Inline `[text](slug)` / `[[slug]]` in markdown body + frontmatter `direction: incoming` | `links` | `extract links` |
 | **Timeline** | `## Timeline` section after `<!-- timeline -->` sentinel | `timeline_entries` | `extract timeline` |
+| **Source-event projections** | Private `source-events/<event-id>.md` artifact with active relationship links and revision/candidate audit marker | `pages`, `links`, plus facts in the target entity fence | `sync` + `extract all`; source-event replay reconciles the active revision |
 | **Tags** | Frontmatter `tags:` YAML array | `tags` | `importFromFile` (reconciles per-page on import) |
 | **emotional_weight** | Recomputed from takes + tags | `pages.emotional_weight` (signal column) | `recompute_emotional_weight` cycle phase |
 | **synthesis_evidence** | FK into `takes` rows (`slug#N`) inside synthesis pages | `synthesis_evidence` | `extract takes` (transitively) |
@@ -90,6 +91,7 @@ the repo. The architectural rule still holds — these aren't
 | `gbrain_cycle_locks` / migration ledger | Infrastructure. |
 | `op_checkpoint_paths` | Sync-resume checkpoint. Append-only progress banking; a completed sync makes it irrelevant. |
 | `config` (some keys) | Site-local routing config (e.g. `sync.repo_path`). |
+| `source_event_receipts` | Operational stage/idempotency ledger. User knowledge is in the private source-event artifact and entity facts fences. |
 
 A new derived table that holds user-knowledge MUST land FS-first.
 If you're tempted to add one as "DB-only for now," the structural

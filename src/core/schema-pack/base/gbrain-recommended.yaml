@@ -67,6 +67,7 @@ page_types:
       - projects/
     aliases: []
     extractable: false
+    linkable: true
     expert_routing: false
 
   - name: source

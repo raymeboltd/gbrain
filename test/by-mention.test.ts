@@ -35,6 +35,7 @@ import {
   findMentionedEntities,
   tokenizeForScan,
   tokenizeTitle,
+  resolveLinkableEntityTypes,
   LINKABLE_ENTITY_TYPES,
   type Gazetteer,
   type GazetteerEntry,
@@ -55,6 +56,7 @@ afterAll(async () => {
 beforeEach(async () => {
   await engine.executeRaw('DELETE FROM links');
   await engine.executeRaw('DELETE FROM pages');
+  await engine.setConfig('schema_pack', 'gbrain-base');
 });
 
 // Tiny gazetteer builder for pure-fn cases that don't need engine.
@@ -766,15 +768,18 @@ describe('buildGazetteer — engine integration', () => {
     expect(g2.has('john')).toBe(true);
   });
 
-  test('LINKABLE_ENTITY_TYPES exposes the hardcoded contract', () => {
-    // Regression: if anyone changes the hardcoded type list, this test
-    // forces a deliberate change (and a corresponding test update).
-    // fork(a494f4ce3): widened with 'project','deal' so the personal pack's
-    // project/deal entity pages participate in mention linking. This is the
-    // deliberate companion update the assertion above asks for.
-    // fork(2026-08-27): widened with 'goal' - robin-base-v2 gained a goal
-    // entity type (goals/) so dream outputs mention-link back to goal pages.
+  test('LINKABLE_ENTITY_TYPES remains a legacy compatibility export only', () => {
     expect(LINKABLE_ENTITY_TYPES).toEqual(['person', 'company', 'organization', 'entity', 'project', 'deal', 'goal']);
+  });
+
+  test('active pack declarations drive project linkability without a code-list patch', async () => {
+    await engine.setConfig('schema_pack', 'gbrain-recommended');
+    expect(await resolveLinkableEntityTypes(engine)).toContain('project');
+    await engine.putPage('projects/car-program', {
+      type: 'project', title: 'Car Program', compiled_truth: 'Known project.', timeline: '', frontmatter: {},
+    });
+    const gazetteer = await buildGazetteer(engine);
+    expect(gazetteer.get('car')?.map((entry) => entry.slug)).toEqual(['projects/car-program']);
   });
 
   // CJK — engine-backed tests

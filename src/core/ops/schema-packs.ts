@@ -169,7 +169,7 @@ const schema_graph: Operation = {
 
 const schema_explain_type: Operation = {
   name: 'schema_explain_type',
-  description: 'v0.40.6.0: resolved settings for a single page_type in the active pack. Returns {pack, type, primitive, path_prefixes, aliases, extractable, expert_routing}.',
+  description: 'Resolved settings for a single page_type in the active pack. Returns {pack, type, primitive, path_prefixes, aliases, extractable, linkable, expert_routing}.',
   params: {
     type: { type: 'string', required: true, description: 'Page type name to explain' },
   },
@@ -222,7 +222,7 @@ const schema_review_orphans: Operation = {
 
 const schema_apply_mutations: Operation = {
   name: 'schema_apply_mutations',
-  description: 'v0.40.7.0: batched schema pack mutation. ATOMIC: every mutation is validated against an in-memory manifest first, and the pack file is written to disk at most once, after the FULL batch has proven valid — so a failure at any point leaves the pack file byte-identical to its pre-batch state (never a partial write). Audit log records one batch_id. Admin scope; NOT localOnly so remote agents (your OpenClaw, etc.) can author packs over normal MCP. Mutation shape per ApplyMutationsRequest type — supports add_type / remove_type / update_type / add_alias / remove_alias / add_prefix / remove_prefix / add_link_type / remove_link_type / set_extractable / set_expert_routing.',
+  description: 'Batched schema pack mutation. ATOMIC: every mutation is validated against an in-memory manifest first, and the pack file is written to disk at most once, after the FULL batch has proven valid — so a failure at any point leaves the pack file byte-identical to its pre-batch state (never a partial write). Audit log records one batch_id. Admin scope; NOT localOnly so remote agents can author packs over normal MCP. Supports add_type / remove_type / update_type / add_alias / remove_alias / add_prefix / remove_prefix / add_link_type / remove_link_type / set_extractable / set_linkable / set_expert_routing.',
   params: {
     pack: { type: 'string', required: true, description: 'Pack to mutate (must not be bundled)' },
     mutations: {

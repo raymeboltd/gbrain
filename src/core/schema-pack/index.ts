@@ -123,6 +123,11 @@ export {
 } from './expert-types.ts';
 
 export {
+  LEGACY_LINKABLE_ENTITY_TYPES,
+  linkableTypesFromPack,
+} from './linkable-types.ts';
+
+export {
   extractableTypesFromPack,
   extractableSpecsFromPack,
   getExtractableSpec,
@@ -186,6 +191,7 @@ export {
   addLinkTypeToPack,
   removeLinkTypeFromPack,
   setExtractableOnType,
+  setLinkableOnType,
   setExpertRoutingOnType,
   type BatchMutationRequest,
   type BatchMutationResult,

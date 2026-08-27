@@ -33,12 +33,17 @@ import { stripCodeBlocks } from './link-extraction.ts';
 // #4222: shared generic-token reject list — same list gates enrichEntity
 // minting and drives the junk_entity_hubs doctor check.
 import { isGenericEntityToken } from './entity-name-quality.ts';
+import { loadActivePackForLocalEngine } from './schema-pack/best-effort.ts';
+import {
+  LEGACY_LINKABLE_ENTITY_TYPES,
+  linkableTypesFromPack,
+} from './schema-pack/linkable-types.ts';
 
 /** D2: hardcoded entity types for v1. Pack-aware extension is TODO-1. */
 // fork: 'goal' added 2026-08-27 (dream-consumption reshape) so new
 // atoms/reflections mentioning a goal by title/alias link back to its page;
 // pairs with the robin-base-v2 goal page type (primitive entity, goals/).
-export const LINKABLE_ENTITY_TYPES = ['person', 'company', 'organization', 'entity', 'project', 'deal', 'goal'] as const;
+export const LINKABLE_ENTITY_TYPES = LEGACY_LINKABLE_ENTITY_TYPES;
 
 /**
  * Minimum title length for gazetteer inclusion. Filters out 2-3 char names
@@ -101,6 +106,15 @@ export interface BuildGazetteerOpts {
    * raw title match). Merged with DEFAULT_IGNORE_LIST.
    */
   extraIgnore?: string[];
+  /** Explicit internal/test override. Omit to use active-pack entity types. */
+  linkableTypes?: readonly string[];
+}
+
+/** Resolve linkability from the active schema pack; pack failure fails empty. */
+export async function resolveLinkableEntityTypes(engine: BrainEngine): Promise<string[]> {
+  const pack = await loadActivePackForLocalEngine(engine);
+  if (!pack) return [];
+  return [...new Set(linkableTypesFromPack(pack.manifest))];
 }
 
 export interface FindMentionsOpts {
@@ -365,7 +379,7 @@ export function tokenizeTitle(title: string): string[] {
 /**
  * Build a token-Map gazetteer from all entity-typed pages in the brain.
  *
- * Hardcoded type filter per D2 (pack-awareness is TODO-1). Soft-deleted
+ * Active-pack entity primitive filter. Soft-deleted
  * pages excluded. Pages with too-short titles excluded (MIN_NAME_LENGTH).
  * Ignore-list applied per CK12: built-in ambiguous tokens dropped unless
  * the user has explicitly created the corresponding page.
@@ -377,13 +391,14 @@ export async function buildGazetteer(
   engine: BrainEngine,
   opts: BuildGazetteerOpts = {},
 ): Promise<Gazetteer> {
-  const typeList = LINKABLE_ENTITY_TYPES.map(t => `'${t}'`).join(', ');
+  const linkableTypes = opts.linkableTypes ?? await resolveLinkableEntityTypes(engine);
+  if (linkableTypes.length === 0) return new Map();
   const rows = await engine.executeRaw<{ slug: string; source_id: string | null; title: string | null; type: string | null }>(
     `SELECT slug, source_id, title, type
      FROM pages
-     WHERE type IN (${typeList})
+     WHERE type = ANY($1::text[])
        AND deleted_at IS NULL`,
-    [],
+    [linkableTypes],
   );
 
   // Pre-build the existing-slug Set so the ignore-list rule can check
@@ -453,9 +468,9 @@ export async function buildGazetteer(
       `SELECT pa.alias_norm, pa.slug, pa.source_id, p.title
        FROM page_aliases pa
        JOIN pages p ON p.slug = pa.slug AND p.source_id = pa.source_id
-       WHERE p.type IN (${typeList})
+       WHERE p.type = ANY($1::text[])
          AND p.deleted_at IS NULL`,
-      [],
+      [linkableTypes],
     );
     const ignoreLc = new Set(Array.from(ignoreSet, (s) => s.toLowerCase()));
     // Per-source title index for alias-vs-title collision checks.

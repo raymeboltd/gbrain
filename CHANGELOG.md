@@ -2,6 +2,35 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **Default-off source-event projection under Autopilot.** Approved sources can
+  project message, email, calendar, meeting, conversation, Slack and explicit
+  authoring signals into one private, filesystem-canonical source-event
+  artifact. Stable provider identity, content/timestamp revisions, processor
+  replay, per-stage receipts and source-delete retraction make corrections
+  auditable and idempotent. The artifact links only already-known entities;
+  raw source text is never copied into receipt payloads or entity pages.
+- **Facts and review candidates for source events.** Known-entity facts reuse
+  the upstream facts fence writer with a strict resolved-target allowlist.
+  Commitments become review-only task candidates and facts on project/deal/goal
+  pages become review-only project-update candidates. The projector never
+  writes `ops/tasks.md` and never rewrites compiled truth.
+- **Pack-driven mention linkability.** Schema-pack page types may declare
+  `linkable: true|false`; by-mention, NER and source-event gazetteers consume
+  the active pack and fail empty when it cannot load. `schema add-type` and
+  `schema update-type` accept `--linkable`, so custom types no longer require
+  a core-code allowlist patch.
+
+### Security
+- Source-event jobs are protected from remote submission, recheck their
+  default-off source allowlist in both scheduler and handler, require
+  filesystem-canonical write-through, quarantine ambiguous/oversized/high-
+  fanout inputs, exclude Dream and source-event artifacts from recursive
+  intake, and keep every non-applied receipt cause explicit. Private artifacts
+  and backlinks stay hidden from remote page/backlink reads.
+
 ## [0.46.34.0] - 2026-08-26
 
 The db-availability wave: gbrain now detects which engine a brain runs on,
