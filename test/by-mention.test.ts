@@ -772,7 +772,9 @@ describe('buildGazetteer — engine integration', () => {
     // fork(a494f4ce3): widened with 'project','deal' so the personal pack's
     // project/deal entity pages participate in mention linking. This is the
     // deliberate companion update the assertion above asks for.
-    expect(LINKABLE_ENTITY_TYPES).toEqual(['person', 'company', 'organization', 'entity', 'project', 'deal']);
+    // fork(2026-08-27): widened with 'goal' - robin-base-v2 gained a goal
+    // entity type (goals/) so dream outputs mention-link back to goal pages.
+    expect(LINKABLE_ENTITY_TYPES).toEqual(['person', 'company', 'organization', 'entity', 'project', 'deal', 'goal']);
   });
 
   // CJK — engine-backed tests

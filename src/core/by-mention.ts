@@ -35,7 +35,10 @@ import { stripCodeBlocks } from './link-extraction.ts';
 import { isGenericEntityToken } from './entity-name-quality.ts';
 
 /** D2: hardcoded entity types for v1. Pack-aware extension is TODO-1. */
-export const LINKABLE_ENTITY_TYPES = ['person', 'company', 'organization', 'entity', 'project', 'deal'] as const;
+// fork: 'goal' added 2026-08-27 (dream-consumption reshape) so new
+// atoms/reflections mentioning a goal by title/alias link back to its page;
+// pairs with the robin-base-v2 goal page type (primitive entity, goals/).
+export const LINKABLE_ENTITY_TYPES = ['person', 'company', 'organization', 'entity', 'project', 'deal', 'goal'] as const;
 
 /**
  * Minimum title length for gazetteer inclusion. Filters out 2-3 char names
