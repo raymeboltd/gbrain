@@ -36,10 +36,15 @@ cd "$ROOT"
 # Capturing JSON output; redirect stderr to keep progress noise out of the
 # parse.
 TMPOUT="$(mktemp -t gbrain-doctor-XXXXXXXX)"
+TMPHOME="$(mktemp -d -t gbrain-doctor-home-XXXXXXXX)"
 # shellcheck disable=SC2064
-trap "rm -f \"$TMPOUT\"" EXIT
+trap "rm -f \"$TMPOUT\"; rm -rf \"$TMPHOME\"" EXIT
 
-GBRAIN_SKILLS_DIR="$ROOT/skills" bun run src/cli.ts doctor --fast --json >"$TMPOUT" 2>/dev/null || true
+# Isolate the check from an operator's thin-client ~/.gbrain config. Without
+# this, `doctor --fast` routes to the remote-doctor surface before it can run
+# the local filesystem-only skill checks, and the guard reports a false
+# "missing" result on connected developer workstations.
+GBRAIN_HOME="$TMPHOME" GBRAIN_SKILLS_DIR="$ROOT/skills" bun run src/cli.ts doctor --fast --json >"$TMPOUT" 2>/dev/null || true
 
 # Extract the skill_brain_first check status. Use python3 (already a
 # repo-wide dependency via image-decoders + admin tooling) so we don't
