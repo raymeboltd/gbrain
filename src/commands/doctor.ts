@@ -135,6 +135,9 @@ export {
   checkPoolBudget,
   checkCycleFreshness,
 } from './doctor/checks/consolidation-cycle.ts';
+import { dbRepairRecurrenceCheck, pgliteScaleCheck } from './doctor/checks/engine-fit.ts';
+import { classifyPgAccessError } from '../core/pg-access-classify.ts';
+export { dbRepairRecurrenceCheck, pgliteScaleCheck } from './doctor/checks/engine-fit.ts';
 export {
   computePgliteDataDirCheck,
   computeWorkerOomLoopCheck,
@@ -310,6 +313,13 @@ export interface DoctorReport {
    * the ranking. Additive + optional; schema_version stays at 2.
    */
   top_issues?: RankedIssue[];
+  /**
+   * db-availability loop — which engine this report was measured against and
+   * where its URL came from. Additive + optional (schema_version stays 2);
+   * absent on remote/report-only paths that don't know them.
+   */
+  engine?: 'postgres' | 'pglite';
+  db_url_source?: DbUrlSource | null;
 }
 
 function _penaltyScore(checks: Check[]): number {
@@ -335,7 +345,10 @@ function _penaltyScore(checks: Check[]): number {
  * categorizer is the single source of truth in
  * `src/core/doctor-categories.ts`.
  */
-export function computeDoctorReport(checks: Check[]): DoctorReport {
+export function computeDoctorReport(
+  checks: Check[],
+  extras?: { engine?: 'postgres' | 'pglite'; db_url_source?: DbUrlSource | null },
+): DoctorReport {
   const tagged = checks.map((c) =>
     c.category ? c : { ...c, category: categorizeCheck(c.name) },
   );
@@ -363,6 +376,8 @@ export function computeDoctorReport(checks: Check[]): DoctorReport {
     },
     checks: tagged,
     top_issues: rankIssues(tagged),
+    ...(extras?.engine ? { engine: extras.engine } : {}),
+    ...(extras?.db_url_source !== undefined ? { db_url_source: extras.db_url_source } : {}),
   };
 }
 
@@ -548,17 +563,68 @@ const _resolveEnvNumber = resolveEnvNumber;
 const _resolveSyncFreshnessHours = resolveHoursEnv;
 
 /**
- * Run doctor with filesystem-first, DB-second architecture.
- * Filesystem checks (resolver, conformance) run without engine.
- * DB checks run only if engine is provided.
+ * PgBouncer / prepared-statement compatibility. URL-only inspection — no DB
+ * round-trip — extracted so it runs BOTH before the connection check and in
+ * the dead-DB filesystem lane (a URL problem is diagnosable with the DB down).
+ */
+async function pgbouncerPrepareCheck(): Promise<Check | null> {
+  try {
+    const { resolvePrepare } = await import('../core/db.ts');
+    const config = loadConfig();
+    const url = config?.database_url || '';
+    if (!url) return null;
+    const prepare = resolvePrepare(url);
+    if (prepare === false) {
+      return { name: 'pgbouncer_prepare', status: 'ok', message: 'Prepared statements disabled (PgBouncer-safe)' };
+    }
+    try {
+      const parsed = new URL(url.replace(/^postgres(ql)?:\/\//, 'http://'));
+      if (parsed.port === '6543') {
+        return {
+          name: 'pgbouncer_prepare',
+          status: 'warn',
+          message:
+            'Port 6543 (PgBouncer transaction mode) detected but prepared statements are enabled. ' +
+            'This causes "prepared statement does not exist" errors under concurrent load. ' +
+            'Fix: unset GBRAIN_PREPARE (or set =false), or add ?prepare=false to the connection URL.',
+        };
+      }
+    } catch {
+      // URL parse failure — skip, nothing actionable
+    }
+    return null;
+  } catch {
+    return null; // best-effort; never fail doctor on this check
+  }
+}
+
+/**
+ * db-availability loop (2c/2c-bis): the ONE classified-connection-fail shape,
+ * shared by the live connection check and the dead-DB synthesized entry.
+ * `connection` is in ROOT_CAUSE_CHECKS, so top_issues[0].fix carries the
+ * classified remediation instead of a raw pg error. Deliberately NOT
+ * makeRemediationStep: that lane feeds `--remediate`, whose Minion jobs need
+ * the very DB that's down (db-repair is the engine-free applier here).
+ */
+function classifiedConnectionCheck(e: unknown): Check {
+  const d = classifyPgAccessError(e, { url: loadConfig()?.database_url ?? null });
+  return {
+    name: 'connection',
+    status: 'fail',
+    message: d.message,
+    details: { reason: d.reason, transient: d.transient, fix_hint: `${d.remediation} Run: gbrain db-repair` },
+  };
+}
+
+/**
+ * Build the full check list for `gbrain doctor` against an engine + arg vector.
+ * Filesystem-first, DB-second: filesystem checks (resolver, conformance) run
+ * without an engine; DB checks run only if one is provided.
  *
  * `dbSource` is passed only from the `--fast` and DB-unavailable paths in
  * cli.ts so we can emit a precise "why no DB check" message. When null, the
  * user has no DB configured anywhere; otherwise the caller chose --fast or
  * we failed to connect despite a configured URL.
- */
-/**
- * Build the full check list for `gbrain doctor` against an engine + arg vector.
  *
  * The check-building seam: takes the same args as `runDoctor` minus the
  * --locks shortcut (locks-mode is a focused diagnostic the CLI wrapper
@@ -583,6 +649,11 @@ export async function buildChecks(
   engine: BrainEngine | null,
   args: string[],
   dbSource?: DbUrlSource,
+  // db-availability loop (2c-bis): the connect error captured by the CLI's
+  // dead-DB fallback. Lets the null-engine path synthesize a CLASSIFIED
+  // `connection` check — without it, a total outage produced NO connection
+  // entry at all, which is exactly the field smoke-test branches on.
+  connectError?: unknown,
 ): Promise<Check[]> {
   const jsonOutput = args.includes('--json');
   const fastMode = args.includes('--fast');
@@ -1762,15 +1833,27 @@ export async function buildChecks(
       // whether a URL exists (env or config-file) — the caller simply
       // skipped the connection. When null, there really is no config
       // anywhere.
-      let msg: string;
-      if (fastMode && dbSource) {
-        msg = `Skipping DB checks (--fast mode, URL present from ${dbSource})`;
-      } else if (!fastMode && dbSource) {
-        msg = `Could not connect to configured DB (URL from ${dbSource}); filesystem checks only`;
+      if (!fastMode && dbSource && connectError !== undefined) {
+        // 2c-bis: a REAL connect failure — synthesize the classified check so
+        // `checks[name=="connection"]` exists in every failure shape.
+        checks.push(classifiedConnectionCheck(connectError));
       } else {
-        msg = 'No database configured (filesystem checks only). Set GBRAIN_DATABASE_URL or run `gbrain init`.';
+        let msg: string;
+        if (fastMode && dbSource) {
+          msg = `Skipping DB checks (--fast mode, URL present from ${dbSource})`;
+        } else if (!fastMode && dbSource) {
+          msg = `Could not connect to configured DB (URL from ${dbSource}); filesystem checks only`;
+        } else {
+          msg = 'No database configured (filesystem checks only). Set GBRAIN_DATABASE_URL or run `gbrain init`.';
+        }
+        checks.push({ name: 'connection', status: 'warn', message: msg });
       }
-      checks.push({ name: 'connection', status: 'warn', message: msg });
+      // URL-only + engine-free checks still run on a dead DB — that is the
+      // point of them.
+      const pgbouncer = await pgbouncerPrepareCheck();
+      if (pgbouncer) checks.push(pgbouncer);
+      const recurrence = dbRepairRecurrenceCheck();
+      if (recurrence) checks.push(recurrence);
     }
     // Early return: caller renders the partial check list + decides exit code.
     // Pre-v0.39 this site called outputResults + process.exit directly; the
@@ -1783,14 +1866,30 @@ export async function buildChecks(
   // heartbeat the binary looks hung when stdout is piped).
   progress.start('doctor.db_checks');
 
+  // 3a. PgBouncer / prepared-statement compatibility — HOISTED above the
+  // connection check because it is URL-only (no round-trip) and must still
+  // run when the connection below fails.
+  progress.heartbeat('pgbouncer_prepare');
+  {
+    const pgbouncer = await pgbouncerPrepareCheck();
+    if (pgbouncer) checks.push(pgbouncer);
+  }
+
+  // 3b. db-repair recurrence — engine-free receipts read; runs regardless of
+  // connection state (repeat repairs are most interesting when the DB is sick).
+  {
+    const recurrence = dbRepairRecurrenceCheck();
+    if (recurrence) checks.push(recurrence);
+  }
+
   // 3. Connection
   progress.heartbeat('connection');
   try {
     const stats = await engine.getStats();
     checks.push({ name: 'connection', status: 'ok', message: `Connected, ${stats.page_count} pages` });
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : String(e);
-    checks.push({ name: 'connection', status: 'fail', message: msg });
+    // db-availability loop (2c): classified + redacted, with the fix hint.
+    checks.push(classifiedConnectionCheck(e));
     progress.finish();
     // Early return: caller renders the partial check list + decides exit code.
     // Pre-v0.39 this site called outputResults + process.exit directly; the
@@ -1807,43 +1906,15 @@ export async function buildChecks(
   progress.heartbeat('pages_upsert_arbiter');
   checks.push(await pagesUpsertArbiterCheck(engine));
 
-  // 4b. PgBouncer / prepared-statement compatibility.
-  // URL-only inspection — no DB roundtrip — so this is cheap and works
-  // regardless of whether the caller is the module singleton or a
-  // worker-instance engine.
-  progress.heartbeat('pgbouncer_prepare');
-  try {
-    const { resolvePrepare } = await import('../core/db.ts');
-    const { loadConfig } = await import('../core/config.ts');
-    const config = loadConfig();
-    const url = config?.database_url || '';
-    const prepare = resolvePrepare(url);
-    if (prepare === false) {
-      checks.push({
-        name: 'pgbouncer_prepare',
-        status: 'ok',
-        message: 'Prepared statements disabled (PgBouncer-safe)',
-      });
-    } else {
-      try {
-        const parsed = new URL(url.replace(/^postgres(ql)?:\/\//, 'http://'));
-        if (parsed.port === '6543') {
-          checks.push({
-            name: 'pgbouncer_prepare',
-            status: 'warn',
-            message:
-              'Port 6543 (PgBouncer transaction mode) detected but prepared statements are enabled. ' +
-              'This causes "prepared statement does not exist" errors under concurrent load. ' +
-              'Fix: unset GBRAIN_PREPARE (or set =false), or add ?prepare=false to the connection URL.',
-          });
-        }
-      } catch {
-        // URL parse failure — skip, nothing actionable
-      }
-    }
-  } catch {
-    // best-effort; never fail doctor on this check
+  // 4b. pglite_scale — engine-fit signal: makes the init-time 1000-file
+  // Supabase suggestion re-evaluable for the life of the brain.
+  progress.heartbeat('pglite_scale');
+  {
+    const scale = await pgliteScaleCheck(engine);
+    if (scale) checks.push(scale);
   }
+  // (pgbouncer_prepare moved ABOVE the connection check — URL-only, must
+  // survive a dead DB.)
 
   // 5. RLS — check ALL public tables, not just gbrain's own.
   // Any table without RLS in the public schema is a security risk:
@@ -3877,6 +3948,13 @@ export async function buildChecks(
     // default (false) — that's the trust-boundary preservation Codex
     // P0-1 flagged.
     checks.push(await checkSyncFreshness(engine, { localOnly: true }));
+    // Monthly backup-coverage check (same D4 trust stance as sync_freshness:
+    // localOnly:true probes git; the remote path stays a cache-only reader).
+    progress.heartbeat('backup_coverage');
+    {
+      const { checkBackupCoverage } = await import('./doctor/checks/backup-coverage.ts');
+      checks.push(await checkBackupCoverage(engine, { localOnly: true }));
+    }
     // v0.41.19.0 (Issue 5): sync --all consolidation nudge.
     progress.heartbeat('sync_consolidation');
     checks.push(await checkSyncConsolidation(engine));
@@ -4023,6 +4101,9 @@ export async function runDoctor(
   engine: BrainEngine | null,
   args: string[],
   dbSource?: DbUrlSource,
+  // db-availability loop: the connect error from the CLI's dead-DB fallback,
+  // threaded to buildChecks for the synthesized `connection` check (2c-bis).
+  connectError?: unknown,
 ) {
   const jsonOutput = args.includes('--json');
   const locksMode = args.includes('--locks');
@@ -4035,8 +4116,8 @@ export async function runDoctor(
     return;
   }
 
-  const checks = await buildChecks(engine, args, dbSource);
-  const hasFail = outputResults(checks, jsonOutput);
+  const checks = await buildChecks(engine, args, dbSource, connectError);
+  const hasFail = outputResults(checks, jsonOutput, { engine: engine?.kind, db_url_source: dbSource ?? null });
 
   // Features teaser (non-JSON, non-failing only)
   if (!jsonOutput && !hasFail && engine) {
@@ -4095,10 +4176,14 @@ function printAutoFixReport(report: AutoFixReport, dryRun: boolean, jsonOutput: 
   if (dryRun && n > 0) console.log('\nRun without --dry-run to apply.');
 }
 
-function outputResults(checks: Check[], json: boolean): boolean {
+function outputResults(
+  checks: Check[],
+  json: boolean,
+  extras?: { engine?: 'postgres' | 'pglite'; db_url_source?: DbUrlSource | null },
+): boolean {
   // v0.41.19.0 — render goes through computeDoctorReport so the human
   // output, JSON output, and remote MCP envelope all share one shape.
-  const report = computeDoctorReport(checks);
+  const report = computeDoctorReport(checks, extras);
   const hasFail = report.status === 'unhealthy';
   const hasWarn = report.status === 'warnings';
   const score = report.health_score;

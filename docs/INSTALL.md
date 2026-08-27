@@ -39,16 +39,24 @@ gbrain init --pglite
 
 > **If `bun install -g` hits a postinstall error** (Bun blocks postinstall hooks in some environments), the CLI prints a recovery hint pointing at [#218](https://github.com/garrytan/gbrain/issues/218). Run `gbrain doctor` to diagnose, then `gbrain apply-migrations --yes` manually. The deterministic fallback is `git clone https://github.com/garrytan/gbrain.git ~/gbrain && cd ~/gbrain && bun install && bun link`.
 
-The init flow detects your repo size and suggests Supabase for brains > 1000 markdown files. To switch later:
+The init flow detects your repo size and suggests Supabase for brains > 1000 markdown files. Agent-harness installs that want Postgres first can run the ladder instead:
+
+```bash
+gbrain init --prefer-postgres    # env URL → Supabase token discovery → local Postgres → opt-in docker → PGLite
+```
+
+To switch later:
 
 ```bash
 gbrain migrate --to supabase     # PGLite → Postgres
 gbrain migrate --to pglite       # Postgres → PGLite (rare)
 ```
 
+If Postgres access ever breaks at runtime, `gbrain engine status --probe` diagnoses it and `gbrain db-repair` fixes it — see the "Engine detection and access repair" section of [`docs/ENGINES.md`](ENGINES.md).
+
 For shared / large / multi-machine deployments (a team or company brain with multiple users hitting one server over HTTP MCP with OAuth scoping per user), follow the dedicated walkthrough: **[Tutorial: set up GBrain as your company brain](tutorials/company-brain.md)**.
 
-API keys live in `~/.gbrain/config.json` (file plane) or env vars (`VOYAGE_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`). Set them via env or by editing `~/.gbrain/config.json` directly — do NOT use `gbrain config set` for API keys (that writes the DB plane, which the embedding pipeline never reads):
+API keys live in `~/.gbrain/config.json` (file plane) or env vars (`VOYAGE_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`). Set them via env, or with `gbrain config set <KEY> <value>` — vendor API keys (and `database_url`/`database_path`) are file-plane routed, so the write lands where the pipeline actually reads it:
 
 ```bash
 export VOYAGE_API_KEY=pa-...          # default embedding (voyage-4) + reranker (rerank-2.5) — one key

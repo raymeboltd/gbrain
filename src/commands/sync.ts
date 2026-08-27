@@ -40,6 +40,7 @@ import type { SyncManifest, SyncFailure } from '../core/sync.ts';
 import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
 import { loadConfig } from '../core/config.ts';
+import { DB_ACCESS_MARKER_PREFIX, shouldEmitDbAccessMarker } from '../core/pg-access-classify.ts';
 import {
   autoConcurrency,
   shouldRunParallel,
@@ -2342,6 +2343,15 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       `[sync] banked ${banked} file(s) this run; next 'gbrain sync' resumes from ` +
       `the checkpoint (last_commit unchanged at ${(lastCommit ?? '').slice(0, 8)}).`,
     );
+    // db-availability loop (4b): a dead checkpoint IS a DB-access failure by
+    // construction — the checkpoint writer only gives up after exhausting the
+    // retry-matcher's connection-class retries (#1794), so `conn_dropped` is
+    // asserted structurally, not parsed from an error. The marker lets the
+    // bundled skills/db-repair skill pick this up from an agent-run sync.
+    if (checkpointDead && shouldEmitDbAccessMarker()) {
+      serr(`${DB_ACCESS_MARKER_PREFIX} conn_dropped`);
+      serr('The sync checkpoint pool died mid-run. Run: gbrain db-repair');
+    }
     return buildPartialResult({
       fromCommit: lastCommit,
       toCommit: pin,
@@ -5022,6 +5032,8 @@ See also:
     // v0.42.7 (#1696): brain-wide extraction-lag nudge after the --all wave.
     // Best-effort, stderr-only; skipped on dry-run.
     if (!dryRun) await maybeExtractionNudge(engine);
+    // Monthly backup-coverage stale-only refresh (trusted local engine holder).
+    if (!dryRun) await maybeBackupCoverageRefresh(engine);
 
     // #3068: any source wedged on a failed pull (partial/pull_failed) makes
     // the whole --all run non-zero — it will not self-heal on retry, so a
@@ -5137,6 +5149,10 @@ See also:
     // — NOT just 'synced'; a fresh/--full import (`first_sync`) is the biggest
     // un-extracted backlog. Scoped to this source; best-effort, stderr-only.
     if (shouldNudgeAfterSync(result.status)) await maybeExtractionNudge(engine, sourceId);
+    // Monthly backup-coverage: the sync CLI legitimately holds the engine
+    // (trusted local), so the stale-only compute piggybacks here — covering
+    // active CLI users without any serve involvement. Dry-run stays pure.
+    if (result.status !== 'dry_run') await maybeBackupCoverageRefresh(engine);
     // Issue #2 + eng-review pass-2 finding #1 + Codex P1: manage .gitignore ONLY
     // on successful sync. Skip on dry-run (don't mutate disk in preview mode)
     // and blocked_by_failures (sync state is inconsistent — defer .gitignore
@@ -5542,6 +5558,25 @@ export function manageGitignore(
       `Could not update ${gitignorePath} (${error instanceof Error ? error.message : String(error)}) — ` +
         `please add db_only directories manually:\n  ${linesToAdd.join('\n  ')}`,
     );
+  }
+}
+
+/**
+ * Post-sync backup-coverage refresh (monthly, stale-only). The sync CLI is a
+ * trusted local engine holder (D4), so the compute piggybacks here; the
+ * shared choke point (getBackupStatus) makes a fresh cache a no-op file read.
+ * Best-effort — never blocks or fails a sync.
+ */
+async function maybeBackupCoverageRefresh(engine: BrainEngine): Promise<void> {
+  try {
+    const { backupCheckDisabled, isBackupStatusStale, loadBackupStatus } = await import(
+      '../core/backup/status-file.ts'
+    );
+    if (backupCheckDisabled() || !isBackupStatusStale(loadBackupStatus())) return;
+    const { getBackupStatus } = await import('../core/backup/coverage.ts');
+    await getBackupStatus(engine, { localGitProbes: true, computedBy: 'sync' });
+  } catch {
+    /* best-effort — never block sync on it */
   }
 }
 

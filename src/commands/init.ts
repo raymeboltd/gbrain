@@ -111,6 +111,24 @@ export async function runInit(args: string[]) {
     nonInteractive: isNonInteractive,
   });
 
+  // db-availability loop (5a): Postgres-first ladder for agent-harness
+  // installs. Explicit opt-in flag — the zero-config `gbrain init` default
+  // stays PGLite (owner decision; the preference lives in the plugin lane).
+  if (args.includes('--prefer-postgres')) {
+    const { runPreferPostgresLadder } = await import('./init-prefer-postgres.ts');
+    return runPreferPostgresLadder({
+      jsonOutput,
+      apiKey,
+      customPath,
+      aiOpts,
+      schemaPack,
+      skipEmbedCheck,
+      allowDocker: args.includes('--allow-docker'),
+      allowCreateDb: args.includes('--allow-create-db'),
+      localPostgres: args.includes('--local-postgres'),
+    });
+  }
+
   // Explicit PGLite mode
   if (isPGLite || (!isSupabase && !manualUrl && !isNonInteractive)) {
     // Smart detection: scan for .md files unless --pglite flag forces it
@@ -163,6 +181,11 @@ const INIT_BOOLEAN_FLAGS = new Set([
   '--json',
   '--no-embedding',
   '--skip-embed-check',
+  // db-availability loop (5a): Postgres-first ladder for harness installs.
+  '--prefer-postgres',
+  '--allow-docker',
+  '--allow-create-db',
+  '--local-postgres',
 ]);
 
 const INIT_VALUE_FLAGS = new Set([
@@ -1119,7 +1142,7 @@ function printResolvedAIChoice(
   }
 }
 
-async function initPGLite(opts: {
+export async function initPGLite(opts: {
   jsonOutput: boolean;
   apiKey: string | null;
   customPath: string | null;
@@ -1400,7 +1423,30 @@ function printMemoryVerbsQuickstart(opts: { emptyBrain?: boolean; onPglite?: boo
   );
 }
 
-async function initPostgres(opts: {
+/**
+ * db-availability loop (5a): typed failure for initPostgresCore. The ladder
+ * (`init --prefer-postgres`) treats it as RUNG FAILURE and falls through to
+ * the next rung; the initPostgres wrapper preserves the historical
+ * process.exit(1) for direct `--supabase`/`--url` invocations.
+ */
+export class InitPostgresFailure extends Error {
+  constructor(public reason: string, message?: string) {
+    super(message ?? reason);
+    this.name = 'InitPostgresFailure';
+  }
+}
+
+/** Exit-preserving wrapper — direct invocations keep their contract. */
+async function initPostgres(opts: Parameters<typeof initPostgresCore>[0]) {
+  try {
+    await initPostgresCore(opts);
+  } catch (e) {
+    if (e instanceof InitPostgresFailure) process.exit(1);
+    throw e;
+  }
+}
+
+export async function initPostgresCore(opts: {
   databaseUrl: string;
   jsonOutput: boolean;
   apiKey: string | null;
@@ -1435,7 +1481,7 @@ async function initPostgres(opts: {
       if (opts.jsonOutput) {
         console.log(JSON.stringify({ status: 'error', reason: 'preflight_failed', error: pre.error }));
       }
-      process.exit(1);
+      throw new InitPostgresFailure('preflight_failed', pre.error);
     }
     resolvedDim = pre.dim;
     resolvedModel = pre.model;
@@ -1520,8 +1566,13 @@ async function initPostgres(opts: {
           throw new Error('pgvector extension missing');
         }
       }
-    } catch {
-      // Non-fatal
+    } catch (e) {
+      // 5b: the deliberate throw above used to be EATEN here, so an install
+      // with no pgvector "succeeded" into initSchema and died later with a
+      // worse message. Rethrow it; only the pg_extension PROBE failure stays
+      // non-fatal (odd hosted PG catalogs — initSchema surfaces the truth).
+      if (e instanceof Error && e.message === 'pgvector extension missing') throw e;
+      // Non-fatal: probe-read failure only.
     }
 
     // v0.28.5 (A4) + v0.37.11.0 Lane B.5: refuse to silently re-template an
@@ -1548,7 +1599,7 @@ async function initPostgres(opts: {
             requested_dims: resolvedDim,
           }));
         }
-        process.exit(1);
+        throw new InitPostgresFailure('embedding_dim_mismatch');
       }
     }
 
@@ -1570,7 +1621,7 @@ async function initPostgres(opts: {
           source: 'init',
           engineKind: 'postgres',
         }));
-        process.exit(1);
+        throw new InitPostgresFailure('post_init_dim_invariant');
       }
     }
 

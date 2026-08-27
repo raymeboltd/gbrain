@@ -74,6 +74,12 @@ writing or reviewing an operation, consult `src/core/operations.ts` for the cont
   guide: [`docs/guides/chat-connectors.md`](./docs/guides/chat-connectors.md).
 - **Debug:** [`docs/GBRAIN_VERIFY.md`](./docs/GBRAIN_VERIFY.md),
   [`docs/guides/minions-fix.md`](./docs/guides/minions-fix.md), `gbrain doctor --fix`.
+  Database unreachable — or any `GBRAIN_DB_ACCESS <reason>` marker in gbrain
+  output: `gbrain engine status --probe` (which engine, where its URL comes from,
+  classified reachability), then `gbrain db-repair` to diagnose and
+  `gbrain db-repair --yes` to apply safe fixes. All three are engine-free — they
+  work while the database is down. Full loop:
+  [`docs/ENGINES.md`](./docs/ENGINES.md#engine-detection-and-access-repair).
 - **Migrate / upgrade:** `gbrain upgrade` (binary self-update + schema migrations + post-upgrade prompts),
   [`docs/UPGRADING_DOWNSTREAM_AGENTS.md`](./docs/UPGRADING_DOWNSTREAM_AGENTS.md),
   [`skills/migrations/`](./skills/migrations/), `gbrain apply-migrations --yes` (manual schema-only).

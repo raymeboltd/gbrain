@@ -33,6 +33,9 @@ export interface GBrainConfig {
    * `gbrain config set` routes these two dotted keys here, not to the DB. */
   push?: { allow_unverified_remote?: boolean };
   hooks?: { stop_push_debounce_min?: number | string };
+  /** Monthly backup-coverage check (src/core/backup/). File-plane: read by
+   * engine-free render sites (hook children, the cli.ts startup rail). */
+  backup?: { check_enabled?: boolean | string; check_interval_days?: number | string };
   database_url?: string;
   database_path?: string;
   openai_api_key?: string;
@@ -635,6 +638,21 @@ export function effectiveEnvDatabaseUrl(dir: string = process.cwd()): string | u
   return url;
 }
 
+/**
+ * The #427 shadow predicate, single-homed: a bare DATABASE_URL exists in the
+ * process env but the cwd-.env guard excluded it (and GBRAIN_DATABASE_URL is
+ * unset) — the "init inside a web-app checkout" confusion shape. Consumers:
+ * engine-status, db-repair, the CLI's no-config marker site.
+ */
+export function envShadowDetected(dir: string = process.cwd()): boolean {
+  return (
+    typeof process.env.DATABASE_URL === 'string' &&
+    process.env.DATABASE_URL.length > 0 &&
+    !process.env.GBRAIN_DATABASE_URL &&
+    effectiveEnvDatabaseUrl(dir) === undefined
+  );
+}
+
 export function loadConfig(): GBrainConfig | null {
   let fileConfig: GBrainConfig | null = null;
   try {
@@ -1155,6 +1173,11 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // `config set` — engine-free hook/push children read loadConfigFileOnly).
   'push.allow_unverified_remote',
   'hooks.stop_push_debounce_min',
+  // File-plane backup-check keys (routed to ~/.gbrain/config.json by `config
+  // set` — the engine-free render sites read loadConfigFileOnly). Default ON /
+  // 30 days; interval clamps to >=1 day at read time (backup/status-file.ts).
+  'backup.check_enabled',
+  'backup.check_interval_days',
   // DB-plane (v0.32.3 search modes + related)
   'search.mode',
   'search.cache.enabled',
