@@ -216,7 +216,7 @@ describe('findBacklinkGaps dedupe (v0.36.x #967 regression)', () => {
 // fixBacklinkGaps safety pipeline (frontmatter corruption incident regression)
 // ---------------------------------------------------------------------------
 
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync, readFileSync, readdirSync } from 'fs';
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync, readFileSync, readdirSync, symlinkSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import {
@@ -246,6 +246,82 @@ function gapFor(target: string): BacklinkGap {
     sourceTitle: 'Standup',
   };
 }
+
+describe('backlinks scan/fix path and race safety', () => {
+  test('a backlink added after scan is not duplicated by fix', async () => {
+    const { root, lockRoot, cleanup } = makeFixture();
+    try {
+      writeFileSync(join(root, 'people/alice.md'), '# Alice\n');
+      writeFileSync(join(root, 'meetings/standup.md'), '# Standup\n\nMet [Alice](../people/alice).\n');
+      const gaps = findBacklinkGaps(root);
+      expect(gaps).toHaveLength(1);
+
+      writeFileSync(
+        join(root, 'people/alice.md'),
+        '# Alice\n\n## Timeline\n\n- **2026-01-01** | Referenced in [Standup](../meetings/standup)\n',
+      );
+      const outcome = await fixBacklinkGaps(root, gaps, false, { lockRoot });
+      const after = readFileSync(join(root, 'people/alice.md'), 'utf-8');
+
+      expect(outcome.fixed).toBe(0);
+      expect(after.match(/Referenced in \[Standup\]/g)).toHaveLength(1);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test('scan never follows a symlinked markdown target', () => {
+    const { root, cleanup } = makeFixture();
+    const outside = mkdtempSync(join(tmpdir(), 'gbrain-backlinks-outside-'));
+    try {
+      writeFileSync(join(outside, 'alice.md'), '# Alice\n');
+      symlinkSync(join(outside, 'alice.md'), join(root, 'people/alice.md'));
+      writeFileSync(join(root, 'meetings/standup.md'), '# Standup\n\nMet [Alice](../people/alice).\n');
+      expect(findBacklinkGaps(root)).toHaveLength(0);
+    } finally {
+      cleanup();
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test('fix refuses a target whose parent is replaced by a symlink', async () => {
+    const { root, lockRoot, cleanup } = makeFixture();
+    const outside = mkdtempSync(join(tmpdir(), 'gbrain-backlinks-outside-parent-'));
+    try {
+      writeFileSync(join(root, 'people/alice.md'), '# Alice\n');
+      writeFileSync(join(root, 'meetings/standup.md'), '# Standup\n\nMet [Alice](../people/alice).\n');
+      const gaps = findBacklinkGaps(root);
+      expect(gaps).toHaveLength(1);
+
+      rmSync(join(root, 'people'), { recursive: true, force: true });
+      writeFileSync(join(outside, 'alice.md'), '# Outside Alice\n');
+      symlinkSync(outside, join(root, 'people'));
+      const outcome = await fixBacklinkGaps(root, gaps, false, { lockRoot });
+
+      expect(outcome.fixed).toBe(0);
+      expect(outcome.skipped).toHaveLength(1);
+      expect(readFileSync(join(outside, 'alice.md'), 'utf-8')).toBe('# Outside Alice\n');
+    } finally {
+      cleanup();
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test('fix refuses a direct traversal target', async () => {
+    const { root, lockRoot, cleanup } = makeFixture();
+    const outside = join(root, '..', `outside-${Date.now()}.md`);
+    try {
+      writeFileSync(outside, '# Outside\n');
+      const outcome = await fixBacklinkGaps(root, [gapFor(`../${outside.split('/').pop()}`)], false, { lockRoot });
+      expect(outcome.fixed).toBe(0);
+      expect(outcome.skipped).toHaveLength(1);
+      expect(readFileSync(outside, 'utf-8')).toBe('# Outside\n');
+    } finally {
+      cleanup();
+      rmSync(outside, { force: true });
+    }
+  });
+});
 
 describe('frontmatterBodyOffset', () => {
   test('no frontmatter → 0 (whole file is body)', () => {
