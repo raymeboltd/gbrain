@@ -2959,6 +2959,13 @@ export async function registerBuiltinHandlers(
     return await makeConnectorSyncHandler(engine)(job);
   });
 
+  // Deterministic post-ingest projection. No gateway refresh: this lane only
+  // resolves exact known mentions and writes source-scoped receipts/evidence.
+  worker.register('source-event-projection', async (job) => {
+    const { makeSourceEventProjectionHandler } = await import('../core/minions/handlers/source-event-projection.ts');
+    return await makeSourceEventProjectionHandler(engine)(job);
+  });
+
   // v0.41.18.0 (A10, T7): extract-ner handler for the gbrain onboard
   // remediation pipeline. Wraps extractNerLinks; emits typed_ner kind
   // alongside the by-mention 'plain' kind. NOT in PROTECTED_JOB_NAMES

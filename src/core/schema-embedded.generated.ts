@@ -568,6 +568,44 @@ CREATE INDEX IF NOT EXISTS idx_timeline_event_page ON timeline_entries(event_pag
 CREATE UNIQUE INDEX IF NOT EXISTS idx_timeline_event_dedup ON timeline_entries(event_page_id, date) WHERE event_page_id IS NOT NULL;
 
 -- ============================================================
+-- source_event_receipts: durable post-ingest projection ledger
+-- ============================================================
+CREATE TABLE IF NOT EXISTS source_event_receipts (
+  id                BIGSERIAL PRIMARY KEY,
+  source_id         TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  event_key         TEXT NOT NULL,
+  source_kind       TEXT NOT NULL,
+  source_key        TEXT NOT NULL,
+  source_uri        TEXT NOT NULL,
+  source_slug       TEXT NOT NULL,
+  content_hash      TEXT NOT NULL,
+  processor_version TEXT NOT NULL,
+  observed_at       TIMESTAMPTZ NOT NULL,
+  event_date        DATE NOT NULL,
+  status            TEXT NOT NULL CHECK (status IN ('processing','applied','partial','skipped','review','error')),
+  target_results    JSONB NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(target_results) = 'array'),
+  candidates_count  INTEGER NOT NULL DEFAULT 0 CHECK (candidates_count >= 0),
+  resolved_count    INTEGER NOT NULL DEFAULT 0 CHECK (resolved_count >= 0),
+  links_written     INTEGER NOT NULL DEFAULT 0 CHECK (links_written >= 0),
+  timeline_written  INTEGER NOT NULL DEFAULT 0 CHECK (timeline_written >= 0),
+  facts_written     INTEGER NOT NULL DEFAULT 0 CHECK (facts_written >= 0),
+  skipped_count     INTEGER NOT NULL DEFAULT 0 CHECK (skipped_count >= 0),
+  error_count       INTEGER NOT NULL DEFAULT 0 CHECK (error_count >= 0),
+  errors            JSONB NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(errors) = 'array'),
+  attempts          INTEGER NOT NULL DEFAULT 1 CHECK (attempts >= 1),
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(source_id, event_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_event_receipts_status
+  ON source_event_receipts(source_id, status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_source_event_receipts_observed
+  ON source_event_receipts(source_id, observed_at, source_slug);
+CREATE INDEX IF NOT EXISTS idx_source_event_receipts_lookup
+  ON source_event_receipts(source_id, source_slug, content_hash, processor_version);
+
+-- ============================================================
 -- page_versions: snapshot history for compiled_truth
 -- ============================================================
 CREATE TABLE IF NOT EXISTS page_versions (

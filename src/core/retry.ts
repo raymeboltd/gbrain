@@ -95,6 +95,9 @@ export const BATCH_AUDIT_SITES = [
   'cycle.extract_atoms.provenance',
   // operations.ts MCP put_page auto-link path.
   'mcp.put_page.autolink',
+  // Deterministic post-ingest projection onto existing entities.
+  'source-event.links',
+  'source-event.timeline',
   // sync.ts/reindex.ts orchestrator labels.
   'sync.import_file',
   'reindex.markdown',

@@ -1,0 +1,154 @@
+import { tryAcquireDbLock } from '../../db-lock.ts';
+import type { BrainEngine } from '../../engine.ts';
+import type { MinionJobContext } from '../types.ts';
+import { SOURCE_EVENT_PROCESSOR_VERSION, projectSourceEvent } from '../../source-events/projector.ts';
+
+const SUPPORTED_SOURCE_EVENT_TYPES = [
+  'message',
+  'email',
+  'calendar-event',
+  'meeting-note',
+  'event',
+  'conversation',
+] as const;
+
+const LOCK_TTL_MIN = 20;
+const DEFAULT_LIMIT = 100;
+const MAX_LIMIT = 500;
+
+interface CandidateRow {
+  slug: string;
+  type: string;
+  compiled_truth: string;
+  timeline: string;
+  projection_hash: string;
+  updated_at: Date | string;
+  effective_date: Date | string | null;
+  frontmatter: Record<string, unknown> | string;
+}
+
+export function sourceEventProjectionLockId(sourceId: string): string {
+  return `gbrain-source-event-projection:${sourceId}`;
+}
+
+function parseParams(data: Record<string, unknown>): { sourceId: string; limit: number } {
+  const sourceId = typeof data.sourceId === 'string' ? data.sourceId.trim() : '';
+  if (!sourceId) throw new Error('source-event-projection: sourceId is required');
+  const rawLimit = typeof data.limit === 'number' ? Math.floor(data.limit) : DEFAULT_LIMIT;
+  if (!Number.isFinite(rawLimit) || rawLimit < 1) {
+    throw new Error('source-event-projection: limit must be a positive integer');
+  }
+  return { sourceId, limit: Math.min(rawLimit, MAX_LIMIT) };
+}
+
+async function listCandidates(engine: BrainEngine, sourceId: string, limit: number): Promise<CandidateRow[]> {
+  return engine.executeRaw<CandidateRow>(
+    `SELECT p.slug, p.type, COALESCE(p.compiled_truth, '') AS compiled_truth,
+            COALESCE(p.timeline, '') AS timeline,
+            COALESCE(NULLIF(p.content_hash, ''), md5(COALESCE(p.compiled_truth, '') || E'\n' || COALESCE(p.timeline, ''))) AS projection_hash,
+            p.updated_at, p.effective_date, p.frontmatter
+       FROM pages p
+      WHERE p.source_id=$1
+        AND p.deleted_at IS NULL
+        AND p.type = ANY($2::text[])
+        AND NOT EXISTS (
+          SELECT 1 FROM source_event_receipts r
+           WHERE r.source_id=p.source_id
+             AND r.source_slug=p.slug
+             AND r.content_hash=COALESCE(NULLIF(p.content_hash, ''), md5(COALESCE(p.compiled_truth, '') || E'\n' || COALESCE(p.timeline, '')))
+             AND r.processor_version=$4
+             AND r.status IN ('applied','partial','skipped','review')
+        )
+      ORDER BY p.updated_at, p.slug
+      LIMIT $3`,
+    [sourceId, [...SUPPORTED_SOURCE_EVENT_TYPES], limit, SOURCE_EVENT_PROCESSOR_VERSION],
+  );
+}
+
+function metadata(row: CandidateRow): Record<string, unknown> {
+  if (typeof row.frontmatter !== 'string') return row.frontmatter ?? {};
+  try {
+    const parsed = JSON.parse(row.frontmatter);
+    return parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : {};
+  } catch {
+    return {};
+  }
+}
+
+function sourceIdentity(row: CandidateRow): { sourceKey: string; sourceUri: string } {
+  const meta = metadata(row);
+  const keyFields = ['provider_item_id', 'message_id', 'event_id', 'session_id', 'thread_id'];
+  const sourceKey = keyFields
+    .map((field) => meta[field])
+    .find((value) => typeof value === 'string' && value.trim()) as string | undefined;
+  const uri = meta.source_uri;
+  return {
+    sourceKey: sourceKey?.trim() ?? `page:${row.slug}`,
+    sourceUri: typeof uri === 'string' && uri.trim()
+      ? uri.trim()
+      : `gbrain://${encodeURIComponent(row.slug)}`,
+  };
+}
+
+function timestamp(row: CandidateRow): string {
+  const raw = row.effective_date ?? row.updated_at;
+  const value = raw instanceof Date ? raw : new Date(raw);
+  if (Number.isNaN(value.getTime())) throw new Error(`source-event-projection: invalid timestamp for ${row.slug}`);
+  return value.toISOString();
+}
+
+export function makeSourceEventProjectionHandler(engine: BrainEngine) {
+  return async function sourceEventProjectionHandler(job: MinionJobContext): Promise<unknown> {
+    const { sourceId, limit } = parseParams(job.data);
+    const sources = await engine.listAllSources({ includeArchived: false });
+    if (!sources.some((source) => source.id === sourceId)) {
+      throw new Error(`source-event-projection: sourceId '${sourceId}' is not a registered source`);
+    }
+    const lock = await tryAcquireDbLock(engine, sourceEventProjectionLockId(sourceId), LOCK_TTL_MIN);
+    if (!lock) return { status: 'already_in_progress', sourceId };
+
+    try {
+      const candidates = await listCandidates(engine, sourceId, limit);
+      let applied = 0;
+      let skipped = 0;
+      let reviews = 0;
+      let errors = 0;
+      for (let index = 0; index < candidates.length; index++) {
+        if (job.signal.aborted) throw job.signal.reason ?? new Error('source-event-projection aborted');
+        const row = candidates[index]!;
+        const content = [row.compiled_truth, row.timeline].filter(Boolean).join('\n\n');
+        const identity = sourceIdentity(row);
+        const receipt = await projectSourceEvent(engine, {
+          sourceId,
+          sourceKind: row.type,
+          sourceKey: identity.sourceKey,
+          sourceUri: identity.sourceUri,
+          sourceSlug: row.slug,
+          contentHash: row.projection_hash,
+          processorVersion: SOURCE_EVENT_PROCESSOR_VERSION,
+          occurredAt: timestamp(row),
+          content,
+        });
+        if (receipt.status === 'applied' || receipt.status === 'partial') applied++;
+        else if (receipt.status === 'review') reviews++;
+        else skipped++;
+        errors += receipt.errors.length;
+        await job.updateProgress({
+          phase: 'source-event-projection',
+          scanned: index + 1,
+          total: candidates.length,
+          applied,
+          skipped,
+          reviews,
+          errors,
+        });
+      }
+      return {
+        status: 'completed', sourceId, scanned: candidates.length,
+        applied, skipped, reviews, errors,
+      };
+    } finally {
+      await lock.release();
+    }
+  };
+}

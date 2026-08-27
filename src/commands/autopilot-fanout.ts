@@ -742,3 +742,44 @@ export async function maybeDispatchConnectorSyncs(
   }
   return { dispatched };
 }
+
+/**
+ * Default-off post-ingest projection dispatch. This is intentionally a
+ * separate Minion from source sync: transport can succeed while projection
+ * fails, and each stage needs its own receipt/retry surface.
+ */
+export async function maybeDispatchSourceEventProjection(
+  engine: BrainEngine,
+  queue: MinionQueue,
+  opts: { slot: string; timeoutMs: number },
+): Promise<{ dispatched: string[]; reason: 'disabled' | 'source_unconfigured' | 'no_sources' | 'enabled' }> {
+  const enabled = (await engine.getConfig('source_events.enabled'))?.trim().toLowerCase();
+  if (!enabled || !['1', 'true', 'yes', 'on'].includes(enabled)) {
+    return { dispatched: [], reason: 'disabled' };
+  }
+
+  const approvedRaw = (await engine.getConfig('source_events.source_ids'))?.trim();
+  const approved = new Set((approvedRaw ?? '').split(',').map((id) => id.trim()).filter(Boolean));
+  if (approved.size === 0) return { dispatched: [], reason: 'source_unconfigured' };
+
+  const sources = (await engine.listAllSources({ includeArchived: false }))
+    .filter((source) => approved.has(source.id) && isSourceAutopilotSyncEnabled(source.config));
+  if (sources.length === 0) return { dispatched: [], reason: 'no_sources' };
+
+  const dispatched: string[] = [];
+  for (const source of sources) {
+    const job = await queue.add(
+      'source-event-projection',
+      { sourceId: source.id },
+      {
+        queue: 'default',
+        idempotency_key: `source-event-projection:${source.id}:${opts.slot}`,
+        max_attempts: 2,
+        timeout_ms: opts.timeoutMs,
+        maxPending: 1,
+      },
+    );
+    if (!job.coalesced) dispatched.push(source.id);
+  }
+  return { dispatched, reason: 'enabled' };
+}

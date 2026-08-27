@@ -25,6 +25,7 @@ test/autopilot-install.test.ts	autopilot wrapper script — key sourcing (#2608)
 test/autopilot-pause-marker.test.ts	pause marker fences minion job pickup	1	readFileSync
 test/autopilot-self-upgrade.test.ts	autopilot self-upgrade static-shape regressions	4	readFileSync
 test/autopilot-shutdown-engine-close.test.ts	autopilot.ts graceful engine shutdown (#1872)	6	readFileSync
+test/autopilot-source-event.test.ts	Autopilot source-event projection dispatch	7	readFileSync
 test/autopilot-supervisor-wiring.test.ts	autopilot.ts ↔ ChildWorkerSupervisor wiring	7	readFileSync
 test/backlinks-job-default.test.ts	backlinks Minion handler — empty payload defaults to check, not fix	3	readFileSync
 test/backup-cli.serial.test.ts	runBackupCli — PGLite lock fallback	3	readFileSync
