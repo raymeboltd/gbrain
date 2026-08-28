@@ -1168,7 +1168,13 @@ export class PGLiteEngine implements BrainEngine {
         EXISTS (SELECT 1 FROM information_schema.columns
                 WHERE table_schema='public' AND table_name='minion_jobs' AND column_name='private_queue_owner_token') AS minion_jobs_pq_token_exists,
         EXISTS (SELECT 1 FROM information_schema.columns
-                WHERE table_schema='public' AND table_name='minion_jobs' AND column_name='private_queue_lease_until') AS minion_jobs_pq_lease_exists
+                WHERE table_schema='public' AND table_name='minion_jobs' AND column_name='private_queue_lease_until') AS minion_jobs_pq_lease_exists,
+        EXISTS (SELECT 1 FROM information_schema.tables
+                WHERE table_schema='public' AND table_name='source_event_receipts') AS source_event_receipts_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='source_event_receipts' AND column_name='processor_version') AS source_event_receipts_processor_version_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='source_event_receipts' AND column_name='event_id') AS source_event_receipts_event_id_exists
     `);
     const probe = rows[0] as {
       pages_exists: boolean;
@@ -1221,6 +1227,9 @@ export class PGLiteEngine implements BrainEngine {
       minion_jobs_pq_owner_exists: boolean;
       minion_jobs_pq_token_exists: boolean;
       minion_jobs_pq_lease_exists: boolean;
+      source_event_receipts_exists: boolean;
+      source_event_receipts_processor_version_exists: boolean;
+      source_event_receipts_event_id_exists: boolean;
     };
 
     const needsPagesBootstrap = probe.pages_exists && !probe.source_id_exists;
@@ -1317,6 +1326,9 @@ export class PGLiteEngine implements BrainEngine {
     const needsMinionJobsPrivateQueue = probe.minion_jobs_exists
       && (!probe.minion_jobs_pq_owner_exists || !probe.minion_jobs_pq_token_exists
           || !probe.minion_jobs_pq_lease_exists);
+    const needsSourceEventReceiptIndexColumns = probe.source_event_receipts_exists
+      && (!probe.source_event_receipts_processor_version_exists
+          || !probe.source_event_receipts_event_id_exists);
 
     // Fresh installs (no tables yet) and modern brains both no-op.
     if (!needsPagesBootstrap && !needsLinksBootstrap && !needsChunksBootstrap
@@ -1332,7 +1344,8 @@ export class PGLiteEngine implements BrainEngine {
         && !needsPagesLinksExtractedAt
         && !needsTimelineEventPageId
         && !needsMinionJobsTimeoutAt && !needsMinionJobsIdempotencyKey
-        && !needsMinionJobsPrivateQueue) return;
+        && !needsMinionJobsPrivateQueue
+        && !needsSourceEventReceiptIndexColumns) return;
 
     process.stderr.write('  Pre-v0.21 brain detected, applying forward-reference bootstrap\n');
 
@@ -1623,6 +1636,13 @@ export class PGLiteEngine implements BrainEngine {
         ALTER TABLE minion_jobs ADD COLUMN IF NOT EXISTS private_queue_owner_job_id INTEGER REFERENCES minion_jobs(id) ON DELETE SET NULL;
         ALTER TABLE minion_jobs ADD COLUMN IF NOT EXISTS private_queue_owner_token TEXT;
         ALTER TABLE minion_jobs ADD COLUMN IF NOT EXISTS private_queue_lease_until TIMESTAMPTZ;
+      `);
+    }
+
+    if (needsSourceEventReceiptIndexColumns) {
+      await this.db.exec(`
+        ALTER TABLE source_event_receipts ADD COLUMN IF NOT EXISTS processor_version TEXT;
+        ALTER TABLE source_event_receipts ADD COLUMN IF NOT EXISTS event_id TEXT;
       `);
     }
   }

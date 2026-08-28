@@ -93,6 +93,41 @@ describe.skipIf(skip)('PostgresEngine forward-reference bootstrap (E2E)', () => 
     expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
   });
 
+  test('pre-v143 Dream TTL shape reaches migrations before the schema index', async () => {
+    await engine.initSchema();
+    const conn = (engine as any).sql;
+    await conn.unsafe(`
+      DELETE FROM dream_verdicts;
+      DROP INDEX IF EXISTS dream_verdicts_expires_idx;
+      ALTER TABLE dream_verdicts DROP COLUMN IF EXISTS expires_at;
+      INSERT INTO dream_verdicts
+        (file_path, content_hash, worth_processing, reasons, judged_at)
+      VALUES
+        ('/tmp/pre-v143.md', 'pre-v143-hash', false, '[]'::jsonb,
+         now() - interval '45 days');
+    `);
+    await engine.setConfig('version', '142');
+
+    await engine.initSchema();
+
+    expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
+    const rows = await conn<{
+      is_nullable: string;
+      age_seconds: number;
+    }[]>`
+      SELECT c.is_nullable,
+             EXTRACT(EPOCH FROM (d.expires_at - d.judged_at))::float8 AS age_seconds
+        FROM information_schema.columns c
+        JOIN dream_verdicts d ON d.content_hash = 'pre-v143-hash'
+       WHERE c.table_schema = current_schema()
+         AND c.table_name = 'dream_verdicts'
+         AND c.column_name = 'expires_at'
+    `;
+    expect(rows).toHaveLength(1);
+    expect(rows[0].is_nullable).toBe('NO');
+    expect(rows[0].age_seconds).toBeCloseTo(30 * 24 * 60 * 60, -1);
+  });
+
   test('pre-v121 timeline shape converges to full final shape on REAL Postgres (#2626 wedge class)', async () => {
     // The v121 wedge was Postgres-visible in production (blob CREATE INDEX
     // on a column migration v121 hadn't added yet); the PGLite twins live in

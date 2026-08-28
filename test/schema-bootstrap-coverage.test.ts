@@ -192,6 +192,10 @@ const REQUIRED_BOOTSTRAP_COVERAGE: ForwardReference[] = [
   // Token rides the same bootstrap ALTER; registering it guards any FUTURE
   // blob index on it against the same wedge.
   { kind: 'column', table: 'minion_jobs', column: 'private_queue_owner_token' },
+  // Fork migration v145/v146 columns are referenced by schema-blob indexes;
+  // older fork histories may have the table without one of these columns.
+  { kind: 'column', table: 'source_event_receipts', column: 'processor_version' },
+  { kind: 'column', table: 'source_event_receipts', column: 'event_id' },
 ];
 
 test('applyForwardReferenceBootstrap covers every forward reference declared in REQUIRED_BOOTSTRAP_COVERAGE', async () => {
@@ -1107,6 +1111,20 @@ test('postgres-engine.ts bootstrap carries the private-queue ALTERs and probes (
   for (const column of ['private_queue_owner_job_id', 'private_queue_owner_token', 'private_queue_lease_until']) {
     expect(pgBootstrapAdds).toContainEqual({ table: 'minion_jobs', column });
   }
+});
+
+test('Postgres bootstrap repairs the v143 Dream TTL forward reference before schema replay', async () => {
+  const { readFileSync } = await import('fs');
+  const { resolve: resolvePath } = await import('path');
+  const enginePath = resolvePath(process.cwd(), 'src/core/postgres-engine/forward-reference-bootstrap.ts');
+  const engineSrc = readFileSync(enginePath, 'utf-8');
+  const normalized = engineSrc.replace(/\s+/g, ' ');
+
+  expect(normalized).toContain("table_name = 'dream_verdicts' AND column_name = 'expires_at'");
+  expect(normalized).toContain('needsDreamVerdictExpiresAt');
+  expect(normalized).toContain(
+    'ALTER TABLE dream_verdicts ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;',
+  );
 });
 
 test('planted-bug: simulated unprovided column produces a clear failure message', async () => {

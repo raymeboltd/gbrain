@@ -64,6 +64,11 @@ const probeRows = await conn<{
   sources_archived_exists: boolean;
   sources_archived_at_exists: boolean;
   sources_archive_expires_at_exists: boolean;
+  dream_verdicts_exists: boolean;
+  dream_verdicts_expires_at_exists: boolean;
+  source_event_receipts_exists: boolean;
+  source_event_receipts_processor_version_exists: boolean;
+  source_event_receipts_event_id_exists: boolean;
 }[]>`
   SELECT
     EXISTS (SELECT 1 FROM information_schema.tables
@@ -126,6 +131,16 @@ const probeRows = await conn<{
             WHERE table_schema = current_schema() AND table_name = 'sources' AND column_name = 'archived_at') AS sources_archived_at_exists,
     EXISTS (SELECT 1 FROM information_schema.columns
             WHERE table_schema = current_schema() AND table_name = 'sources' AND column_name = 'archive_expires_at') AS sources_archive_expires_at_exists,
+    EXISTS (SELECT 1 FROM information_schema.tables
+            WHERE table_schema = current_schema() AND table_name = 'dream_verdicts') AS dream_verdicts_exists,
+    EXISTS (SELECT 1 FROM information_schema.columns
+            WHERE table_schema = current_schema() AND table_name = 'dream_verdicts' AND column_name = 'expires_at') AS dream_verdicts_expires_at_exists,
+    EXISTS (SELECT 1 FROM information_schema.tables
+            WHERE table_schema = current_schema() AND table_name = 'source_event_receipts') AS source_event_receipts_exists,
+    EXISTS (SELECT 1 FROM information_schema.columns
+            WHERE table_schema = current_schema() AND table_name = 'source_event_receipts' AND column_name = 'processor_version') AS source_event_receipts_processor_version_exists,
+    EXISTS (SELECT 1 FROM information_schema.columns
+            WHERE table_schema = current_schema() AND table_name = 'source_event_receipts' AND column_name = 'event_id') AS source_event_receipts_event_id_exists,
     EXISTS (SELECT 1 FROM information_schema.columns
             WHERE table_schema = current_schema() AND table_name = 'pages' AND column_name = 'last_retrieved_at') AS pages_last_retrieved_at_exists,
     EXISTS (SELECT 1 FROM information_schema.columns
@@ -224,6 +239,15 @@ const needsSourcesArchive = probe.sources_exists
   && (!probe.sources_archived_exists
       || !probe.sources_archived_at_exists
       || !probe.sources_archive_expires_at_exists);
+// v143: the Postgres schema blob creates dream_verdicts_expires_idx before
+// runMigrations can add expires_at to an existing pre-v143 table. Add only a
+// nullable column here; v143 remains authoritative for the judged_at + 30d
+// backfill, default, and NOT NULL constraint.
+const needsDreamVerdictExpiresAt = probe.dream_verdicts_exists
+  && !probe.dream_verdicts_expires_at_exists;
+const needsSourceEventReceiptIndexColumns = probe.source_event_receipts_exists
+  && (!probe.source_event_receipts_processor_version_exists
+      || !probe.source_event_receipts_event_id_exists);
 // v0.37.0 (v79): pages_last_retrieved_at_idx in SCHEMA_SQL references
 // last_retrieved_at. Pre-v79 brains crash without the column; bootstrap
 // adds it before SCHEMA_SQL replay creates the index. v79 runs later
@@ -303,6 +327,8 @@ if (!needsPagesBootstrap && !needsLinksBootstrap && !needsChunksBootstrap
     && !needsIngestLogSourceId && !needsFilesBootstrap
     && !needsOauthClientsBootstrap && !needsOauthClientsSurface
     && !needsSourcesArchive
+    && !needsDreamVerdictExpiresAt
+    && !needsSourceEventReceiptIndexColumns
     && !needsPagesLastRetrievedAt
     && !needsPagesProvenance
     && !needsContextualRetrievalColumns && !needsPagesGeneration
@@ -499,6 +525,21 @@ if (needsSourcesArchive) {
     ALTER TABLE sources ADD COLUMN IF NOT EXISTS archived BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE sources ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;
     ALTER TABLE sources ADD COLUMN IF NOT EXISTS archive_expires_at TIMESTAMPTZ;
+  `);
+}
+
+if (needsDreamVerdictExpiresAt) {
+  await conn.unsafe(`
+    ALTER TABLE dream_verdicts ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
+  `);
+}
+
+if (needsSourceEventReceiptIndexColumns) {
+  // v145/v146 backfill and constrain these columns after the schema blob's
+  // lookup/event indexes have been allowed to replay on an older fork brain.
+  await conn.unsafe(`
+    ALTER TABLE source_event_receipts ADD COLUMN IF NOT EXISTS processor_version TEXT;
+    ALTER TABLE source_event_receipts ADD COLUMN IF NOT EXISTS event_id TEXT;
   `);
 }
 
