@@ -105,7 +105,24 @@ async function listCandidates(engine: BrainEngine, sourceId: string, limit: numb
              AND r.status IN ('applied','partial','skipped')
              AND NOT (r.errors @> '[{"code":"source_retracted"}]'::jsonb)
         )
-      ORDER BY CASE WHEN
+        AND NOT EXISTS (
+          SELECT 1 FROM source_event_receipts retry_receipt
+           WHERE retry_receipt.source_id=p.source_id
+             AND retry_receipt.source_slug=p.slug
+             AND retry_receipt.content_hash=md5(COALESCE(p.compiled_truth, '') || E'\n' || COALESCE(p.timeline, ''))
+             AND retry_receipt.processor_version=$4
+             AND retry_receipt.status IN ('review','error')
+             AND retry_receipt.updated_at > now() - INTERVAL '24 hours'
+        )
+      ORDER BY CASE WHEN EXISTS (
+        SELECT 1 FROM source_event_receipts pending_retry
+         WHERE pending_retry.source_id=p.source_id
+           AND pending_retry.source_slug=p.slug
+           AND pending_retry.content_hash=md5(COALESCE(p.compiled_truth, '') || E'\n' || COALESCE(p.timeline, ''))
+           AND pending_retry.processor_version=$4
+           AND pending_retry.status IN ('review','error')
+      ) THEN 1 ELSE 0 END,
+      CASE WHEN
         (
           jsonb_typeof(p.frontmatter#>'{transcript_import,session_id}') = 'string'
           AND jsonb_typeof(p.frontmatter#>'{transcript_import,harness}') = 'string'

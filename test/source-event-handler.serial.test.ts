@@ -296,6 +296,94 @@ describe('source-event projection handler', () => {
     expect(result).toMatchObject({ status: 'partial', scanned: 2, applied: 0, partial: 0, skipped: 1, reviews: 1, errors: 2 });
   });
 
+  test('prioritizes unseen events ahead of a full retryable-review batch so review volume cannot starve intake', async () => {
+    await engine.putPage('people/alex-one', {
+      type: 'person', title: 'Alex Example', compiled_truth: 'Known one.',
+    });
+    await engine.putPage('people/alex-two', {
+      type: 'person', title: 'Alex Example', compiled_truth: 'Known two.',
+    });
+    for (let i = 0; i < 100; i++) {
+      await engine.putPage(`raw/gmail/review-${i}`, {
+        type: 'email', title: `Review ${i}`, compiled_truth: 'Alex Example replied.',
+        frontmatter: { provider: 'gmail', message_id: `review-${i}` },
+      });
+    }
+    const handler = makeSourceEventProjectionHandler(engine);
+    const first = await handler(fakeJob({ sourceId: 'default', limit: 100 })) as {
+      scanned: number; reviews: number;
+    };
+    expect(first).toMatchObject({ scanned: 100, reviews: 100 });
+
+    await engine.putPage('raw/gmail/unseen-new', {
+      type: 'email', title: 'Unseen', compiled_truth: 'Nobody Known replied.',
+      frontmatter: { provider: 'gmail', message_id: 'unseen-new' },
+    });
+    const second = await handler(fakeJob({ sourceId: 'default', limit: 1 })) as {
+      scanned: number; skipped: number; reviews: number;
+    };
+    expect(second).toMatchObject({ scanned: 1, skipped: 1, reviews: 0 });
+    const receipts = await engine.executeRaw<{ source_slug: string }>(
+      'SELECT source_slug FROM source_event_receipts ORDER BY source_slug',
+    );
+    expect(receipts).toHaveLength(101);
+    expect(receipts.map((row) => row.source_slug)).toContain('raw/gmail/unseen-new');
+
+    await engine.executeRaw(
+      "UPDATE source_event_receipts SET status='error',updated_at=now() - INTERVAL '25 hours' WHERE status='review'",
+    );
+    await engine.putPage('raw/gmail/unseen-after-errors', {
+      type: 'email', title: 'Unseen after errors', compiled_truth: 'Still Nobody Known replied.',
+      frontmatter: { provider: 'gmail', message_id: 'unseen-after-errors' },
+    });
+    const afterErrors = await handler(fakeJob({ sourceId: 'default', limit: 1 })) as {
+      scanned: number; skipped: number; reviews: number;
+    };
+    expect(afterErrors).toMatchObject({ scanned: 1, skipped: 1, reviews: 0 });
+  });
+
+  test('cools unchanged review/error receipts, bypasses on content change, and retries when due', async () => {
+    await engine.putPage('people/victor-one', {
+      type: 'person', title: 'Victor One', compiled_truth: 'Known one.',
+    });
+    await engine.putPage('people/victor-two', {
+      type: 'person', title: 'Victor Two', compiled_truth: 'Known two.',
+    });
+    await engine.setPageAliases('people/victor-one', 'default', ['victor']);
+    await engine.setPageAliases('people/victor-two', 'default', ['victor']);
+    await engine.putPage('raw/gmail/retry-review', {
+      type: 'email', title: 'Retry review', compiled_truth: 'Victor replied.',
+      frontmatter: { provider: 'gmail', message_id: 'retry-review' },
+    });
+    const handler = makeSourceEventProjectionHandler(engine);
+    const first = await handler(fakeJob({ sourceId: 'default', limit: 1 })) as {
+      scanned: number; reviews: number;
+    };
+    expect(first).toMatchObject({ scanned: 1, reviews: 1 });
+
+    const cooledReview = await handler(fakeJob({ sourceId: 'default', limit: 1 })) as { scanned: number };
+    expect(cooledReview.scanned).toBe(0);
+    await engine.executeRaw("UPDATE source_event_receipts SET status='error'");
+    const cooledError = await handler(fakeJob({ sourceId: 'default', limit: 1 })) as { scanned: number };
+    expect(cooledError.scanned).toBe(0);
+
+    await engine.putPage('raw/gmail/retry-review', {
+      type: 'email', title: 'Retry review', compiled_truth: 'Victor replied with changed content.',
+      frontmatter: { provider: 'gmail', message_id: 'retry-review' },
+    });
+    const changed = await handler(fakeJob({ sourceId: 'default', limit: 1 })) as {
+      scanned: number; reviews: number;
+    };
+    expect(changed).toMatchObject({ scanned: 1, reviews: 1 });
+
+    await engine.setPageAliases('people/victor-two', 'default', []);
+    await engine.executeRaw("UPDATE source_event_receipts SET updated_at=now() - INTERVAL '25 hours'");
+    const due = await handler(fakeJob({ sourceId: 'default', limit: 1 })) as {
+      scanned: number; partial: number;
+    };
+    expect(due).toMatchObject({ scanned: 1, partial: 1 });
+  });
+
   test('normalizes every material ingestion shape and excludes derived Dream/artifact pages', async () => {
     await seedCanonicalTarget('people/victor-example', 'person', 'Victor Example');
     await seedLane('raw/messages/beeper-1', 'message', '2026-08-21', { provider_item_id: undefined, message_id: 'beeper-msg-1', network: 'whatsapp' });

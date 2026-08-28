@@ -42,6 +42,12 @@ Autopilot submits one source-scoped, single-flight job per enabled source after
 producer dispatch. The source's own `autopilot_sync: false` breaker blocks both
 sync and projection.
 
+Unseen event revisions run before prior review/error retries. An unchanged
+review or error receipt cools down for 24 hours before becoming eligible again;
+a changed content hash or processor version is eligible immediately. This keeps
+an unresolved review backlog from starving newly ingested signals while still
+retrying ambiguity after entity/schema repair.
+
 ## Roll back scheduling
 
 ```bash
