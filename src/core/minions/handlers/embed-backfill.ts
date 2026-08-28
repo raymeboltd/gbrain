@@ -41,6 +41,7 @@ import { resolvePaceMode, loadPaceModeConfig, readPaceEnv } from '../../pace-mod
 import type { BrainEngine } from '../../engine.ts';
 import type { MinionJobContext } from '../types.ts';
 import { parseUsdLimit, usdLimitToCap, resolveSpendPosture } from '../../spend-posture.ts';
+import { recordMinionJobSpend } from '../../minion-spend.ts';
 
 import { embedBackfillLockId, EMBED_BACKFILL_LOCK_TTL_MIN } from '../../embed-backfill-lock.ts';
 
@@ -257,6 +258,21 @@ export function makeEmbedBackfillHandler(
       throw err;
     } finally {
       pacer.dispose();
+      // Settle this run's LLM/embedding spend against the originating OAuth
+      // client (job.data.client_id when run_onboard submitted the job; NULL
+      // for local submissions — the row still lands for global accounting).
+      // Covers every exit path — success, aborted, budget_exhausted, throw.
+      // Best-effort: spend telemetry must never fail the job (recordSpend
+      // swallows write failures; this guard swallows the rest). Ceil so
+      // sub-cent spend still counts against the per-client daily cap.
+      if (tracker.totalSpent > 0) {
+        try {
+          await recordMinionJobSpend(engine, { id: job.id, data: job.data }, {
+            operation: 'embed-backfill',
+            spendCents: Math.ceil(tracker.totalSpent * 100),
+          });
+        } catch { /* never block the job on ledger writes */ }
+      }
       // ALWAYS release. Aborts, throws, budget-exhaust — all paths unwind here.
       try {
         await lock.release();

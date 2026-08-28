@@ -85,6 +85,42 @@ trees under `test/fixtures/guards/<guard>/{bad,good}/` via the
 build. A guard whose pattern rots into a permanently-green no-op now fails CI
 instead of masquerading as coverage.
 
+### Registry-walking ratchets
+
+Structural suites that walk a registry so the NEXT gap of a known class
+cannot ship silently. All allowlists below are shrink-only.
+
+- `test/operations-coverage-ledger.test.ts` — every op in
+  `src/core/operations.ts` maps to a covering test file in a checked-in
+  ledger; the `UNCOVERED` allowlist only shrinks. Shares one
+  registry-enumeration helper (`test/helpers/ops-registry.ts`) with the
+  jobs-ops token-redaction sweep so two walkers can't drift.
+- `test/operations-source-isolation-matrix.test.ts` — every non-localOnly
+  read op runs under a scoped remote ctx and a federated grant; nothing
+  carrying the other source's identity may return. Deliberate brain-wide
+  behavior requires an explicit `BRAIN_WIDE_READS` entry with a rationale
+  string. Anti-vacuity is mandatory: each op's control call must SEE the
+  cross-source marker before its scoped assertions count; an op that can't
+  be driven is an explicit counted SKIP disposition, never a silent pass.
+- `test/scripts/e2e-wiring.test.ts` — every `test/e2e/*.test.ts` must be
+  claimed by a PR-time lane (a `scripts/e2e-test-map.ts` row, a workflow
+  mention, or the shrink-only `test/fixtures/e2e-unmapped-baseline.txt`),
+  and every map entry must point at a real file (typo guard).
+- `test/engine-surface-coverage.test.ts` — two-way census of the
+  `BrainEngine` interface against the PGLite prototype (new methods force a
+  visible list edit) plus a runtime `UNCALLED` ratchet scanning the whole
+  test corpus for references, so a never-called engine method can't ship.
+- `scripts/check-orphan-modules.mjs` (verify battery, guard-manifest
+  registered with bad/good fixtures) — transitive import walk from the
+  cli/mcp/engine entrypoints; a src module reachable from no entrypoint
+  fails unless in the 4-entry reasoned allowlist, and the
+  test-only-reachable tier has a shrink-only ceiling.
+
+The takes-bootstrap graduation instrument (`evals/takes-bootstrap/`: 123-case
+corpus, scorer, live harness + $0 replay) is CI-guarded keyless by
+`test/eval-takes-bootstrap.test.ts` — the guard proves the instrument, not
+the score; the autopilot tier flips only on a committed GRADUATED live run.
+
 ### Shell dispatch and Windows
 
 All four of `test`, `verify`, `ci:local` and `test:e2e` hand off to shell scripts
@@ -599,6 +635,7 @@ E2E tests live in `test/e2e/` and run against real Postgres+pgvector (require `D
 - `test/e2e/source-isolation-pglite.test.ts` — PGLite in-memory regression suite pinning the source-isolation seal at two layers. Engine layer: `searchKeyword` / `searchVector` / `searchKeywordChunks` / `listPages` / `getPage` / `traverseGraph` / `traversePaths` apply `sourceId` (scalar fast path) and `sourceIds` (array path) correctly across both engines. Op-handler layer: routes through `sourceScopeOpts(ctx)` so a `read+write`-scoped OAuth client bound to `--source dept-x` cannot see rows from neighboring sources via `search`, `query`, `list_pages`, `get_page`, or `find_experts`. Covers both `ctx.sourceId` (single-source clients) and `ctx.auth.allowedSources` (federated_read clients) precedence; federated array wins over scalar wins over nothing. No `DATABASE_URL` needed.
 - `test/e2e/think-source-isolation-pglite.test.ts` — PGLite in-memory suite pinning the `think` gather stage's source scope: seeds three sources with cross-source links and embedded takes, then asserts `runGather` under a federated `sourceIds` grant (and under a scalar `sourceId`) keeps every stream — hybrid retrieval, takes keyword + vector (`searchTakes`/`searchTakesVector`), and the `traversePaths` graph walk — inside the grant while still reaching authorized neighboring sources. No `DATABASE_URL` needed.
 - `test/e2e/skill-brain-first.test.ts` — doctor reports `skill_brain_first` check with structured issues; `--fix --dry-run` previews insertion without writing; `--fix` applies the canonical Convention callout idempotently; `brain_first: exempt` frontmatter resolves the warn; `brain_first_typo` surfaces a paste-ready hint; audit JSONL records `detected` / `resolved` / `fixed` transitions; stable brain emits 0 audit lines/run.
+- Test-gap-wave journey suites (each claimed by an `scripts/e2e-test-map.ts` row; DATABASE_URL-gated unless noted): `migrate-engine-pglite-to-postgres.test.ts` (whole-brain `runMigrateEngine` transfer incl. the child-process failure arm — config not flipped), `takes-write-ops-postgres.test.ts` (takes op layer + `withPageLock` serialization), `propose-takes-jsonb-postgres.test.ts` + `calibration-profile-write.test.ts` (JSONB bind shape on real Postgres), `engine-parity-cjk.test.ts` (cross-engine CJK keyword parity on an identical corpus — both engines route `hasCJK()` queries through the shared ILIKE builder in `src/core/search/cjk-keyword-sql.ts`; top-slug agreement, chunk-grain parity, mixed-query AND semantics, nonexistent-term strictness), `code-edges-read-parity.test.ts` / `ontology-merge-parity.test.ts` / `chronicle-event-projection-parity.test.ts` / `health-parity-postgres.test.ts` (read-path + getHealth parity), `sync-sigkill-resume-postgres.test.ts` (real SIGKILL mid-sync; DB-polled checkpoint, stranded-lock reclaim, exactly-once resume), `serve-http-source-grant.test.ts` (legacy no-grant federated widening vs granted confinement over real `/mcp`), `mounts-routing-pglite.test.ts` (hermetic mount-routing tiers, no DATABASE_URL), `serve-http-surface-ceiling.test.ts` (hermetic 7-verb `--surface verbs` ceiling; the FORCE_SURFACE env is narrow-only), `autopilot-linux-lifecycle.serial.test.ts` + `upgrade-bun-link-arc.serial.test.ts` (PATH-shimmed crontab/systemctl and bun-link upgrade arcs, hermetic), and the thin-client daily-driver verb extension inside `thin-client.test.ts`.
 - Tier 2 (`test/e2e/skills.test.ts`) requires OpenClaw + API keys, runs nightly in CI.
 - `test/e2e/claw-test.test.ts` also covers live mode token-free via shim agents (`OPENCLAW_BIN=<sh script>`): the success-oracle break path (a do-nothing agent now FAILS), the E0 child-friction merge surviving tempdir cleanup, and the upgrade staging + schema-version-probe regression.
 - If `.env.testing` doesn't exist in this directory, check sibling worktrees: `find ../ -maxdepth 2 -name .env.testing -print -quit` and copy it here if found.

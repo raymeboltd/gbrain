@@ -4788,17 +4788,23 @@ export class PGLiteEngine implements BrainEngine {
   // builder idiom): JOIN depth page (deleted_at IS NULL), LEFT JOIN event page,
   // hide soft-deleted event projections, order by COALESCE(event effective_date,
   // date). Source scope: federated sourceIds[] > scalar sourceId > unscoped.
-  private pushChronicleSource(where: string[], params: unknown[], opts?: { sourceId?: string; sourceIds?: string[] }): void {
+  // Returns the ep-side fragment (same param slot): the event-page LEFT JOIN carries
+  // the caller's scope so out-of-scope event fields null out (#2200 origin-join shape).
+  private pushChronicleSource(where: string[], params: unknown[], opts?: { sourceId?: string; sourceIds?: string[] }): string {
     if (opts?.sourceIds && opts.sourceIds.length > 0) {
       params.push(opts.sourceIds);
       where.push(`p.source_id = ANY($${params.length}::text[])`);
+      return ` AND ep.source_id = ANY($${params.length}::text[])`;
     } else if (opts?.sourceId) {
       params.push(opts.sourceId);
       where.push(`p.source_id = $${params.length}`);
+      return ` AND ep.source_id = $${params.length}`;
     }
+    return '';
   }
 
-  private static CHRONICLE_SELECT = `
+  private static chronicleSelect(epScope: string): string {
+    return `
     SELECT te.date::text AS date, te.summary, te.detail, te.source,
            te.page_id, p.slug AS page_slug,
            te.event_page_id, ep.slug AS event_slug,
@@ -4806,7 +4812,8 @@ export class PGLiteEngine implements BrainEngine {
            ep.frontmatter->'event'->>'kind' AS kind
     FROM timeline_entries te
     JOIN pages p ON p.id = te.page_id AND p.deleted_at IS NULL
-    LEFT JOIN pages ep ON ep.id = te.event_page_id`;
+    LEFT JOIN pages ep ON ep.id = te.event_page_id${epScope}`;
+  }
 
   async getTimelineForDate(date: string, opts?: ChronicleTimelineOpts): Promise<ChronicleTimelineRow[]> {
     const limit = opts?.limit ?? 200;
@@ -4818,10 +4825,10 @@ export class PGLiteEngine implements BrainEngine {
       `te.date <= ${upper}`,
       `(te.event_page_id IS NULL OR ep.deleted_at IS NULL)`,
     ];
-    this.pushChronicleSource(where, params, opts);
+    const epScope = this.pushChronicleSource(where, params, opts);
     params.push(limit);
     const result = await this.db.query(
-      `${PGLiteEngine.CHRONICLE_SELECT}
+      `${PGLiteEngine.chronicleSelect(epScope)}
        WHERE ${where.join(' AND ')}
        ORDER BY COALESCE(ep.effective_date, te.date::timestamptz) ASC, te.id ASC
        LIMIT $${params.length}`,
@@ -4841,10 +4848,10 @@ export class PGLiteEngine implements BrainEngine {
       params.push(opts.kind);
       where.push(`ep.frontmatter->'event'->>'kind' = $${params.length}`);
     }
-    this.pushChronicleSource(where, params, opts);
+    const epScope = this.pushChronicleSource(where, params, opts);
     params.push(limit);
     const result = await this.db.query(
-      `${PGLiteEngine.CHRONICLE_SELECT}
+      `${PGLiteEngine.chronicleSelect(epScope)}
        WHERE ${where.join(' AND ')}
        ORDER BY COALESCE(ep.effective_date, te.date::timestamptz) ASC, te.id ASC
        LIMIT $${params.length}`,
@@ -4865,10 +4872,10 @@ export class PGLiteEngine implements BrainEngine {
       `te.date < ${target}`,
       `(te.event_page_id IS NULL OR ep.deleted_at IS NULL)`,
     ];
-    this.pushChronicleSource(where, params, opts);
+    const epScope = this.pushChronicleSource(where, params, opts);
     params.push(limit);
     const result = await this.db.query(
-      `${PGLiteEngine.CHRONICLE_SELECT}
+      `${PGLiteEngine.chronicleSelect(epScope)}
        WHERE ${where.join(' AND ')}
        ORDER BY te.date DESC, te.id ASC
        LIMIT $${params.length}`,
@@ -4894,12 +4901,12 @@ export class PGLiteEngine implements BrainEngine {
     if (opts?.asof) { params.push(opts.asof); seenThrough = `$${params.length}::date`; }
     else { seenThrough = `current_date`; }
     where.push(`te.date <= ${seenThrough}`);
-    this.pushChronicleSource(where, params, opts);
+    const epScope = this.pushChronicleSource(where, params, opts);
     const result = await this.db.query(
       `SELECT te.date::text AS last_date, ep.slug AS last_event_slug
        FROM timeline_entries te
        JOIN pages p ON p.id = te.page_id AND p.deleted_at IS NULL
-       LEFT JOIN pages ep ON ep.id = te.event_page_id
+       LEFT JOIN pages ep ON ep.id = te.event_page_id${epScope}
        WHERE ${where.join(' AND ')}
        ORDER BY COALESCE(ep.effective_date, te.date::timestamptz) DESC, te.id DESC
        LIMIT 1`,
