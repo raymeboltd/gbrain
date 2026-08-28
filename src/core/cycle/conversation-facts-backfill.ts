@@ -51,6 +51,7 @@ import {
   isAbortError,
   type ExtractConversationFactsResult,
 } from '../../commands/extract-conversation-facts.ts';
+import { ConversationFactsDeadlineExceeded } from './conversation-facts-deadline.ts';
 // The type allowlist comes straight from the canonical leaf module (same
 // binding extract-conversation-facts.ts re-exports) so this phase is part of
 // the drift-guarded set in test/conversation-facts-type-allowlist-drift.test.ts.
@@ -95,6 +96,23 @@ interface ResolvedConfig {
    * opt-in via this config key. PGLite engines clamp to 1 regardless.
    */
   workers: number;
+}
+
+export function hasUnfinishedConversationFactsPage(
+  result: ExtractConversationFactsResult,
+): boolean {
+  // `pages_marked_non_extractable` and `pages_skipped_unrecognized_speaker`
+  // are detail counters whose pages already increment `pages_skipped`.
+  const handled =
+    result.pages_processed +
+    result.pages_skipped +
+    result.pages_skipped_too_large +
+    result.pages_skipped_disappeared +
+    result.pages_skipped_completed +
+    result.pages_skipped_non_extractable +
+    result.pages_failed +
+    result.pages_lock_skipped;
+  return handled < result.pages_considered;
 }
 
 async function loadCfg(engine: BrainEngine): Promise<ResolvedConfig> {
@@ -278,7 +296,7 @@ export async function runPhaseConversationFactsBackfill(
       let walltimeFired = false;
       const timer = setTimeout(() => {
         walltimeFired = true;
-        controller.abort(new Error(
+        controller.abort(new ConversationFactsDeadlineExceeded(
           `conversation_facts_backfill: per-source walltime cap (${cfg.maxWalltimeMin}min) hit for ${src.id}`,
         ));
       }, perSourceWallMs);
@@ -297,9 +315,30 @@ export async function runPhaseConversationFactsBackfill(
             // per-source worker count. Default 1 — opt-in concurrency
             // for cycle paths.
             workers: cfg.workers,
+            // Preserve already-committed page/fact counters when THIS
+            // wrapper's per-source deadline fires. Caller cancellation is
+            // checked and rethrown immediately after the core returns.
+            returnPartialOnDeadline: true,
           }, controller.signal),
         );
-        perSourceResults[src.id] = result;
+        if (opts.signal?.aborted) {
+          throw opts.signal.reason instanceof Error
+            ? opts.signal.reason
+            : Object.assign(new Error('caller cancelled'), { name: 'AbortError' });
+        }
+        if (
+          result.deadline_exhausted ||
+          (walltimeFired && hasUnfinishedConversationFactsPage(result))
+        ) {
+          sourcesWalltimeExhausted++;
+          perSourceResults[src.id] = {
+            ...result,
+            walltime_exhausted: true,
+            error: 'walltime_exhausted',
+          };
+        } else {
+          perSourceResults[src.id] = result;
+        }
         // #3627: per-source exhaustion (cost or the tracker's runtime cap)
         // is recorded and the loop CONTINUES — the next source gets its own
         // fresh budget. Only the brain-wide checks at the loop top break.

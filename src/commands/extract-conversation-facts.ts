@@ -91,8 +91,9 @@ import { runSlidingPool } from '../core/worker-pool.ts';
 import { parseWorkers, resolveWorkersWithClamp } from '../core/sync-concurrency.ts';
 import { withRefreshingLock, LockUnavailableError } from '../core/db-lock.ts';
 import { assertFactsEmbeddingDimMatchesConfig } from '../core/embedding-dim-check.ts';
-import { writeReceipt, shortRunId } from '../core/extract/receipt-writer.ts';
-import { upsertExtractRollup, classifyRunStop } from '../core/extract/rollup-writer.ts';
+import { shortRunId } from '../core/extract/receipt-writer.ts';
+import { writeConversationFactsRunReceipt } from '../core/extract/conversation-facts-run-receipt.ts';
+import { ConversationFactsDeadlineExceeded } from '../core/cycle/conversation-facts-deadline.ts';
 import { ALLOWED_TYPES, type AllowedType } from '../core/facts/conversation-types.ts';
 import { TERMINAL_AUDIT_SOURCE, NON_EXTRACTABLE_AUDIT_SOURCE } from '../core/facts/audit-sources.ts';
 import {
@@ -304,6 +305,13 @@ export interface ExtractConversationFactsCoreOpts {
    * a brain-wide tracker; CLI/Minion pass nothing.
    */
   budgetTracker?: BudgetTracker;
+  /**
+   * Internal cycle-wrapper seam: return the counters already banked before
+   * this signal aborted and persist the bounded-run receipt. The wrapper must
+   * still rethrow its caller-owned abort; only its own per-source deadline may
+   * be surfaced as a normal partial result.
+   */
+  returnPartialOnDeadline?: boolean;
   /** Bypass `facts.extraction_enabled=false`. Power-user escape. */
   overrideDisabled?: boolean;
   /**
@@ -377,6 +385,8 @@ export interface ExtractConversationFactsResult {
   /** Entity values kept raw after a best-effort resolution failure. */
   resolution_errors: number;
   budget_exhausted?: boolean;
+  /** Internal marker: this result was returned from a typed per-source deadline. */
+  deadline_exhausted?: boolean;
   spent_usd?: number;
 }
 
@@ -1599,9 +1609,24 @@ export async function runExtractConversationFactsCore(
       // Fall through to receipt+rollup write so the partial run is
       // still observable in extract_health doctor + extracts/ pages.
       // ...but not under --dry-run: a preview must not persist cache state.
-      if (!dryRun) await writeRunReceiptAndRollup(engine, sourceId, result, /* halted */ true);
+      if (!dryRun) await writeConversationFactsRunReceipt(engine, sourceId, result, true);
       // Return partial result — caller (CLI / Minion) decides how to
       // surface. NOT a thrown failure.
+      return result;
+    }
+    if (
+      opts.returnPartialOnDeadline &&
+      signal?.reason instanceof ConversationFactsDeadlineExceeded
+    ) {
+      if (opts.budgetTracker) {
+        result.spent_usd = opts.budgetTracker.totalSpent;
+      }
+      result.deadline_exhausted = true;
+      // The per-page writes and durable extraction outcomes completed before
+      // the abort are already committed. Preserve their counters and emit the
+      // same bounded-run receipt/rollup used for a budget stop instead of
+      // letting the cycle wrapper replace real progress with zeroes.
+      if (!dryRun) await writeConversationFactsRunReceipt(engine, sourceId, result, true);
       return result;
     }
     throw err;
@@ -1628,7 +1653,7 @@ export async function runExtractConversationFactsCore(
   // --dry-run must not persist cache/knowledge state: skip the rollup UPSERT +
   // receipt-page write so a preview leaves no extract cache row behind.
   if (!dryRun) {
-    await writeRunReceiptAndRollup(
+    await writeConversationFactsRunReceipt(
       engine,
       sourceId,
       result,
@@ -1637,75 +1662,6 @@ export async function runExtractConversationFactsCore(
   }
 
   return result;
-}
-
-/**
- * v0.42 — Wave B1: best-effort receipt + rollup writes at the end of an
- * extract-conversation-facts run. Skips the receipt page when the run
- * extracted ZERO facts (no-op runs don't need brain memory) but always
- * UPSERTs the rollup row so doctor sees the cycle ran.
- *
- * `halted` true means the run hit a budget cap mid-flight; receipt
- * carries that state in its frontmatter (round='full' regardless; the
- * halt is recorded as a halt_delta=1 in the rollup table).
- */
-async function writeRunReceiptAndRollup(
-  engine: BrainEngine,
-  sourceId: string,
-  result: ExtractConversationFactsResult,
-  halted: boolean,
-): Promise<void> {
-  const now = new Date().toISOString();
-  // run_id: stable-ish identifier for this run. Includes day so multiple
-  // runs of the same source on different days don't collide on the
-  // receipt slug. shortRunId() truncates to 8 chars.
-  const runId = `ecf-${Date.now().toString(36)}-${sourceId.slice(0, 4)}`;
-
-  // Receipt write: only when the run actually inserted facts.
-  if (result.facts_inserted > 0) {
-    try {
-      await writeReceipt(engine, {
-        kind: 'facts.conversation',
-        source_id: sourceId,
-        run_id: runId,
-        round: 'full',
-        extracted_at: now,
-        total_rows: result.facts_inserted,
-        cost_usd: result.spent_usd ?? 0,
-        summary:
-          `Extracted ${result.facts_inserted} facts from ` +
-          `${result.pages_processed}/${result.pages_considered} eligible pages` +
-          (result.pages_failed > 0
-            ? `; ${result.pages_failed} page(s) failed and remain unfinished.`
-            : '.'),
-      });
-    } catch (err) {
-      // Best-effort: receipt write failure shouldn't kill the run.
-      // The audit trail lives in the facts table (terminal rows) +
-      // optionally the new audit JSONL once wired.
-      const msg = (err as Error).message || String(err);
-      console.error(`[extract-conversation-facts] receipt write failed: ${msg}`);
-    }
-  }
-
-  // Rollup UPSERT: ALWAYS fire so doctor's extract_health sees the
-  // cycle ran (even no-op runs are signal — they prove the extractor
-  // was alive). Best-effort per F-OUT-19.
-  //
-  // #4482: a run that stopped ONLY because it hit its per-source budget cap
-  // is working as designed (partial progress banked; the backlog drains over
-  // future runs) — record it as expected_limit_delta, not halt_delta, so
-  // doctor's extract_health failure rate stops warning on normal
-  // bigger-backlog-than-budget operation. Per-page failures stay error halts.
-  await upsertExtractRollup(engine, {
-    kind: 'facts.conversation',
-    source_id: sourceId,
-    cost_delta: result.spent_usd ?? 0,
-    ...classifyRunStop({
-      budget_exhausted: halted,
-      error: result.pages_failed > 0,
-    }),
-  });
 }
 
 /**

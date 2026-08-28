@@ -25,12 +25,17 @@ import {
   configureGateway,
   type ChatResult,
 } from '../src/core/ai/gateway.ts';
-import { runPhaseConversationFactsBackfill } from '../src/core/cycle/conversation-facts-backfill.ts';
+import {
+  hasUnfinishedConversationFactsPage,
+  runPhaseConversationFactsBackfill,
+} from '../src/core/cycle/conversation-facts-backfill.ts';
+import { extractConversationFactsFingerprint } from '../src/commands/extract-conversation-facts.ts';
 
 let engine: PGLiteEngine;
 
 /** Per-test transport knobs. */
 let chatDelayMs = 0;
+let chatFastCallsBeforeDelay = 0;
 let chatOutputTokens = 50;
 let chatCalls = 0;
 let chatCallsBySource: string[] = [];
@@ -71,7 +76,9 @@ beforeAll(async () => {
   __setChatTransportForTests(async (opts): Promise<ChatResult> => {
     chatCalls++;
     chatCallsBySource.push(String(opts.messages[0]?.content ?? '').slice(0, 40));
-    if (chatDelayMs > 0) await new Promise((r) => setTimeout(r, chatDelayMs));
+    if (chatDelayMs > 0 && chatCalls > chatFastCallsBeforeDelay) {
+      await new Promise((r) => setTimeout(r, chatDelayMs));
+    }
     if (opts.abortSignal?.aborted) {
       const err = new Error('The operation was aborted.');
       err.name = 'AbortError';
@@ -122,6 +129,7 @@ afterAll(async () => {
 
 beforeEach(async () => {
   chatDelayMs = 0;
+  chatFastCallsBeforeDelay = 0;
   chatOutputTokens = 50;
   chatCalls = 0;
   chatCallsBySource = [];
@@ -139,6 +147,29 @@ beforeEach(async () => {
 });
 
 describe('runPhaseConversationFactsBackfill per-source caps (#3627)', () => {
+  test('durable non-extractable completion is not unfinished', () => {
+    expect(hasUnfinishedConversationFactsPage({
+      pages_considered: 1,
+      pages_processed: 0,
+      pages_skipped: 1,
+      pages_skipped_too_large: 0,
+      pages_skipped_disappeared: 0,
+      pages_skipped_completed: 0,
+      pages_skipped_non_extractable: 0,
+      pages_marked_non_extractable: 1,
+      pages_skipped_unrecognized_speaker: 0,
+      pages_failed: 0,
+      pages_llm_fallback: 0,
+      pages_lock_skipped: 0,
+      orphan_facts_cleaned: 0,
+      segments_processed: 0,
+      facts_extracted: 0,
+      facts_inserted: 0,
+      fallback_slugify_count: 0,
+      resolution_errors: 0,
+    })).toBe(false);
+  });
+
   test('happy path: two sources both extract under generous caps', async () => {
     await seedSource('src-a');
     await seedSource('src-b');
@@ -171,6 +202,7 @@ describe('runPhaseConversationFactsBackfill per-source caps (#3627)', () => {
     expect(Object.keys(perSource)).toContain('src-cost-a');
     expect(Object.keys(perSource)).toContain('src-cost-b');
     expect(d.sources_budget_exhausted as number).toBeGreaterThan(0);
+    expect(d.sources_walltime_exhausted).toBe(0);
     // Spend is summed across per-source trackers.
     expect(d.spent_usd as number).toBeGreaterThan(0);
   }, 120000);
@@ -193,6 +225,72 @@ describe('runPhaseConversationFactsBackfill per-source caps (#3627)', () => {
     // Both sources were attempted — a slow source can't starve its siblings.
     expect(Object.keys(perSource)).toContain('src-slow-a');
     expect(Object.keys(perSource)).toContain('src-slow-b');
+  }, 120000);
+
+  test('per-source walltime preserves facts and counters completed before the deadline', async () => {
+    await seedSource('src-partial-a');
+    await engine.putPage('conversations/src-partial-a-chat', {
+      type: 'conversation',
+      title: 'Two-segment chat in src-partial-a',
+      compiled_truth: [
+        '**Alice Example** (2024-03-15 9:00 AM): I signed the offer letter.',
+        '**Bob Demo** (2024-03-15 9:01 AM): Congratulations on the role.',
+        '**Alice Example** (2024-03-15 10:00 AM): The project starts Monday.',
+        '**Bob Demo** (2024-03-15 10:01 AM): I will send the plan tomorrow.',
+      ].join('\n'),
+      timeline: '',
+      frontmatter: {},
+    }, { sourceId: 'src-partial-a' });
+
+    // Segment 1 completes immediately. Segment 2 crosses the 180ms
+    // per-source deadline and must not erase segment 1's durable result.
+    chatFastCallsBeforeDelay = 1;
+    chatDelayMs = 500;
+    await engine.setConfig('cycle.conversation_facts_backfill.max_walltime_min', '0.003');
+
+    const r = await runPhaseConversationFactsBackfill(engine, {});
+    const d = r.details as Record<string, unknown>;
+    const perSource = d.per_source as Record<string, {
+      pages_processed: number; facts_inserted: number; walltime_exhausted?: boolean;
+    }>;
+    expect(perSource['src-partial-a']).toMatchObject({ walltime_exhausted: true });
+    expect(perSource['src-partial-a']!.pages_processed).toBe(0);
+    expect(perSource['src-partial-a']!.facts_inserted).toBe(1);
+    expect(d.pages_processed as number).toBe(0);
+    expect(d.facts_inserted as number).toBe(1);
+    const stored = await engine.executeRaw<{ user_facts: number; terminal_rows: number }>(
+      `SELECT COUNT(*) FILTER (WHERE fact <> 'EXTRACTION_COMPLETE')::int AS user_facts,
+              COUNT(*) FILTER (WHERE fact = 'EXTRACTION_COMPLETE')::int AS terminal_rows
+         FROM facts WHERE source_id='src-partial-a'`,
+    );
+    expect(stored[0]).toEqual({ user_facts: 1, terminal_rows: 0 });
+    const receipts = await engine.listPages({
+      sourceId: 'src-partial-a',
+      type: 'extract_receipt',
+      limit: 10,
+    });
+    expect(receipts).toHaveLength(1);
+    expect(receipts[0]?.frontmatter).toMatchObject({
+      source_id: 'src-partial-a',
+      total_rows: 1,
+    });
+    const checkpoints = await engine.executeRaw<{ count: number }>(
+      "SELECT COUNT(*)::int AS count FROM op_checkpoints WHERE op='extract-conversation-facts' AND fingerprint=$1",
+      [extractConversationFactsFingerprint({ sourceId: 'src-partial-a' })],
+    );
+    expect(checkpoints[0]?.count).toBe(0);
+    const rollup = await engine.executeRaw<{ expected_limit_count: number; halt_count: number }>(
+      "SELECT expected_limit_count,halt_count FROM extract_rollup_7d WHERE kind='facts.conversation' AND source_id='src-partial-a'",
+    );
+    expect(rollup[0]).toMatchObject({ expected_limit_count: 1, halt_count: 0 });
+  }, 120000);
+
+  test('caller-owned abort remains control flow instead of a partial success', async () => {
+    await seedSource('src-caller-abort');
+    const controller = new AbortController();
+    controller.abort(new Error('caller aborted'));
+    await expect(runPhaseConversationFactsBackfill(engine, { signal: controller.signal }))
+      .rejects.toThrow(/aborted/);
   }, 120000);
 
   test('brain-wide walltime still skips remaining sources', async () => {
