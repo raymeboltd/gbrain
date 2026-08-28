@@ -812,6 +812,16 @@ async function runPipelineBodyInner(
       // every fact in this entity group as not-inserted (no fact_id
       // returned). Do NOT fall through to legacy DB-only — that
       // would write rows to a DB index whose fence is broken.
+      //
+      // Source-event corrections have a stronger atomicity contract:
+      // returning an ordinary applied/zero-ID result would let the
+      // projector expire the prior revision even though this replacement
+      // never reached its canonical fence. Propagate the failure so the
+      // projector keeps the prior facts active and records a retryable
+      // terminal receipt instead.
+      if (ctx.pendingRunId) {
+        throw new Error(`facts: canonical fence write failed for ${slug}`);
+      }
       continue;
     }
     if (result.stubGuardBlocked || result.targetUnresolvable) {

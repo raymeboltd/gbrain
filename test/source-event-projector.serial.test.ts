@@ -647,6 +647,44 @@ describe('source-event projector', () => {
       .not.toContain('source-event-pending:');
   });
 
+  test('canonical fence failure during correction preserves the prior active fact', async () => {
+    await seedKnownTargets();
+    await engine.executeRaw("UPDATE sources SET local_path=$1 WHERE id='default'", [brainDir]);
+    let oldFactId = 0;
+    const first = await projectSourceEvent(engine, input(), {
+      runFacts: async (factsEngine, sourceInput, _targets, run) => {
+        const written = await writeSingleFact(factsEngine, sourceInput.sourceId, {
+          fact: 'The Porsche Project delivery is Friday', provenance: 'source-event:fence-fail-old',
+          kind: 'event', entity: 'projects/porsche', visibility: 'private', pendingRunId: run.runId,
+        });
+        oldFactId = written.id;
+        return { inserted: 1, duplicate: 0, superseded: 0, factIds: [written.id], stage: 'applied' };
+      },
+    });
+    const corrected = 'Victor Example confirmed the Porsche Project delivery moved to Monday.';
+    await engine.putPage('raw/gmail/msg-123', {
+      type: 'email', title: 'Corrected delivery', compiled_truth: corrected,
+    });
+
+    await expect(projectSourceEvent(engine, input({ content: corrected }), {
+      runFacts: async () => {
+        throw new Error('facts: canonical fence write failed for projects/porsche');
+      },
+    })).rejects.toThrow(/canonical fence write failed/);
+
+    expect((await engine.executeRaw<{ expired_at: Date | null }>(
+      'SELECT expired_at FROM facts WHERE id=$1', [oldFactId],
+    ))[0]?.expired_at).toBeNull();
+    const artifact = await loadSourceEventArtifact(engine, 'default', first.artifactSlug);
+    expect(artifact?.active_revision_id).toBe(first.revisionId);
+    expect(artifact?.pending_revision_id).not.toBeNull();
+    const failedReceipt = await engine.executeRaw<{ status: string; projection_state: string }>(
+      'SELECT status,projection_state FROM source_event_receipts WHERE revision_id=$1',
+      [sourceEventRevisionId(first.eventId, input({ content: corrected }))],
+    );
+    expect(failedReceipt[0]).toEqual({ status: 'error', projection_state: 'pending' });
+  });
+
   test('receipt finalization failure rolls forward on retry without duplicate revisions', async () => {
     await seedKnownTargets();
     await engine.executeRaw("UPDATE sources SET local_path=$1 WHERE id='default'", [brainDir]);

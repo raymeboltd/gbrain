@@ -218,6 +218,43 @@ describe('runFactsBackstop — mode: inline', () => {
     }
   });
 
+  test('source-event fence failure throws instead of reporting applied zero IDs', async () => {
+    const { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { dirname, join } = await import('node:path');
+    const brainDir = mkdtempSync(join(tmpdir(), 'backstop-source-event-fence-fail-'));
+    const slug = `people/fence-fail-${Math.random().toString(36).slice(2, 9)}`;
+    const filePath = join(brainDir, `${slug}.md`);
+    const original = `---\ntype: person\ntitle: Fence Failure\n---\n\n# Fence Failure\n`;
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (engine as any).db.query(`UPDATE sources SET local_path = $1 WHERE id = 'default'`, [brainDir]);
+      await engine.putPage(slug, { type: 'person', title: 'Fence Failure', compiled_truth: original });
+      mkdirSync(dirname(filePath), { recursive: true });
+      writeFileSync(filePath, original);
+      chatStub([{
+        // A literal newline is valid extractor output today but invalid in a
+        // Markdown table cell. It makes the tmp fence fail parse-validation.
+        fact: 'Fence Failure confirmed\nthe sourced correction',
+        kind: 'event', notability: 'high', entity: slug,
+      }]);
+
+      await expect(runFactsBackstop(meetingPage(), makeCtx({
+        mode: 'inline', source: 'source-event', sourceSlug: 'raw/gmail/fence-failure',
+        pendingRunId: 'source-event-fence-failure-run',
+        entityHints: [slug], allowedEntitySlugs: [slug], visibility: 'private',
+      }))).rejects.toThrow(`canonical fence write failed for ${slug}`);
+
+      expect(readFileSync(filePath, 'utf8')).toBe(original);
+      expect(existsSync(`${filePath}.tmp`)).toBe(true);
+      expect((await engine.executeRaw('SELECT 1 FROM facts WHERE entity_slug=$1', [slug]))).toHaveLength(0);
+    } finally {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (engine as any).db.query(`UPDATE sources SET local_path = NULL WHERE id = 'default'`);
+      rmSync(brainDir, { recursive: true, force: true });
+    }
+  });
+
   test('aborted before LLM call → zero counts, no throw', async () => {
     chatStub([]);
     const ac = new AbortController();
