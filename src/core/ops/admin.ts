@@ -11,6 +11,8 @@
 import type { Operation } from './contract.ts';
 import { enforceClientSlugFence, sourceScopeOpts } from './context.ts';
 import { stripTakesFence } from '../takes-fence.ts';
+import { stripFactsFence } from '../facts-fence.ts';
+import { stripPrivateSourceEventUpdates } from '../source-events/private-compiled-block.ts';
 import { slugHiddenFromCaller } from '../search/private-visibility.ts';
 import { VERSION } from '../../version.ts';
 
@@ -154,8 +156,13 @@ const get_versions: Operation = {
     // historical compiled_truth verbatim, including the takes fence, so
     // a remote token bypassing get_page via /history would re-introduce
     // the same leak across every prior version.
-    if (!ctx.takesHoldersAllowList) return versions;
-    return versions.map(v => ({ ...v, compiled_truth: stripTakesFence(v.compiled_truth) }));
+    if (ctx.remote === false) return versions;
+    return versions.map(v => ({
+      ...v,
+      compiled_truth: stripPrivateSourceEventUpdates(
+        stripFactsFence(stripTakesFence(v.compiled_truth), { keepVisibility: ['world'] }),
+      ),
+    }));
   },
   scope: 'read',
   cliHints: { name: 'history', positional: ['slug'] },

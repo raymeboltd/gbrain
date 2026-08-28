@@ -111,6 +111,7 @@ import { loopsOperations } from './ops/loops.ts';
 import { chronicleOperations } from './ops/chronicle.ts';
 import { extractionOperations } from './ops/extraction.ts';
 import { entityIdentityOperations } from './ops/entity-identity.ts';
+import { sourceEventOperations } from './ops/source-events.ts';
 import { requestToolsOperations } from './ops/request-tools.ts';
 
 // parseTtlParam moved to ops/facts.ts with the facts cluster; the `remember`
@@ -190,6 +191,9 @@ export const operations: Operation[] = [
   // #4224: cross-source entity identity groups (v1 manual-only) —
   // ops/entity-identity.ts
   ...entityIdentityOperations,
+  // Vault OS recovery: trusted-local review/apply surface over private
+  // source-event artifacts. Remote transports never receive candidate text.
+  ...sourceEventOperations,
   // v0.31: hot memory (extract_facts, recall, context_pack, delta,
   // forget_fact) — ops/facts.ts
   ...factsOperations,

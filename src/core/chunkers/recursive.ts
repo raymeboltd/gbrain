@@ -84,6 +84,7 @@ import { stripTakesFence } from '../takes-fence.ts';
 // that re-import the chunk content can still parse it; only the private
 // rows go.
 import { stripFactsFence } from '../facts-fence.ts';
+import { stripPrivateSourceEventUpdates } from '../source-events/private-compiled-block.ts';
 
 export function chunkText(text: string, opts?: ChunkOptions): TextChunk[] {
   const chunkSize = opts?.chunkSize || 300;
@@ -106,7 +107,9 @@ export function chunkText(text: string, opts?: ChunkOptions): TextChunk[] {
   // v0.32.2: also strip private facts (Codex R2-#1). World facts stay so
   // search retains its public-knowledge surface; private rows are filtered
   // out at the fence-row level via stripFactsFence({keepVisibility:['world']}).
-  const stripped = stripFactsFence(stripTakesFence(text), { keepVisibility: ['world'] });
+  const stripped = stripPrivateSourceEventUpdates(
+    stripFactsFence(stripTakesFence(text), { keepVisibility: ['world'] }),
+  );
   if (!stripped || stripped.trim().length === 0) return [];
 
   const wordCount = countWords(stripped);

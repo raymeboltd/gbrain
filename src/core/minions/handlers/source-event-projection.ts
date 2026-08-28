@@ -35,6 +35,7 @@ interface CandidateRow {
   projection_hash: string;
   updated_at: Date | string;
   effective_date: Date | string | null;
+  effective_date_source: string | null;
   frontmatter: Record<string, unknown> | string;
 }
 
@@ -89,7 +90,7 @@ async function listCandidates(engine: BrainEngine, sourceId: string, limit: numb
     `SELECT p.slug, p.type, COALESCE(p.compiled_truth, '') AS compiled_truth,
             COALESCE(p.timeline, '') AS timeline,
             md5(COALESCE(p.compiled_truth, '') || E'\n' || COALESCE(p.timeline, '')) AS projection_hash,
-            p.updated_at, p.effective_date, p.frontmatter
+            p.updated_at, p.effective_date, p.effective_date_source, p.frontmatter
        FROM pages p
       WHERE p.source_id=$1
         AND p.deleted_at IS NULL
@@ -275,11 +276,18 @@ function sourceIdentity(row: CandidateRow): { sourceKey: string; sourceUri: stri
   };
 }
 
-function timestamp(row: CandidateRow): string {
+function timestamp(row: CandidateRow): { occurredAt: string; attested: boolean } {
   const raw = row.effective_date ?? row.updated_at;
   const value = raw instanceof Date ? raw : new Date(raw);
   if (Number.isNaN(value.getTime())) throw new Error(`source-event-projection: invalid timestamp for ${row.slug}`);
-  return value.toISOString();
+  return {
+    occurredAt: value.toISOString(),
+    // Filename dates are useful ordering hints, not provider/source
+    // attestations. Only an explicit dated frontmatter source can authorize
+    // compiled-truth or task application.
+    attested: row.effective_date !== null
+      && ['event_date', 'date', 'published'].includes(row.effective_date_source ?? ''),
+  };
 }
 
 export function makeSourceEventProjectionHandler(engine: BrainEngine) {
@@ -372,6 +380,7 @@ export function makeSourceEventProjectionHandler(engine: BrainEngine) {
           continue;
         }
         try {
+          const sourceTime = timestamp(row);
           const receipt = await projectSourceEvent(engine, {
             sourceId,
             sourceKind: row.type,
@@ -380,9 +389,10 @@ export function makeSourceEventProjectionHandler(engine: BrainEngine) {
             sourceSlug: row.slug,
             contentHash: row.projection_hash,
             processorVersion: SOURCE_EVENT_PROCESSOR_VERSION,
-            occurredAt: timestamp(row),
+            occurredAt: sourceTime.occurredAt,
+            occurredAtAttested: sourceTime.attested,
             content,
-          });
+          }, { sourceLockHeld: true });
           if (receipt.status === 'applied') applied++;
           else if (receipt.status === 'partial') partial++;
           else if (receipt.status === 'review') reviews++;

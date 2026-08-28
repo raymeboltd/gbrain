@@ -7,10 +7,20 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { importFromContent } from '../src/core/import-file.ts';
 import { runExtractCore } from '../src/commands/extract.ts';
 import { runExtractFacts } from '../src/core/cycle/extract-facts.ts';
+import { chunkText } from '../src/core/chunkers/recursive.ts';
 import { writePageThrough, _resetWriteThroughCacheForTest } from '../src/core/write-through.ts';
 import { operationsByName } from '../src/core/operations.ts';
 import { writeSingleFact } from '../src/core/facts/write-single.ts';
 import { loadSourceEventArtifact } from '../src/core/source-events/artifact.ts';
+import {
+  listCompiledTruthCandidates,
+  listSourceEventTaskCandidates,
+  recordSourceEventTaskApplication,
+  replaceCompiledTruthBlock,
+  reviewCompiledTruthCandidate,
+} from '../src/core/source-events/compiled-projection.ts';
+import { stripPrivateSourceEventUpdates } from '../src/core/source-events/private-compiled-block.ts';
+import { contentHash } from '../src/core/utils.ts';
 import type { OperationContext } from '../src/core/operations.ts';
 import {
   projectSourceEvent,
@@ -97,6 +107,11 @@ async function seedKnownTargets(): Promise<void> {
 }
 
 describe('source-event projector', () => {
+  test('malformed private compiled-truth markers fail closed', () => {
+    const malformed = 'Human prose\n<!-- gbrain:source-event-updates:begin -->\nprivate update';
+    expect(() => replaceCompiledTruthBlock(malformed, [])).toThrow(/malformed owned block/);
+    expect(stripPrivateSourceEventUpdates(malformed)).toBe('');
+  });
   test('direct calls enforce feature and approved-source policy before projection', async () => {
     await seedKnownTargets();
     await engine.setConfig('source_events.enabled', 'false');
@@ -112,7 +127,7 @@ describe('source-event projector', () => {
     const a = sourceEventKey(input());
     const b = sourceEventKey(input());
     const otherSource = sourceEventKey(input({ sourceId: 'other' }));
-    const otherVersion = sourceEventKey(input({ processorVersion: 'source-event-v4' }));
+    const otherVersion = sourceEventKey(input({ processorVersion: 'source-event-v5' }));
     const otherItem = sourceEventKey(input({ sourceKey: 'msg-456' }));
     const otherUri = sourceEventKey(input({ sourceUri: 'gmail://message/msg-else' }));
     const otherSlug = sourceEventKey(input({ sourceSlug: 'raw/gmail/msg-else' }));
@@ -756,7 +771,7 @@ describe('source-event projector', () => {
       return { inserted: 1, duplicate: 0, superseded: 0, factIds: [written.id], stage: 'applied' as const };
     };
     const first = await projectSourceEvent(engine, input(), { runFacts });
-    const second = await projectSourceEvent(engine, input({ processorVersion: 'source-event-v4' }), { runFacts });
+    const second = await projectSourceEvent(engine, input({ processorVersion: 'source-event-v5' }), { runFacts });
     expect(calls).toBe(1);
     expect(second.eventId).toBe(first.eventId);
     expect(second.revisionId).toBe(first.revisionId);
@@ -764,7 +779,7 @@ describe('source-event projector', () => {
     expect(await engine.executeRaw('SELECT 1 FROM facts WHERE expired_at IS NULL')).toHaveLength(1);
     const artifact = fs.readFileSync(path.join(brainDir, `${first.artifactSlug}.md`), 'utf8');
     expect(artifact.match(/"revision_id":/g)?.length).toBe(1);
-    expect(artifact).toContain('"processor_version": "source-event-v4"');
+    expect(artifact).toContain('"processor_version": "source-event-v5"');
   });
 
   test('private artifact is visible locally but cannot leak through remote page or backlink reads', async () => {
@@ -784,7 +799,7 @@ describe('source-event projector', () => {
   test('facts use the upstream canonical writer and produce review-only task/project candidates', async () => {
     await seedKnownTargets();
     await engine.executeRaw("UPDATE sources SET local_path=$1 WHERE id='default'", [brainDir]);
-    const receipt = await projectSourceEvent(engine, input(), {
+    const receipt = await projectSourceEvent(engine, input({ occurredAtAttested: true }), {
       runFacts: async (factsEngine, sourceInput, _targets, run) => {
         const commitment = await writeSingleFact(factsEngine, sourceInput.sourceId, {
           fact: 'Send the insurance documents tomorrow',
@@ -816,6 +831,314 @@ describe('source-event projector', () => {
     expect(project).toContain('gbrain:facts:begin');
     expect(project).toContain('Send the insurance documents tomorrow');
     expect(fs.existsSync(path.join(brainDir, 'ops', 'tasks.md'))).toBe(false);
+    const [taskCandidate] = await listSourceEventTaskCandidates(engine, { sourceId: 'default' });
+    expect(taskCandidate).toMatchObject({
+      event_id: receipt.eventId,
+      revision_id: receipt.revisionId,
+      entity_slug: 'projects/porsche',
+      due: null,
+      review_state: 'pending',
+    });
+    const localOps = { engine, remote: false, dryRun: true, sourceId: 'default' } as unknown as OperationContext;
+    const listedTasks = await operationsByName.source_event_task_candidates!.handler(localOps, {
+      source_id: 'default', limit: 10,
+    }) as Array<{ candidate_id: string }>;
+    expect(listedTasks.map((row) => row.candidate_id)).toContain(taskCandidate!.candidate_id);
+    expect(await operationsByName.record_source_event_task_application!.handler(localOps, {
+      source_id: 'default', event_id: receipt.eventId, revision_id: receipt.revisionId,
+      candidate_id: taskCandidate!.candidate_id,
+    })).toEqual({ status: 'planned', candidate_id: taskCandidate!.candidate_id });
+    const application = {
+      receipt_id: `source-event-task-create:${taskCandidate!.candidate_id}`,
+      task_id: 'task-send-insurance-documents',
+      task_path: 'ops/tasks/2026/task-send-insurance-documents.md',
+      task_hash: 'a'.repeat(64),
+      operation: 'create',
+    };
+    await expect(recordSourceEventTaskApplication(engine, {
+      sourceId: 'default', eventId: receipt.eventId, revisionId: receipt.revisionId,
+      candidateId: taskCandidate!.candidate_id, reviewer: 'test:robin', application,
+    })).rejects.toThrow(/kernel receipt is unavailable/);
+    expect(await recordSourceEventTaskApplication(engine, {
+      sourceId: 'default', eventId: receipt.eventId, revisionId: receipt.revisionId,
+      candidateId: taskCandidate!.candidate_id, reviewer: 'test:robin', application,
+    }, { verifyApplication: async () => {} })).toEqual({ status: 'recorded', candidate_id: taskCandidate!.candidate_id });
+    expect(await recordSourceEventTaskApplication(engine, {
+      sourceId: 'default', eventId: receipt.eventId, revisionId: receipt.revisionId,
+      candidateId: taskCandidate!.candidate_id, reviewer: 'test:robin', application,
+    }, { verifyApplication: async () => {} })).toEqual({ status: 'already_recorded', candidate_id: taskCandidate!.candidate_id });
+    expect(await listSourceEventTaskCandidates(engine, { sourceId: 'default' })).toHaveLength(0);
+
+    const correctedInput = input({
+      occurredAtAttested: true,
+      content: 'Victor Example confirmed the Porsche Project needs the corrected insurance documents.',
+    });
+    await engine.putPage('raw/gmail/msg-123', {
+      type: 'email', title: 'Car update correction', compiled_truth: correctedInput.content,
+    });
+    const correctedReceipt = await projectSourceEvent(engine, correctedInput, {
+      runFacts: async (factsEngine, sourceInput, _targets, run) => {
+        const corrected = await writeSingleFact(factsEngine, sourceInput.sourceId, {
+          fact: 'Send the corrected insurance documents',
+          provenance: `source-event:${sourceInput.sourceKey}`,
+          kind: 'commitment', entity: 'projects/porsche', visibility: 'private',
+          confidence: 0.95, pendingRunId: run.runId,
+        });
+        return { inserted: 1, duplicate: 0, superseded: 0, factIds: [corrected.id], stage: 'applied' };
+      },
+    });
+    const [correctedCandidate] = await listSourceEventTaskCandidates(engine, { sourceId: 'default' });
+    expect(correctedCandidate).toMatchObject({
+      review_state: 'pending', required_action: 'update', prior_application: application,
+    });
+    const correctedApplication = {
+      ...application,
+      receipt_id: `source-event-task-update:${correctedCandidate!.candidate_id}`,
+      task_hash: 'b'.repeat(64),
+      operation: 'update',
+    };
+    expect(await recordSourceEventTaskApplication(engine, {
+      sourceId: 'default', eventId: correctedReceipt.eventId, revisionId: correctedReceipt.revisionId,
+      candidateId: correctedCandidate!.candidate_id, reviewer: 'test:robin',
+      application: correctedApplication,
+    }, { verifyApplication: async () => {} })).toEqual({
+      status: 'recorded', candidate_id: correctedCandidate!.candidate_id,
+    });
+
+    const correctedAgainInput = input({
+      occurredAtAttested: true,
+      content: 'Victor Example confirmed the Porsche Project needs the final insurance document set.',
+    });
+    await engine.putPage('raw/gmail/msg-123', {
+      type: 'email', title: 'Car update final correction', compiled_truth: correctedAgainInput.content,
+    });
+    const correctedAgainReceipt = await projectSourceEvent(engine, correctedAgainInput, {
+      runFacts: async (factsEngine, sourceInput, _targets, run) => {
+        const correctedAgain = await writeSingleFact(factsEngine, sourceInput.sourceId, {
+          fact: 'Send the final insurance document set',
+          provenance: `source-event:${sourceInput.sourceKey}`,
+          kind: 'commitment', entity: 'projects/porsche', visibility: 'private',
+          confidence: 0.95, pendingRunId: run.runId,
+        });
+        return { inserted: 1, duplicate: 0, superseded: 0, factIds: [correctedAgain.id], stage: 'applied' };
+      },
+    });
+    const [correctedAgainCandidate] = await listSourceEventTaskCandidates(engine, { sourceId: 'default' });
+    expect(correctedAgainCandidate).toMatchObject({
+      review_state: 'pending', required_action: 'update',
+      prior_application: correctedApplication,
+    });
+    expect(correctedAgainCandidate!.correction_ambiguous).toBeUndefined();
+    const correctedAgainApplication = {
+      ...correctedApplication,
+      receipt_id: `source-event-task-update:${correctedAgainCandidate!.candidate_id}`,
+      task_hash: 'c'.repeat(64),
+    };
+    expect(await recordSourceEventTaskApplication(engine, {
+      sourceId: 'default', eventId: correctedAgainReceipt.eventId, revisionId: correctedAgainReceipt.revisionId,
+      candidateId: correctedAgainCandidate!.candidate_id, reviewer: 'test:robin',
+      application: correctedAgainApplication,
+    }, { verifyApplication: async () => {} })).toEqual({
+      status: 'recorded', candidate_id: correctedAgainCandidate!.candidate_id,
+    });
+    await retractSourceEvent(engine, {
+      sourceId: 'default', eventId: correctedAgainReceipt.eventId, artifactSlug: correctedAgainReceipt.artifactSlug,
+      reason: 'task source deleted',
+    });
+    const retirements = await listSourceEventTaskCandidates(engine, { sourceId: 'default' });
+    expect(retirements).toHaveLength(1);
+    const [retirement] = retirements;
+    expect(retirement).toMatchObject({
+      candidate_id: correctedAgainCandidate!.candidate_id,
+      review_state: 'retirement_pending',
+      required_action: 'retire',
+      prior_application: correctedAgainApplication,
+    });
+    const retirementApplication = {
+      ...correctedAgainApplication,
+      receipt_id: `source-event-task-retire:${correctedAgainCandidate!.candidate_id}`,
+      task_hash: 'd'.repeat(64),
+      operation: 'archive',
+    };
+    expect(await recordSourceEventTaskApplication(engine, {
+      sourceId: 'default', eventId: correctedAgainReceipt.eventId, revisionId: correctedAgainReceipt.revisionId,
+      candidateId: correctedAgainCandidate!.candidate_id, reviewer: 'test:robin',
+      application: retirementApplication, disposition: 'retired',
+    }, { verifyApplication: async () => {} })).toEqual({ status: 'recorded', candidate_id: correctedAgainCandidate!.candidate_id });
+    expect(await listSourceEventTaskCandidates(engine, { sourceId: 'default' })).toHaveLength(0);
+    expect(fs.existsSync(path.join(brainDir, 'ops', 'tasks.md'))).toBe(false);
+  });
+
+  test('approved compiled-truth candidates update only the owned block and replay idempotently', async () => {
+    await seedKnownTargets();
+    await engine.executeRaw("UPDATE sources SET local_path=$1 WHERE id='default'", [brainDir]);
+    const projectPath = path.join(brainDir, 'projects/porsche.md');
+    fs.appendFileSync(projectPath, '\nHuman-only note that must survive.\n');
+    await importFromContent(engine, 'projects/porsche', fs.readFileSync(projectPath, 'utf8'), {
+      noEmbed: true, sourceId: 'default', sourcePath: 'projects/porsche.md',
+    });
+    const receipt = await projectSourceEvent(engine, input({ occurredAtAttested: true }), {
+      runFacts: async (factsEngine, sourceInput, _targets, run) => {
+        const update = await writeSingleFact(factsEngine, sourceInput.sourceId, {
+          fact: 'The Porsche project delivery is confirmed for Friday',
+          provenance: `source-event:${sourceInput.sourceKey}`,
+          kind: 'event', entity: 'projects/porsche', visibility: 'private',
+          confidence: 0.95, pendingRunId: run.runId,
+        });
+        return { inserted: 1, duplicate: 0, superseded: 0, factIds: [update.id], stage: 'applied' };
+      },
+    });
+    const pending = await listCompiledTruthCandidates(engine, { sourceId: 'default' });
+    expect(pending).toHaveLength(1);
+    expect(pending[0]).toMatchObject({
+      event_id: receipt.eventId,
+      revision_id: receipt.revisionId,
+      target_slug: 'projects/porsche',
+      source_date: '2026-08-27',
+      source_date_attested: true,
+      review_state: 'pending',
+    });
+    const localOps = { engine, remote: false, dryRun: true, sourceId: 'default' } as unknown as OperationContext;
+    const listed = await operationsByName.source_event_compiled_candidates!.handler(localOps, {
+      source_id: 'default', limit: 10,
+    }) as Array<{ candidate_id: string }>;
+    expect(listed.map((row) => row.candidate_id)).toContain(pending[0]!.candidate_id);
+    expect(await operationsByName.review_source_event_compiled_candidate!.handler(localOps, {
+      source_id: 'default', event_id: receipt.eventId, revision_id: receipt.revisionId,
+      candidate_id: pending[0]!.candidate_id, decision: 'approve', reviewer: 'test:dry-run',
+    })).toEqual({ status: 'planned', candidate_id: pending[0]!.candidate_id, decision: 'approve' });
+    const expectedTargetHash = createHash('sha256').update(fs.readFileSync(projectPath)).digest('hex');
+    await expect(reviewCompiledTruthCandidate(engine, {
+      sourceId: 'default', eventId: receipt.eventId, revisionId: receipt.revisionId,
+      candidateId: pending[0]!.candidate_id, decision: 'approve', reviewer: 'test:robin',
+      expectedTargetHash: '0'.repeat(64),
+    })).rejects.toThrow(/target changed/);
+    expect(fs.readFileSync(projectPath, 'utf8')).not.toContain('## Sourced updates');
+    const first = await reviewCompiledTruthCandidate(engine, {
+      sourceId: 'default', eventId: receipt.eventId, revisionId: receipt.revisionId,
+      candidateId: pending[0]!.candidate_id, decision: 'approve', reviewer: 'test:robin',
+      expectedTargetHash,
+    });
+    expect(first.status).toBe('applied');
+    const afterFirst = fs.readFileSync(projectPath, 'utf8');
+    expect(afterFirst).toContain('Human-only note that must survive.');
+    expect(afterFirst).toContain('## Sourced updates');
+    expect(afterFirst).toContain('2026-08-27 - The Porsche project delivery is confirmed for Friday');
+    expect(afterFirst).toContain('gbrain:facts:begin');
+    const indexed = await engine.getPage('projects/porsche', { sourceId: 'default' });
+    expect(indexed).not.toBeNull();
+    expect(indexed!.content_hash).toBe(contentHash(indexed!));
+    const indexedChunks = await engine.executeRaw<{ chunk_text: string }>(
+      `SELECT c.chunk_text FROM content_chunks c
+        JOIN pages p ON p.id=c.page_id
+       WHERE p.source_id='default' AND p.slug='projects/porsche'
+       ORDER BY c.chunk_index`,
+    );
+    expect(indexedChunks.length).toBeGreaterThan(0);
+    expect(indexedChunks.map((row) => row.chunk_text).join('\n')).toContain('Human-only note');
+    expect(indexedChunks.map((row) => row.chunk_text).join('\n'))
+      .not.toContain('The Porsche project delivery is confirmed for Friday');
+    const remote = { engine, remote: true, sourceId: 'default' } as unknown as OperationContext;
+    const remotePage = await operationsByName.get_page!.handler(remote, { slug: 'projects/porsche' }) as { compiled_truth: string };
+    expect(remotePage.compiled_truth).not.toContain('The Porsche project delivery is confirmed for Friday');
+    expect(remotePage.compiled_truth).not.toContain('## Sourced updates');
+    expect(chunkText(afterFirst).map((chunk) => chunk.text).join('\n')).not.toContain('The Porsche project delivery is confirmed for Friday');
+    const replay = await reviewCompiledTruthCandidate(engine, {
+      sourceId: 'default', eventId: receipt.eventId, revisionId: receipt.revisionId,
+      candidateId: pending[0]!.candidate_id, decision: 'approve', reviewer: 'test:robin',
+      expectedTargetHash: createHash('sha256').update(fs.readFileSync(projectPath)).digest('hex'),
+    });
+    expect(replay.status).toBe('already_applied');
+    expect(fs.readFileSync(projectPath, 'utf8')).toBe(afterFirst);
+  });
+
+  test('compiled-truth approval rejects unattested dates and stale target reads', async () => {
+    await seedKnownTargets();
+    await engine.executeRaw("UPDATE sources SET local_path=$1 WHERE id='default'", [brainDir]);
+    await projectSourceEvent(engine, input({ occurredAtAttested: false }), {
+      runFacts: async (factsEngine, sourceInput, _targets, run) => {
+        const update = await writeSingleFact(factsEngine, sourceInput.sourceId, {
+          fact: 'The Porsche project status changed', provenance: `source-event:${sourceInput.sourceKey}`,
+          kind: 'event', entity: 'projects/porsche', visibility: 'private', pendingRunId: run.runId,
+        });
+        return { inserted: 1, duplicate: 0, superseded: 0, factIds: [update.id], stage: 'applied' };
+      },
+    });
+    const [candidate] = await listCompiledTruthCandidates(engine, { sourceId: 'default' });
+    expect(candidate!.source_date_attested).toBe(false);
+    await expect(reviewCompiledTruthCandidate(engine, {
+      sourceId: 'default', eventId: candidate!.event_id, revisionId: candidate!.revision_id,
+      candidateId: candidate!.candidate_id, decision: 'approve', reviewer: 'test:robin',
+      expectedTargetHash: '0'.repeat(64),
+    })).rejects.toThrow(/attested source date/);
+    expect(await reviewCompiledTruthCandidate(engine, {
+      sourceId: 'default', eventId: candidate!.event_id, revisionId: candidate!.revision_id,
+      candidateId: candidate!.candidate_id, decision: 'reject', reviewer: 'test:robin',
+    })).toMatchObject({ status: 'rejected' });
+    expect(await listCompiledTruthCandidates(engine, { sourceId: 'default' })).toHaveLength(0);
+  });
+
+  test('correction and retraction remove only approved owned truth', async () => {
+    await seedKnownTargets();
+    await engine.executeRaw("UPDATE sources SET local_path=$1 WHERE id='default'", [brainDir]);
+    const facts = (statement: string): NonNullable<SourceEventProjectorDeps['runFacts']> =>
+      async (factsEngine, sourceInput, _targets, run) => {
+        const written = await writeSingleFact(factsEngine, sourceInput.sourceId, {
+          fact: statement, provenance: `source-event:${sourceInput.sourceKey}`,
+          kind: 'event', entity: 'projects/porsche', visibility: 'private', pendingRunId: run.runId,
+        });
+        return { inserted: 1, duplicate: 0, superseded: 0, factIds: [written.id], stage: 'applied' };
+      };
+    const first = await projectSourceEvent(engine, input({ occurredAtAttested: true }), {
+      runFacts: facts('Delivery is confirmed for Friday'),
+    });
+    const [candidate] = await listCompiledTruthCandidates(engine, { sourceId: 'default' });
+    const projectPath = path.join(brainDir, 'projects/porsche.md');
+    await reviewCompiledTruthCandidate(engine, {
+      sourceId: 'default', eventId: first.eventId, revisionId: first.revisionId,
+      candidateId: candidate!.candidate_id, decision: 'approve', reviewer: 'test:robin',
+      expectedTargetHash: createHash('sha256').update(fs.readFileSync(projectPath)).digest('hex'),
+    });
+    expect(fs.readFileSync(projectPath, 'utf8')).toContain('Delivery is confirmed for Friday');
+
+    const corrected = 'Victor Example corrected the Porsche Project delivery date.';
+    await engine.putPage('raw/gmail/msg-123', {
+      type: 'email', title: 'Corrected car update', compiled_truth: corrected,
+    });
+    const second = await projectSourceEvent(engine, input({
+      content: corrected, occurredAt: '2026-08-28T09:00:00.000Z', occurredAtAttested: true,
+    }), { runFacts: facts('Delivery is now confirmed for Monday') });
+    const afterCorrection = fs.readFileSync(projectPath, 'utf8');
+    expect(afterCorrection).not.toContain('## Sourced updates');
+    expect(afterCorrection).not.toContain('gbrain:source-event-candidate:');
+    expect(afterCorrection).toContain('Known project.');
+    expect(afterCorrection).toContain('gbrain:facts:begin');
+
+    const [replacement] = await listCompiledTruthCandidates(engine, { sourceId: 'default' });
+    await reviewCompiledTruthCandidate(engine, {
+      sourceId: 'default', eventId: second.eventId, revisionId: second.revisionId,
+      candidateId: replacement!.candidate_id, decision: 'approve', reviewer: 'test:robin',
+      expectedTargetHash: createHash('sha256').update(fs.readFileSync(projectPath)).digest('hex'),
+    });
+    expect(fs.readFileSync(projectPath, 'utf8')).toContain('Delivery is now confirmed for Monday');
+    await retractSourceEvent(engine, {
+      sourceId: 'default', eventId: second.eventId, artifactSlug: second.artifactSlug,
+      reason: 'source deleted',
+    });
+    const afterRetraction = fs.readFileSync(projectPath, 'utf8');
+    expect(afterRetraction).not.toContain('## Sourced updates');
+    expect(afterRetraction).toContain('Known project.');
+    expect(afterRetraction).toContain('gbrain:facts:begin');
+  });
+
+  test('compiled-truth candidate and review operations are denied remotely', async () => {
+    const remote = { engine, remote: true, sourceId: 'default' } as unknown as OperationContext;
+    await expect(operationsByName.source_event_compiled_candidates!.handler(remote, { source_id: 'default' }))
+      .rejects.toMatchObject({ code: 'permission_denied' });
+    await expect(operationsByName.review_source_event_compiled_candidate!.handler(remote, {
+      source_id: 'default', event_id: 'e', revision_id: 'r', candidate_id: 'c',
+      decision: 'approve', reviewer: 'remote', expected_target_hash: '0'.repeat(64),
+    })).rejects.toMatchObject({ code: 'permission_denied' });
   });
 
   test('fact postconditions reject and retract non-private projector output', async () => {

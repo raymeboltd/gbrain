@@ -14,12 +14,15 @@ export interface SourceEventRevisionRecord {
   processor_version: string;
   content_hash: string;
   occurred_at: string;
+  occurred_at_attested?: boolean;
   state: SourceEventRevisionState;
   targets: string[];
   fact_ids: number[];
   facts_stage: 'applied' | 'disabled' | 'unavailable' | 'skipped' | 'error';
   action_candidates: Array<Record<string, unknown>>;
   project_candidates: Array<Record<string, unknown>>;
+  /** Review-first dated updates for developed entity/project truth. */
+  compiled_truth_candidates: Array<Record<string, unknown>>;
   changed_at: string;
   reason?: string;
 }
@@ -111,6 +114,15 @@ export function parseSourceEventArtifact(body: string): SourceEventArtifact | nu
     if (parsed.version !== ARTIFACT_VERSION || !parsed.event_id || !Array.isArray(parsed.revisions)) return null;
     const revisionIds = parsed.revisions.map((revision) => revision.revision_id);
     if (new Set(revisionIds).size !== revisionIds.length) return null;
+    // Artifact v2 predates compiled-truth candidates. Keep old receipts
+    // readable and let the projector populate the new review surface on the
+    // next content/processor revision.
+    for (const revision of parsed.revisions) {
+      revision.action_candidates ??= [];
+      revision.project_candidates ??= [];
+      revision.compiled_truth_candidates ??= [];
+      revision.occurred_at_attested ??= false;
+    }
     return parsed;
   } catch {
     return null;

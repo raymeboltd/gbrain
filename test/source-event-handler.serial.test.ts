@@ -19,6 +19,7 @@ import {
 } from '../src/core/source-events/projector.ts';
 import { writeSingleFact } from '../src/core/facts/write-single.ts';
 import { runExtractFacts } from '../src/core/cycle/extract-facts.ts';
+import { parseSourceEventArtifact } from '../src/core/source-events/artifact.ts';
 
 let engine: PGLiteEngine;
 let tmpRoot: string;
@@ -94,6 +95,48 @@ describe('source-event projection handler', () => {
     const handler = makeSourceEventProjectionHandler(engine);
     await expect(handler(fakeJob({}))).rejects.toThrow(/sourceId is required/);
     await expect(handler(fakeJob({ sourceId: 'missing' }))).rejects.toThrow(/registered source/);
+  });
+
+  test('filename-derived effective dates remain unattested for downstream review', async () => {
+    await seedCanonicalTarget('people/victor-example', 'person', 'Victor Example');
+    await engine.putPage('raw/gmail/2026-08-27-filename-only', {
+      type: 'email', title: 'Filename-only date',
+      compiled_truth: 'Victor Example confirmed a sufficiently detailed delivery update in this email.',
+      effective_date: new Date('2026-08-27T00:00:00.000Z'),
+      effective_date_source: 'filename',
+      frontmatter: { provider: 'gmail', provider_item_id: 'filename-only' },
+    });
+    await makeSourceEventProjectionHandler(engine)(fakeJob({ sourceId: 'default' }));
+    const rows = await engine.executeRaw<{ compiled_truth: string }>(
+      `SELECT compiled_truth FROM pages
+        WHERE source_id='default' AND COALESCE(frontmatter->>'source_event_artifact','')='true'`,
+    );
+    expect(rows).toHaveLength(1);
+    const artifact = parseSourceEventArtifact(rows[0]!.compiled_truth);
+    const active = artifact?.revisions.find((revision) => revision.state === 'active');
+    expect(active?.occurred_at).toBe('2026-08-27T00:00:00.000Z');
+    expect(active?.occurred_at_attested).toBe(false);
+  });
+
+  test('source-attested effective dates remain eligible for downstream review', async () => {
+    await seedCanonicalTarget('people/victor-example', 'person', 'Victor Example');
+    await engine.putPage('raw/gmail/attested-date', {
+      type: 'email', title: 'Attested date',
+      compiled_truth: 'Victor Example confirmed a sufficiently detailed delivery update in this email.',
+      effective_date: new Date('2026-08-27T00:00:00.000Z'),
+      effective_date_source: 'date',
+      frontmatter: { provider: 'gmail', provider_item_id: 'attested-date' },
+    });
+    await makeSourceEventProjectionHandler(engine)(fakeJob({ sourceId: 'default' }));
+    const rows = await engine.executeRaw<{ compiled_truth: string }>(
+      `SELECT compiled_truth FROM pages
+        WHERE source_id='default' AND COALESCE(frontmatter->>'source_event_artifact','')='true'`,
+    );
+    expect(rows).toHaveLength(1);
+    const artifact = parseSourceEventArtifact(rows[0]!.compiled_truth);
+    const active = artifact?.revisions.find((revision) => revision.state === 'active');
+    expect(active?.occurred_at).toBe('2026-08-27T00:00:00.000Z');
+    expect(active?.occurred_at_attested).toBe(true);
   });
 
   test('rejects pages without immutable producer identity before receipt claim', async () => {
@@ -589,6 +632,10 @@ describe('source-event projection handler', () => {
     let factId = 0;
     let retractionResult: { retracted: number } | null = null;
     await expect(projectSourceEvent(engine, projectionInput, {
+      // Simulate the worker's inner projector call; the handler owns the
+      // source lock in production and this fixture invokes a second handler
+      // from the injected crash seam.
+      sourceLockHeld: true,
       runFacts: async (factsEngine, sourceInput, _targets, run) => {
         const written = await writeSingleFact(factsEngine, sourceInput.sourceId, {
           fact: 'Victor Example confirmed the staged delivery update',

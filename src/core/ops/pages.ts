@@ -20,6 +20,7 @@ import { isFactsBackstopEligible } from '../facts/eligibility.ts';
 import { stripTakesFence } from '../takes-fence.ts';
 import type { WriterLintPayload } from '../output/post-write.ts';
 import { stripFactsFence } from '../facts-fence.ts';
+import { stripPrivateSourceEventUpdates } from '../source-events/private-compiled-block.ts';
 import { getContentFlag } from '../quarantine.ts';
 import { bumpLastRetrievedAt } from '../last-retrieved.ts';
 import { resolveExcludePrivatePages, isPrivatePage, findPrivateOnlySlugs } from '../search/private-visibility.ts';
@@ -98,9 +99,8 @@ async function dropPrivateSlugs(
 function stripPrivacyFencesForRemoteReader(page: Page): Page {
   return {
     ...page,
-    compiled_truth: stripFactsFence(
-      stripTakesFence(page.compiled_truth),
-      { keepVisibility: ['world'] },
+    compiled_truth: stripPrivateSourceEventUpdates(
+      stripFactsFence(stripTakesFence(page.compiled_truth), { keepVisibility: ['world'] }),
     ),
     timeline: stripFactsFence(
       stripTakesFence(page.timeline ?? ''),

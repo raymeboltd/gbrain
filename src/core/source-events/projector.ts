@@ -12,6 +12,8 @@ import {
 } from './artifact.ts';
 import { assertSourceEventAdmission, readSourceEventPolicy } from './policy.ts';
 import { prepareSourceEventFactFence } from './fact-commit.ts';
+import { candidateIdentity, reconcileCompiledTruthForTargets } from './compiled-projection.ts';
+import { tryAcquireDbLock } from '../db-lock.ts';
 
 export interface SourceEventProjectionInput {
   sourceId: string;
@@ -22,6 +24,8 @@ export interface SourceEventProjectionInput {
   contentHash: string;
   processorVersion: string;
   occurredAt: string;
+  /** True only when occurredAt came from provider/source metadata, never ingest updated_at. */
+  occurredAtAttested?: boolean;
   content: string;
 }
 
@@ -62,9 +66,11 @@ export interface SourceEventProjectorDeps {
   finalizeReceipt?: typeof finalizeReceipt;
   afterCanonicalArtifactWrite?: () => void | Promise<void>;
   afterFactDbSwap?: () => void | Promise<void>;
+  /** Worker handler already owns the source-wide projector lock. */
+  sourceLockHeld?: boolean;
 }
 
-export const SOURCE_EVENT_PROCESSOR_VERSION = 'source-event-v3';
+export const SOURCE_EVENT_PROCESSOR_VERSION = 'source-event-v4';
 export const MAX_SOURCE_EVENT_CONTENT_BYTES = 256 * 1024;
 export const MAX_SOURCE_EVENT_TARGETS = 25;
 
@@ -219,26 +225,57 @@ async function defaultFactsRunner(
   };
 }
 
-async function buildReviewCandidates(engine: BrainEngine, sourceId: string, factIds: number[]) {
-  if (factIds.length === 0) return { actions: [] as Array<Record<string, unknown>>, projects: [] as Array<Record<string, unknown>> };
+async function buildReviewCandidates(
+  engine: BrainEngine,
+  input: SourceEventProjectionInput,
+  eventId: string,
+  revisionId: string,
+  artifactSlug: string,
+  factIds: number[],
+) {
+  if (factIds.length === 0) return {
+    actions: [] as Array<Record<string, unknown>>,
+    projects: [] as Array<Record<string, unknown>>,
+    compiledTruth: [] as Array<Record<string, unknown>>,
+  };
   const rows = await engine.executeRaw<{
     id: number; fact: string; kind: string; entity_slug: string | null;
-    valid_from: Date | string | null; page_type: string | null;
+    valid_from: Date | string | null; page_type: string | null; confidence: number | null;
   }>(
-    `SELECT f.id,f.fact,f.kind,f.entity_slug,f.valid_from,p.type AS page_type
+    `SELECT f.id,f.fact,f.kind,f.entity_slug,f.valid_from,f.confidence,p.type AS page_type
        FROM facts f LEFT JOIN pages p ON p.source_id=f.source_id AND p.slug=f.entity_slug AND p.deleted_at IS NULL
       WHERE f.source_id=$1 AND f.id=ANY($2::bigint[])`,
-    [sourceId, factIds],
+    [input.sourceId, factIds],
   );
+  const envelope = (row: typeof rows[number], kind: string) => ({
+    candidate_id: candidateIdentity({
+      eventId, revisionId, factId: Number(row.id), kind, targetSlug: row.entity_slug ?? '',
+    }),
+    kind,
+    review_required: true,
+    review_state: 'pending',
+    fact_id: Number(row.id),
+    entity_slug: row.entity_slug,
+    entity_type: row.page_type,
+    text: row.fact,
+    confidence: row.confidence,
+    source_date: input.occurredAt.slice(0, 10),
+    source_date_attested: input.occurredAtAttested === true,
+    processor_version: input.processorVersion,
+    content_hash: input.contentHash,
+    evidence_artifact_slug: artifactSlug,
+  });
   return {
     actions: rows.filter((row) => row.kind === 'commitment').map((row) => ({
-      kind: 'task_candidate', review_required: true, fact_id: Number(row.id),
-      entity_slug: row.entity_slug, text: row.fact, due: row.valid_from,
+      ...envelope(row, 'task_candidate'),
+      // Fact valid_from is the evidence date, not a task deadline. Keep due
+      // unset until an extractor supplies a separately-attested deadline.
+      due: null,
     })),
-    projects: rows.filter((row) => ['project', 'deal', 'goal'].includes(row.page_type ?? '')).map((row) => ({
-      kind: 'project_update_candidate', review_required: true, fact_id: Number(row.id),
-      entity_slug: row.entity_slug, text: row.fact,
-    })),
+    projects: rows.filter((row) => ['project', 'deal', 'goal'].includes(row.page_type ?? ''))
+      .map((row) => envelope(row, 'project_update_candidate')),
+    compiledTruth: rows.filter((row) => Boolean(row.entity_slug && row.page_type))
+      .map((row) => envelope(row, 'compiled_truth_candidate')),
   };
 }
 
@@ -518,6 +555,27 @@ export async function projectSourceEvent(
   raw: SourceEventProjectionInput,
   deps: SourceEventProjectorDeps = {},
 ): Promise<SourceEventProjectionReceipt> {
+  if (deps.sourceLockHeld) return projectSourceEventUnderSourceLock(engine, raw, deps);
+  const sourceId = required(raw.sourceId, 'sourceId');
+  const lockId = `gbrain-source-event-projection:${sourceId}`;
+  let lock = await tryAcquireDbLock(engine, lockId, 20);
+  for (let attempt = 0; !lock && attempt < 200; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    lock = await tryAcquireDbLock(engine, lockId, 20);
+  }
+  if (!lock) throw new Error(`source-event: source projection lock unavailable for '${sourceId}'`);
+  try {
+    return await projectSourceEventUnderSourceLock(engine, raw, deps);
+  } finally {
+    await lock.release();
+  }
+}
+
+async function projectSourceEventUnderSourceLock(
+  engine: BrainEngine,
+  raw: SourceEventProjectionInput,
+  deps: SourceEventProjectorDeps = {},
+): Promise<SourceEventProjectionReceipt> {
   const sourceId = required(raw.sourceId, 'sourceId');
   const sourceKind = required(raw.sourceKind, 'sourceKind');
   const sourceKey = required(raw.sourceKey, 'sourceKey');
@@ -667,11 +725,15 @@ export async function projectSourceEvent(
         facts: (priorActive?.fact_ids.length ?? 0) > 0 ? 'applied' : factsStage,
         project_candidate: priorActive?.project_candidates.some((candidate) => candidate.entity_slug === slug) ? 'review' : 'none',
       }));
-      return (deps.finalizeReceipt ?? finalizeReceipt)(engine, sourceId, eventKey, {
+      const receipt = await (deps.finalizeReceipt ?? finalizeReceipt)(engine, sourceId, eventKey, {
         status: (priorActive?.targets.length ?? 0) === 0 ? 'skipped' : factsStage === 'applied' ? 'applied' : 'partial',
         targetResults, candidates: priorActive?.targets.length ?? 0, resolved: priorActive?.targets.length ?? 0,
         links: persisted.linksWritten, facts: 0, skipped: (priorActive?.targets.length ?? 0) === 0 ? 1 : 0, errors,
       });
+      await reconcileCompiledTruthForTargets(
+        engine, sourceId, artifact.revisions.flatMap((revision) => revision.targets),
+      );
+      return receipt;
     }
 
     if (processorOnlyUpgrade && priorActive) {
@@ -688,7 +750,7 @@ export async function projectSourceEvent(
       const errors: Array<{ code: string; detail?: string }> = [];
       if (targets.length === 0) errors.push({ code: 'no_known_entity_mentions' });
       if (priorActive.facts_stage !== 'applied' && targets.length > 0) errors.push({ code: `facts_${priorActive.facts_stage}` });
-      return (deps.finalizeReceipt ?? finalizeReceipt)(engine, sourceId, eventKey, {
+      const receipt = await (deps.finalizeReceipt ?? finalizeReceipt)(engine, sourceId, eventKey, {
         status: targets.length === 0 ? 'skipped' : priorActive.facts_stage === 'applied' ? 'applied' : 'partial',
         targetResults: targets.map((slug) => ({
           slug, relationship: 'canonical_private_artifact',
@@ -698,6 +760,10 @@ export async function projectSourceEvent(
         candidates: mentions.length, resolved: mentions.length, links: persisted.linksWritten,
         facts: 0, skipped: targets.length === 0 ? 1 : 0, errors,
       });
+      await reconcileCompiledTruthForTargets(
+        engine, sourceId, artifact.revisions.flatMap((revision) => revision.targets),
+      );
+      return receipt;
     }
 
     let revision = artifact.revisions.find((candidate) => candidate.revision_id === revisionId);
@@ -716,12 +782,14 @@ export async function projectSourceEvent(
       processor_version: processorVersion,
       content_hash: contentHash,
       occurred_at: occurredAt,
+      occurred_at_attested: normalized.occurredAtAttested === true,
       state: 'pending',
       targets,
       fact_ids: [],
       facts_stage: 'skipped',
       action_candidates: [],
       project_candidates: [],
+      compiled_truth_candidates: [],
       changed_at: new Date().toISOString(),
     };
     if (!appendRevision) {
@@ -731,12 +799,14 @@ export async function projectSourceEvent(
       revision.projection_run_id = runId;
       revision.content_hash = contentHash;
       revision.occurred_at = occurredAt;
+      revision.occurred_at_attested = normalized.occurredAtAttested === true;
       revision.state = 'pending';
       revision.targets = targets;
       revision.fact_ids = [];
       revision.facts_stage = 'skipped';
       revision.action_candidates = [];
       revision.project_candidates = [];
+      revision.compiled_truth_candidates = [];
       revision.changed_at = new Date().toISOString();
       delete revision.reason;
     }
@@ -763,9 +833,12 @@ export async function projectSourceEvent(
       precommitFactIds = revision.fact_ids.filter((factId) => !protectedFactIds.has(factId));
       await assertCanonicalFactOutcome(engine, sourceId, targets, revision.fact_ids);
       revision.facts_stage = facts.stage;
-      const candidates = await buildReviewCandidates(engine, sourceId, revision.fact_ids);
+      const candidates = await buildReviewCandidates(
+        engine, normalized, eventId, revisionId, artifactSlug, revision.fact_ids,
+      );
       revision.action_candidates = candidates.actions;
       revision.project_candidates = candidates.projects;
+      revision.compiled_truth_candidates = candidates.compiledTruth;
     }
     await persistProjectionArtifact(artifact);
     await engine.executeRaw(
@@ -814,7 +887,7 @@ export async function projectSourceEvent(
       facts: revision.fact_ids.length > 0 ? 'applied' : revision.facts_stage,
       project_candidate: revision.project_candidates.some((candidate) => candidate.entity_slug === slug) ? 'review' : 'none',
     }));
-    return (deps.finalizeReceipt ?? finalizeReceipt)(engine, sourceId, eventKey, {
+    const receipt = await (deps.finalizeReceipt ?? finalizeReceipt)(engine, sourceId, eventKey, {
       status: targets.length === 0 ? 'skipped' : facts.stage === 'applied' ? 'applied' : 'partial',
       targetResults,
       candidates: mentions.length,
@@ -824,6 +897,13 @@ export async function projectSourceEvent(
       skipped: targets.length === 0 ? 1 : 0,
       errors,
     });
+    // A correction must immediately remove a previously-approved machine
+    // block. The new revision remains review-only; this reconciliation only
+    // retracts stale owned material and never approves replacement text.
+    await reconcileCompiledTruthForTargets(engine, sourceId, [
+      ...new Set([...(priorActive?.targets ?? []), ...targets]),
+    ]);
+    return receipt;
   } catch (error) {
     let detail = error instanceof Error ? error.message : String(error);
     const onDisk = await loadSourceEventArtifact(
@@ -855,12 +935,20 @@ export async function projectSourceEvent(
         detail += `; rollback failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`;
       }
     }
-    await engine.executeRaw(
-      `UPDATE source_event_receipts SET status='error',projection_state=$3,error_count=1,errors=$4::text::jsonb,
-       updated_at=now() WHERE source_id=$1 AND event_key=$2`,
-      [sourceId,eventKey,factDbCommitted ? 'committed' : artifactCommitted ? 'committing' : onDisk?.pending_revision_id === revisionId ? 'pending' : 'aborted',
-       JSON.stringify([{ code: 'projection_failed', detail }])],
-    ).catch(() => {});
+    try {
+      const updated = await engine.executeRaw<{ id: number }>(
+        `UPDATE source_event_receipts SET status='error',projection_state=$3,error_count=1,errors=$4::text::jsonb,
+         updated_at=now() WHERE source_id=$1 AND event_key=$2 RETURNING id`,
+        [sourceId,eventKey,factDbCommitted ? 'committed' : artifactCommitted ? 'committing' : onDisk?.pending_revision_id === revisionId ? 'pending' : 'aborted',
+         JSON.stringify([{ code: 'projection_failed', detail }])],
+      );
+      if (!updated[0]) throw new Error('receipt row disappeared');
+    } catch (receiptError) {
+      throw new Error(
+        `${detail}; terminal receipt update failed: ${receiptError instanceof Error ? receiptError.message : String(receiptError)}`,
+        { cause: error },
+      );
+    }
     throw error;
   }
 }
@@ -874,7 +962,46 @@ export async function retractSourceEvent(
   const artifact = await loadSourceEventArtifact(
     engine, input.sourceId, input.artifactSlug, { includeUncommitted: true },
   );
-  if (!artifact || artifact.event_id !== input.eventId) return;
+  if (!artifact || artifact.event_id !== input.eventId) {
+    // Canonical artifact loss is not permission to leave its facts or an
+    // already-approved compiled-truth block active. Receipts keep the run IDs
+    // and resolved targets needed for a fail-closed recovery retraction.
+    const receipts = await engine.executeRaw<{
+      run_id: string | null;
+      target_results: Array<{ slug?: string }> | string;
+    }>(
+      `SELECT run_id,target_results FROM source_event_receipts
+        WHERE source_id=$1 AND event_id=$2 ORDER BY observed_at,id`,
+      [input.sourceId, input.eventId],
+    );
+    if (receipts.length === 0) {
+      throw new Error(
+        `source-event: cannot retract '${input.eventId}': canonical artifact and receipts are both missing`,
+      );
+    }
+    const runIds = [...new Set(receipts.map((row) => row.run_id).filter((runId): runId is string => Boolean(runId)))];
+    const factIds: number[] = [];
+    for (const runId of runIds) {
+      factIds.push(...await factsForSession(engine, input.sourceId, `source-event:${runId}`));
+    }
+    await retractPriorFacts(
+      engine, input.sourceId, input.eventId, [...new Set(factIds)], input.reason,
+    );
+    const targets = receipts.flatMap((row) => {
+      const parsed = typeof row.target_results === 'string'
+        ? JSON.parse(row.target_results) as Array<{ slug?: string }>
+        : row.target_results;
+      return parsed.map((target) => target.slug).filter((slug): slug is string => Boolean(slug));
+    });
+    await reconcileCompiledTruthForTargets(engine, input.sourceId, targets);
+    await engine.executeRaw(
+      `UPDATE source_event_receipts SET status='skipped',projection_state='committed',
+       errors=$3::text::jsonb,error_count=0,updated_at=now()
+       WHERE source_id=$1 AND event_id=$2`,
+      [input.sourceId,input.eventId,JSON.stringify([{ code: 'source_retracted', detail: input.reason }])],
+    );
+    return;
+  }
   const retractable = artifact.revisions.filter(
     (revision) => revision.state === 'active' || revision.state === 'pending',
   );
@@ -916,6 +1043,9 @@ export async function retractSourceEvent(
   artifact.active_revision_id = null;
   artifact.pending_revision_id = null;
   await persistSourceEventArtifact(engine, { sourceId: input.sourceId, artifactSlug: input.artifactSlug, artifact });
+  await reconcileCompiledTruthForTargets(
+    engine, input.sourceId, artifact.revisions.flatMap((revision) => revision.targets),
+  );
   await engine.executeRaw(
     `UPDATE source_event_receipts SET status='skipped',errors=$3::text::jsonb,error_count=0,
      updated_at=now() WHERE source_id=$1 AND event_id=$2`,
