@@ -60,6 +60,11 @@
       "description": "Always-on ambient signal capture. Fires on every message to detect original thinking and entity mentions."
     },
     {
+      "name": "google-loops",
+      "path": "google-loops/SKILL.md",
+      "description": "Set up and operate the Gmail/Calendar/Contacts connector and the open-loop engine: who is waiting on the user, what they promised, and the context to respond."
+    },
+    {
       "name": "brain-ops",
       "path": "brain-ops/SKILL.md",
       "description": "Brain-first lookup, read-enrich-write loop, source attribution, ambient enrichment. The core read/write cycle."

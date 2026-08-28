@@ -64,6 +64,8 @@ export OPENAI_API_KEY=sk-...          # alternative embeddings; also powers auto
 export ANTHROPIC_API_KEY=sk-ant-...   # automatic fact extraction + chat models; also improves search via query expansion
 ```
 
+Reading a value back: `gbrain config get <key>` prints redacted by default — sensitive keys (any `key`/`secret`/`token`/`password`-segmented name) print `***`, and a `postgres://` / `postgresql://` value like `database_url` has its `user:password` userinfo replaced with `***` (host, port, database, and query string preserved) — because `get` output lands in agent transcripts and shell history. Scripts that need the real value pass `--raw` (accepted before or after the key). `config show` and the `Set <key> = ...` confirmation that `config set` prints redact the same way. `get` keeps stdout a bare value and reports which plane answered (file/env or DB) on stderr.
+
 Chat-shaped features (automatic fact extraction, enrichment, synthesis, query
 expansion) route to whichever supported chat key is present (Anthropic or
 OpenAI) — Anthropic when both are set, OpenAI when it is the only one; other

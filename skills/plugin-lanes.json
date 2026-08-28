@@ -102,6 +102,11 @@
     "gbrain-advisor": [
       "advisor"
     ],
+    "google-loops": [
+      "loops_close",
+      "loops_mute",
+      "open_loops"
+    ],
     "idea-ingest": [
       "add_link",
       "file_upload"

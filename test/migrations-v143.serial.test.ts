@@ -14,9 +14,9 @@ beforeAll(async () => {
 
 afterAll(async () => engine.disconnect());
 
-describe('migrations v143-v145 source-event receipts', () => {
-  test('v145 is current and fresh schema exposes the full two-phase contract', async () => {
-    expect(LATEST_VERSION).toBe(145);
+describe('migrations v145-v148 source-event receipts and skew repair', () => {
+  test('v148 is current and fresh schema exposes the full two-phase contract', async () => {
+    expect(LATEST_VERSION).toBe(148);
     const columns = await engine.executeRaw<{ column_name: string }>(
       `SELECT column_name FROM information_schema.columns
         WHERE table_name='source_event_receipts' ORDER BY column_name`,
@@ -82,7 +82,7 @@ describe('migrations v143-v145 source-event receipts', () => {
        VALUES ('default','legacy-key','email','legacy://1','raw/legacy/1','hash',now(),'2026-01-01','partial')`,
     );
     await engine.setConfig('version', '142');
-    expect(await runMigrations(engine)).toEqual({ applied: 3, current: LATEST_VERSION });
+    expect(await runMigrations(engine)).toEqual({ applied: 6, current: LATEST_VERSION });
 
     const rows = await engine.executeRaw<{ source_key: string; processor_version: string; event_id: string; revision_id: string; artifact_slug: string }>(
       `SELECT source_key,processor_version,event_id,revision_id,artifact_slug
@@ -92,5 +92,25 @@ describe('migrations v143-v145 source-event receipts', () => {
       source_key: 'page:raw/legacy/1', processor_version: 'legacy',
       event_id: 'legacy-key', revision_id: 'legacy-key', artifact_slug: 'source-events/legacy-key',
     });
+  });
+
+  test('repairs upstream v143-v144 DDL skipped by an old downstream v145 ledger', async () => {
+    await engine.executeRaw('DROP TABLE IF EXISTS loop_suppressions');
+    await engine.executeRaw('DROP TABLE IF EXISTS open_loops');
+    await engine.executeRaw('ALTER TABLE dream_verdicts DROP COLUMN IF EXISTS expires_at');
+    await engine.setConfig('version', '145');
+
+    expect(await runMigrations(engine)).toEqual({ applied: 3, current: LATEST_VERSION });
+
+    const dreamColumns = await engine.executeRaw<{ column_name: string }>(
+      `SELECT column_name FROM information_schema.columns
+        WHERE table_name='dream_verdicts' AND column_name='expires_at'`,
+    );
+    expect(dreamColumns).toHaveLength(1);
+    const loopTables = await engine.executeRaw<{ table_name: string }>(
+      `SELECT table_name FROM information_schema.tables
+        WHERE table_name IN ('open_loops','loop_suppressions') ORDER BY table_name`,
+    );
+    expect(loopTables.map((row) => row.table_name)).toEqual(['loop_suppressions', 'open_loops']);
   });
 });

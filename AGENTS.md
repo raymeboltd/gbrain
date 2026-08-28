@@ -114,6 +114,17 @@ writing or reviewing an operation, consult `src/core/operations.ts` for the cont
   to opt out). Non-metric event rows (`meeting`, `job_change`,
   `location_change`) ride through the same pipeline via `facts.event_type`;
   pass `kind: 'event'` or `'all'` to `find_trajectory` to query them.
+- **Answer "who is waiting on me?":** connect the user's Google account once
+  (`gbrain google setup` — two user interactions; relay the `[SHOW USER]`
+  blocks verbatim), then `gbrain waiting --json` returns the ranked people
+  waiting on the user, what they promised, evidence quotes, and Gmail deep
+  links. Manage loops with `gbrain loops done|drop|mute`. It refuses on
+  stale data and names the exact sync command to run first. Guides:
+  [`docs/guides/google-connect.md`](./docs/guides/google-connect.md) (setup +
+  every error and its fix),
+  [`docs/guides/open-loops.md`](./docs/guides/open-loops.md) (how detection
+  works); the harness protocol lives in
+  [`skills/google-loops/SKILL.md`](./skills/google-loops/SKILL.md).
 - **Everything else:** [`./llms.txt`](./llms.txt) is the full documentation map.
   [`./llms-full.txt`](./llms-full.txt) is the same map with core docs inlined for
   single-fetch ingestion.

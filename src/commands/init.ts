@@ -129,8 +129,28 @@ export async function runInit(args: string[]) {
     });
   }
 
+  // #3753: a --force re-init with NO explicit engine choice preserves the
+  // configured engine — the D5 persisted-config-wins rule extended to the
+  // engine field. Pre-fix, the PGLite default branch below swallowed a
+  // postgres config: following the deferred-setup hint verbatim
+  // (`gbrain init --force --embedding-model ...`) silently rewrote
+  // config.json to engine=pglite, orphaning the postgres data behind a
+  // config that no longer pointed at it. Switching engines stays available
+  // by saying so (--pglite / --supabase / --url). loadConfigFileOnly, NOT
+  // loadConfig: a transient env DATABASE_URL must not count as a configured
+  // engine here (CDX2-7); the env plane keeps its existing precedence in
+  // the non-interactive branch below.
+  let preservedPostgresUrl: string | null = null;
+  if (isForce && !isPGLite && !isSupabase && !manualUrl) {
+    const fileCfg = loadConfigFileOnly();
+    if (fileCfg?.engine === 'postgres' && fileCfg.database_url) {
+      preservedPostgresUrl = fileCfg.database_url;
+      console.error('[init] Existing postgres engine preserved (pass --pglite to switch engines).');
+    }
+  }
+
   // Explicit PGLite mode
-  if (isPGLite || (!isSupabase && !manualUrl && !isNonInteractive)) {
+  if (!preservedPostgresUrl && (isPGLite || (!isSupabase && !manualUrl && !isNonInteractive))) {
     // Smart detection: scan for .md files unless --pglite flag forces it
     if (!isPGLite && !isSupabase) {
       const fileCount = countMarkdownFiles(process.cwd());
@@ -160,10 +180,14 @@ export async function runInit(args: string[]) {
     const envUrl = effectiveEnvDatabaseUrl();
     if (envUrl) {
       databaseUrl = envUrl;
+    } else if (preservedPostgresUrl) {
+      databaseUrl = preservedPostgresUrl;
     } else {
       console.error('--non-interactive requires --url <connection_string> or GBRAIN_DATABASE_URL env var');
       process.exit(1);
     }
+  } else if (preservedPostgresUrl) {
+    databaseUrl = preservedPostgresUrl;
   } else {
     databaseUrl = await supabaseWizard();
   }
