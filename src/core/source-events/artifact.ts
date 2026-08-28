@@ -2,13 +2,15 @@ import { importFromContent } from '../import-file.ts';
 import type { BrainEngine } from '../engine.ts';
 import { writePageThrough } from '../write-through.ts';
 
-const ARTIFACT_VERSION = 1;
+const ARTIFACT_VERSION = 2;
 const ARTIFACT_MARKER = 'gbrain:source-event-artifact';
 
-export type SourceEventRevisionState = 'active' | 'superseded' | 'retracted';
+export type SourceEventRevisionState = 'pending' | 'active' | 'superseded' | 'retracted';
 
 export interface SourceEventRevisionRecord {
   revision_id: string;
+  /** Durable marker owner used to repair canonical fences after receipt loss. */
+  projection_run_id?: string;
   processor_version: string;
   content_hash: string;
   occurred_at: string;
@@ -34,6 +36,7 @@ export interface SourceEventArtifact {
     slug: string;
   };
   active_revision_id: string | null;
+  pending_revision_id: string | null;
   revisions: SourceEventRevisionRecord[];
 }
 
@@ -41,6 +44,8 @@ export interface PersistSourceEventArtifactInput {
   sourceId: string;
   artifactSlug: string;
   artifact: SourceEventArtifact;
+  /** Test/fault-injection seam after canonical file+page commit, before links. */
+  afterCanonicalWrite?: () => void | Promise<void>;
 }
 
 function yamlString(value: string): string {
@@ -104,6 +109,8 @@ export function parseSourceEventArtifact(body: string): SourceEventArtifact | nu
   try {
     const parsed = JSON.parse(match[1]!) as SourceEventArtifact;
     if (parsed.version !== ARTIFACT_VERSION || !parsed.event_id || !Array.isArray(parsed.revisions)) return null;
+    const revisionIds = parsed.revisions.map((revision) => revision.revision_id);
+    if (new Set(revisionIds).size !== revisionIds.length) return null;
     return parsed;
   } catch {
     return null;
@@ -114,10 +121,49 @@ export async function loadSourceEventArtifact(
   engine: BrainEngine,
   sourceId: string,
   artifactSlug: string,
+  opts: { includeUncommitted?: boolean } = {},
 ): Promise<SourceEventArtifact | null> {
   const page = await engine.getPage(artifactSlug, { sourceId });
   if (!page) return null;
-  return parseSourceEventArtifact(page.compiled_truth);
+  const artifact = parseSourceEventArtifact(page.compiled_truth);
+  if (!artifact || opts.includeUncommitted) return artifact;
+
+  const governingRevisionId = artifact.pending_revision_id ?? artifact.active_revision_id;
+  if (!governingRevisionId) return artifact.state === 'retracted' ? artifact : null;
+  const governingRevision = artifact.revisions.find(
+    (revision) => revision.revision_id === governingRevisionId,
+  );
+  if (!governingRevision) return null;
+
+  const receipts = await engine.executeRaw<{
+    projection_state: string;
+    prior_revision_id: string | null;
+    pending_revision_id: string | null;
+  }>(
+    `SELECT projection_state,prior_revision_id,pending_revision_id
+       FROM source_event_receipts
+      WHERE source_id=$1 AND event_id=$2 AND revision_id=$3 AND processor_version=$4
+      ORDER BY updated_at DESC,id DESC LIMIT 1`,
+    [sourceId, artifact.event_id, governingRevisionId, governingRevision.processor_version],
+  );
+  const receipt = receipts[0];
+  // Receipt loss is not proof of commit. Fail closed for ordinary readers;
+  // the projector's recovery path explicitly requests includeUncommitted and
+  // rebuilds the receipt from the immutable source event.
+  if (!receipt) return null;
+  if (receipt.projection_state === 'committed') return artifact;
+
+  // The canonical file is write-through and therefore cannot share the facts
+  // transaction. Until that transaction publishes the receipt commit marker,
+  // expose only the prior committed projection to source-event readers.
+  const masked = structuredClone(artifact);
+  masked.active_revision_id = receipt.prior_revision_id;
+  masked.pending_revision_id = receipt.pending_revision_id;
+  for (const revision of masked.revisions) {
+    if (revision.revision_id === receipt.prior_revision_id) revision.state = 'active';
+    if (revision.revision_id === receipt.pending_revision_id) revision.state = 'pending';
+  }
+  return masked;
 }
 
 /**
@@ -129,6 +175,10 @@ export async function persistSourceEventArtifact(
   engine: BrainEngine,
   input: PersistSourceEventArtifactInput,
 ): Promise<{ linksWritten: number; path: string }> {
+  const revisionIds = input.artifact.revisions.map((revision) => revision.revision_id);
+  if (new Set(revisionIds).size !== revisionIds.length) {
+    throw new Error(`source-event: duplicate revision_id in artifact '${input.artifactSlug}'`);
+  }
   const markdown = renderSourceEventArtifact(input.artifact);
   await importFromContent(engine, input.artifactSlug, markdown, {
     noEmbed: true,
@@ -144,6 +194,7 @@ export async function persistSourceEventArtifact(
       `(${written.skipped ?? written.error ?? 'unknown'})`,
     );
   }
+  await input.afterCanonicalWrite?.();
 
   const active = input.artifact.state === 'active'
     ? input.artifact.revisions.find((revision) => revision.revision_id === input.artifact.active_revision_id && revision.state === 'active')
@@ -199,6 +250,7 @@ export function newSourceEventArtifact(input: {
       slug: input.sourceSlug,
     },
     active_revision_id: null,
+    pending_revision_id: null,
     revisions: [],
   };
 }

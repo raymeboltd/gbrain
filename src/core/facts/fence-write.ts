@@ -78,6 +78,8 @@ export interface FenceInputFact {
   validUntil?: Date | null;
   embedding: Float32Array | null;
   sessionId: string | null;
+  /** Source-event two-phase staging marker. Pending rows are canonical but inactive. */
+  pendingRunId?: string;
 }
 
 export interface FenceWriteResult {
@@ -384,6 +386,9 @@ export async function writeFactsToFence(
       const assignedRowNums: number[] = [];
       for (const f of facts) {
         const validFromStr = (f.validFrom ?? new Date()).toISOString().slice(0, 10);
+        const pendingContext = f.pendingRunId
+          ? [f.context?.trim(), `source-event-pending:${f.pendingRunId}`].filter(Boolean).join(' | ')
+          : f.context ?? undefined;
         const { body: updated, rowNum } = upsertFactRow(body, {
           rowNum:      nextRowNum++,
           claim:       f.fact,
@@ -395,9 +400,12 @@ export async function writeFactsToFence(
           // MEMORY_VERBS v1 (c5): remember's ttl threads through to the fence
           // cell — was hard-coded undefined, which silently dropped expiry on
           // this path. extractFactsFromFenceText derives the DB column from it.
-          validUntil:  f.validUntil ? f.validUntil.toISOString().slice(0, 10) : undefined,
+          validUntil:  f.pendingRunId
+            ? new Date().toISOString().slice(0, 10)
+            : f.validUntil ? f.validUntil.toISOString().slice(0, 10) : undefined,
           source:      f.source,
-          context:     f.context ?? undefined,
+          context:     pendingContext,
+          active:      f.pendingRunId ? false : true,
         });
         body = updated;
         assignedRowNums.push(rowNum);
@@ -444,6 +452,9 @@ export async function writeFactsToFence(
       // index.
       const enriched = toInsert.map((row, i) => ({
         ...row,
+        // Pending source-event facts must be invisible in the INSERT itself;
+        // do not rely only on the strikethrough mapper for this trust gate.
+        expired_at:     facts[i].pendingRunId ? new Date() : row.expired_at,
         embedding:      facts[i].embedding,
         source_session: facts[i].sessionId,
       }));

@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } fr
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { createHash } from 'node:crypto';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { importFromContent } from '../src/core/import-file.ts';
 import { writePageThrough, _resetWriteThroughCacheForTest } from '../src/core/write-through.ts';
@@ -11,7 +12,13 @@ import {
   sourceEventProjectionLockId,
 } from '../src/core/minions/handlers/source-event-projection.ts';
 import type { MinionJobContext } from '../src/core/minions/types.ts';
-import { sourceEventId } from '../src/core/source-events/projector.ts';
+import {
+  SOURCE_EVENT_PROCESSOR_VERSION,
+  projectSourceEvent,
+  sourceEventId,
+} from '../src/core/source-events/projector.ts';
+import { writeSingleFact } from '../src/core/facts/write-single.ts';
+import { runExtractFacts } from '../src/core/cycle/extract-facts.ts';
 
 let engine: PGLiteEngine;
 let tmpRoot: string;
@@ -30,7 +37,7 @@ beforeEach(async () => {
   await engine.executeRaw('DELETE FROM timeline_entries');
   await engine.executeRaw('DELETE FROM links');
   await engine.executeRaw('DELETE FROM pages');
-  await engine.executeRaw("UPDATE sources SET config='{}'::jsonb WHERE id='default'");
+  await engine.executeRaw("UPDATE sources SET config='{}'::jsonb,local_path=NULL WHERE id='default'");
   await engine.setConfig('source_events.enabled', 'true');
   await engine.setConfig('source_events.source_ids', 'default');
   _resetWriteThroughCacheForTest();
@@ -87,6 +94,19 @@ describe('source-event projection handler', () => {
     const handler = makeSourceEventProjectionHandler(engine);
     await expect(handler(fakeJob({}))).rejects.toThrow(/sourceId is required/);
     await expect(handler(fakeJob({ sourceId: 'missing' }))).rejects.toThrow(/registered source/);
+  });
+
+  test('rejects pages without immutable producer identity before receipt claim', async () => {
+    await seedCanonicalTarget('people/victor-example', 'person', 'Victor Example');
+    await engine.putPage('raw/gmail/no-provider-id', {
+      type: 'email', title: 'Missing identity', compiled_truth: 'Victor Example replied.',
+      content_hash: 'missing-id', frontmatter: {},
+    });
+    const result = await makeSourceEventProjectionHandler(engine)(fakeJob({ sourceId: 'default' })) as {
+      status: string; identity_rejected: number; errors: number;
+    };
+    expect(result).toMatchObject({ status: 'partial', identity_rejected: 1, errors: 1 });
+    expect(await engine.executeRaw('SELECT 1 FROM source_event_receipts')).toHaveLength(0);
   });
 
   test('enforces enablement and approved-source admission inside the handler', async () => {
@@ -148,9 +168,9 @@ describe('source-event projection handler', () => {
 
     const progress: unknown[] = [];
     const result = await makeSourceEventProjectionHandler(engine)(fakeJob({ sourceId: 'default', limit: 20 }, progress)) as {
-      status: string; sourceId: string; scanned: number; applied: number; partial: number; skipped: number; reviews: number; failed: number; errors: number; retracted: number; silent_skips: number;
+      status: string; sourceId: string; scanned: number; applied: number; partial: number; skipped: number; reviews: number; failed: number; errors: number; retracted: number; identity_rejected: number; silent_skips: number;
     };
-    expect(result).toEqual({ status: 'partial', sourceId: 'default', scanned: 11, applied: 0, partial: 11, skipped: 0, reviews: 0, failed: 0, errors: 11, retracted: 0, silent_skips: 0 });
+    expect(result).toEqual({ status: 'partial', sourceId: 'default', scanned: 11, applied: 0, partial: 11, skipped: 0, reviews: 0, failed: 0, errors: 11, retracted: 0, identity_rejected: 0, silent_skips: 0 });
     expect(progress.length).toBeGreaterThan(0);
 
     const receipts = await engine.executeRaw<{ source_kind: string; source_key: string }>(
@@ -160,7 +180,7 @@ describe('source-event projection handler', () => {
       'calendar-event', 'conversation', 'conversation', 'email', 'event', 'imessage-daily',
       'meeting', 'meeting-note', 'message', 'note', 'slack',
     ]);
-    expect(receipts.map((row) => row.source_key)).toContain('note_id:granola-note-1');
+    expect(receipts.map((row) => row.source_key)).toContain('meeting-note:note_id:granola-note-1');
     expect(receipts.map((row) => row.source_key)).toContain('conversation:chatgpt:session_id:chatgpt-session-1:part:1');
     expect(receipts.map((row) => row.source_key)).toContain('codex:thread_id:codex-thread-1');
 
@@ -191,7 +211,7 @@ describe('source-event projection handler', () => {
   test('contains one canonical-write failure, leaves it retryable, and continues the batch', async () => {
     await seedCanonicalTarget('people/victor-example', 'person', 'Victor Example');
     await seedLane('raw/messages/failing-1', 'message', '2026-08-27');
-    const eventId = sourceEventId({ sourceId: 'default', sourceKey: 'provider_item_id:id-message-raw/messages/failing-1' });
+    const eventId = sourceEventId({ sourceId: 'default', sourceKey: 'message:provider_item_id:id-message-raw/messages/failing-1' });
     fs.mkdirSync(path.join(brainDir, 'source-events', `${eventId}.md`), { recursive: true });
     await engine.putPage('raw/gmail/unknown-2', {
       type: 'email', title: 'Unknown', compiled_truth: 'Nobody Known replied.',
@@ -235,6 +255,140 @@ describe('source-event projection handler', () => {
     expect(restored).toMatchObject({ scanned: 1, retracted: 0 });
     const restoredDisk = fs.readFileSync(path.join(brainDir, `${receipt!.artifact_slug}.md`), 'utf8');
     expect(restoredDisk).toContain('source_event_state: active');
+    const restoredLinks = await engine.executeRaw<{ count: number }>(
+      `SELECT COUNT(*)::int AS count FROM links l JOIN pages p ON p.id=l.from_page_id WHERE p.slug=$1`,
+      [receipt!.artifact_slug],
+    );
+    expect(restoredLinks[0]!.count).toBe(1);
+  });
+
+  test('archiving a source retracts every committed artifact without running admission', async () => {
+    await seedCanonicalTarget('people/victor-example', 'person', 'Victor Example');
+    await seedLane('raw/messages/archive-1', 'message', '2026-08-27');
+    const handler = makeSourceEventProjectionHandler(engine);
+    await handler(fakeJob({ sourceId: 'default' }));
+    await engine.executeRaw("UPDATE sources SET archived=true,config='{}'::jsonb WHERE id='default'");
+    await engine.setConfig('source_events.enabled', 'false');
+    const result = await handler(fakeJob({ sourceId: 'default' })) as {
+      status: string; scanned: number; retracted: number;
+    };
+    expect(result).toMatchObject({ status: 'completed', scanned: 0, retracted: 1 });
+    const receipt = await engine.executeRaw<{ errors: unknown }>('SELECT errors FROM source_event_receipts');
+    expect(JSON.stringify(receipt[0]?.errors)).toContain('source_retracted');
+    await engine.executeRaw("UPDATE sources SET archived=false WHERE id='default'");
+  });
+
+  test('soft-delete retracts canonical artifact and facts after receipt loss', async () => {
+    await seedCanonicalTarget('people/victor-example', 'person', 'Victor Example');
+    await engine.executeRaw("UPDATE sources SET local_path=$1 WHERE id='default'", [brainDir]);
+    const sourceSlug = 'raw/messages/receipt-loss-delete';
+    const content = 'Victor Example confirmed the delivery update in this message.';
+    await engine.putPage(sourceSlug, {
+      type: 'message', title: 'Receipt loss delete', compiled_truth: content,
+      frontmatter: { provider_item_id: 'receipt-loss-delete' },
+    });
+    let factId = 0;
+    const receipt = await projectSourceEvent(engine, {
+      sourceId: 'default', sourceKind: 'message',
+      sourceKey: 'message:provider_item_id:receipt-loss-delete',
+      sourceUri: 'gbrain://raw%2Fmessages%2Freceipt-loss-delete', sourceSlug,
+      contentHash: createHash('md5').update(content).digest('hex'),
+      processorVersion: SOURCE_EVENT_PROCESSOR_VERSION,
+      occurredAt: '2026-08-27T00:00:00.000Z', content,
+    }, {
+      runFacts: async (factsEngine, sourceInput, _targets, run) => {
+        const written = await writeSingleFact(factsEngine, sourceInput.sourceId, {
+          fact: 'Victor Example confirmed the delivery update',
+          provenance: 'source-event:receipt-loss-delete', kind: 'commitment',
+          entity: 'people/victor-example', visibility: 'private',
+          sessionId: run.factSessionId, pendingRunId: run.runId,
+        });
+        factId = written.id;
+        return { inserted: 1, duplicate: 0, superseded: 0, factIds: [written.id], stage: 'applied' };
+      },
+    });
+    await engine.executeRaw('DELETE FROM source_event_receipts');
+    await engine.softDeletePage(sourceSlug, { sourceId: 'default' });
+    const result = await makeSourceEventProjectionHandler(engine)(fakeJob({ sourceId: 'default' })) as {
+      scanned: number; retracted: number;
+    };
+    expect(result).toMatchObject({ scanned: 0, retracted: 1 });
+    const artifact = fs.readFileSync(path.join(brainDir, `${receipt.artifactSlug}.md`), 'utf8');
+    expect(artifact).toContain('source_event_state: retracted');
+    expect(artifact).not.toContain('source-event-pending:');
+    expect((await engine.executeRaw<{ expired_at: Date | null }>(
+      'SELECT expired_at FROM facts WHERE id=$1', [factId],
+    ))[0]?.expired_at).not.toBeNull();
+    expect(await engine.executeRaw(
+      `SELECT 1 FROM links l JOIN pages p ON p.id=l.from_page_id WHERE p.slug=$1`,
+      [receipt.artifactSlug],
+    )).toHaveLength(0);
+  });
+
+  test('soft-delete retracts session-staged fact missing from artifact and receipt', async () => {
+    await seedCanonicalTarget('people/victor-example', 'person', 'Victor Example');
+    await engine.executeRaw("UPDATE sources SET local_path=$1 WHERE id='default'", [brainDir]);
+    const sourceSlug = 'raw/messages/staged-receipt-loss';
+    const compiledTruth = 'Victor Example confirmed a staged delivery update.';
+    const projectedContent = `${compiledTruth}\n`;
+    await engine.putPage(sourceSlug, {
+      type: 'message', title: 'Staged receipt loss', compiled_truth: compiledTruth,
+      effective_date: new Date('2026-08-27T00:00:00.000Z'),
+      frontmatter: { provider_item_id: 'staged-receipt-loss' },
+    });
+    const projectionInput = {
+      sourceId: 'default', sourceKind: 'message',
+      sourceKey: 'message:provider_item_id:staged-receipt-loss',
+      sourceUri: 'gbrain://raw%2Fmessages%2Fstaged-receipt-loss', sourceSlug,
+      contentHash: createHash('md5').update(projectedContent).digest('hex'),
+      processorVersion: SOURCE_EVENT_PROCESSOR_VERSION,
+      occurredAt: '2026-08-27T00:00:00.000Z', content: projectedContent,
+    };
+    let factId = 0;
+    let retractionResult: { retracted: number } | null = null;
+    await expect(projectSourceEvent(engine, projectionInput, {
+      runFacts: async (factsEngine, sourceInput, _targets, run) => {
+        const written = await writeSingleFact(factsEngine, sourceInput.sourceId, {
+          fact: 'Victor Example confirmed the staged delivery update',
+          provenance: 'source-event:staged-receipt-loss', kind: 'commitment',
+          entity: 'people/victor-example', visibility: 'private',
+          sessionId: run.factSessionId, pendingRunId: run.runId,
+        });
+        factId = written.id;
+        await factsEngine.executeRaw('DELETE FROM source_event_receipts');
+        await factsEngine.softDeletePage(sourceSlug, { sourceId: 'default' });
+        retractionResult = await makeSourceEventProjectionHandler(factsEngine)(
+          fakeJob({ sourceId: 'default' }),
+        ) as { retracted: number };
+        throw new Error('simulated crash before artifact fact-id persistence');
+      },
+    })).rejects.toThrow(/simulated crash before artifact fact-id persistence/);
+
+    expect(retractionResult as unknown).toEqual({
+      status: 'completed', sourceId: 'default', scanned: 0, applied: 0, partial: 0,
+      skipped: 0, reviews: 0, failed: 0, errors: 0, retracted: 1,
+      identity_rejected: 0, silent_skips: 0,
+    });
+    const artifactSlug = `source-events/${sourceEventId(projectionInput)}`;
+    const artifact = fs.readFileSync(path.join(brainDir, `${artifactSlug}.md`), 'utf8');
+    expect(artifact).toContain('source_event_state: retracted');
+    const targetPath = path.join(brainDir, 'people/victor-example.md');
+    expect(fs.readFileSync(targetPath, 'utf8')).not.toContain('source-event-pending:');
+    expect((await engine.executeRaw<{ expired_at: Date | null }>(
+      'SELECT expired_at FROM facts WHERE id=$1', [factId],
+    ))[0]?.expired_at).not.toBeNull();
+    expect(await engine.executeRaw(
+      `SELECT 1 FROM links l JOIN pages p ON p.id=l.from_page_id WHERE p.slug=$1`, [artifactSlug],
+    )).toHaveLength(0);
+
+    await importFromContent(engine, 'people/victor-example', fs.readFileSync(targetPath, 'utf8'), {
+      noEmbed: true, sourceId: 'default', sourcePath: 'people/victor-example.md',
+    });
+    const extract = await runExtractFacts(engine, {
+      sourceId: 'default', slugs: ['people/victor-example'],
+    });
+    expect(extract.warnings.some((warning) => warning.includes('SOURCE_EVENT_FACT_COMMIT_PENDING')))
+      .toBe(false);
   });
 
   test('lock contention is observable and does not throw', async () => {

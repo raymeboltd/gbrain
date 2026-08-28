@@ -169,8 +169,8 @@ Every non-localOnly operation on the MCP surface: 118 tools across 22 areas. **S
 | `get_active_schema_pack` | v0.40.6.0: cheap identity packet for the active schema pack. | read |  |  |
 | `list_schema_packs` | v0.40.6.0: list installed schema packs (bundled + user-installed). | read |  |  |
 | `reload_schema_pack` | v0.40.6.0: flush the in-process schema pack cache so the next loadActivePack re-reads from disk. | admin |  |  |
-| `schema_apply_mutations` | v0.40.7.0: batched schema pack mutation. | admin |  |  |
-| `schema_explain_type` | v0.40.6.0: resolved settings for a single page_type in the active pack. | read |  |  |
+| `schema_apply_mutations` | Batched schema pack mutation. | admin |  |  |
+| `schema_explain_type` | Resolved settings for a single page_type in the active pack. | read |  |  |
 | `schema_graph` | v0.40.6.0: schema pack graph as JSON edges. | read |  |  |
 | `schema_lint` | v0.40.6.0: lint the active (or named) schema pack. | read |  |  |
 | `schema_review_orphans` | v0.40.6.0: list pages with no active-pack type match. | read |  |  |

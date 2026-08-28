@@ -2,7 +2,9 @@ import { tryAcquireDbLock } from '../../db-lock.ts';
 import type { BrainEngine } from '../../engine.ts';
 import type { MinionJobContext } from '../types.ts';
 import { SOURCE_EVENT_PROCESSOR_VERSION, projectSourceEvent, retractSourceEvent } from '../../source-events/projector.ts';
+import { parseSourceEventArtifact } from '../../source-events/artifact.ts';
 import { assertSourceEventAdmission, readSourceEventPolicy } from '../../source-events/policy.ts';
+import { fetchSource } from '../../sources-load.ts';
 
 const SUPPORTED_SOURCE_EVENT_TYPES = [
   'message',
@@ -29,6 +31,38 @@ interface CandidateRow {
   updated_at: Date | string;
   effective_date: Date | string | null;
   frontmatter: Record<string, unknown> | string;
+}
+
+interface RetractionCandidate {
+  event_id: string;
+  artifact_slug: string;
+  source_slug?: string;
+}
+
+async function listCanonicalArtifacts(engine: BrainEngine, sourceId: string): Promise<RetractionCandidate[]> {
+  const pages = await engine.executeRaw<{ slug: string; compiled_truth: string }>(
+    `SELECT slug,COALESCE(compiled_truth,'') AS compiled_truth FROM pages
+      WHERE source_id=$1 AND deleted_at IS NULL
+        AND COALESCE(frontmatter->>'source_event_artifact','')='true'`,
+    [sourceId],
+  );
+  const artifacts: RetractionCandidate[] = [];
+  for (const page of pages) {
+    const artifact = parseSourceEventArtifact(page.compiled_truth);
+    if (!artifact || artifact.source.source_id !== sourceId) continue;
+    artifacts.push({
+      event_id: artifact.event_id,
+      artifact_slug: page.slug,
+      source_slug: artifact.source.slug,
+    });
+  }
+  return artifacts;
+}
+
+function uniqueRetractions(rows: RetractionCandidate[]): RetractionCandidate[] {
+  const unique = new Map<string, RetractionCandidate>();
+  for (const row of rows) unique.set(`${row.event_id}\0${row.artifact_slug}`, row);
+  return [...unique.values()];
 }
 
 export function sourceEventProjectionLockId(sourceId: string): string {
@@ -82,7 +116,7 @@ function metadata(row: CandidateRow): Record<string, unknown> {
   }
 }
 
-function sourceIdentity(row: CandidateRow): { sourceKey: string; sourceUri: string } {
+function sourceIdentity(row: CandidateRow): { sourceKey: string; sourceUri: string } | null {
   const meta = metadata(row);
   const transcript = meta.transcript_import && typeof meta.transcript_import === 'object'
     ? meta.transcript_import as Record<string, unknown>
@@ -115,12 +149,14 @@ function sourceIdentity(row: CandidateRow): { sourceKey: string; sourceUri: stri
   const provider = providerFields
     .map((field) => meta[field])
     .find((value) => typeof value === 'string' && value.trim()) as string | undefined;
-  const namespace = provider ? `${provider.trim()}:` : '';
+  // Always namespace provider ids. When producer metadata omits an explicit
+  // provider, the closed source-event type is the deterministic fallback;
+  // bare `id:123` values from email/message/calendar lanes must not collide.
+  const namespace = `${provider?.trim() || row.type}:`;
   const uri = meta.source_uri;
+  if (!matched) return null;
   return {
-    sourceKey: matched
-      ? `${namespace}${matched.field}:${String(matched.value).trim()}`
-      : `page:${row.slug}`,
+    sourceKey: `${namespace}${matched.field}:${String(matched.value).trim()}`,
     sourceUri: typeof uri === 'string' && uri.trim()
       ? uri.trim()
       : `gbrain://${encodeURIComponent(row.slug)}`,
@@ -137,16 +173,42 @@ function timestamp(row: CandidateRow): string {
 export function makeSourceEventProjectionHandler(engine: BrainEngine) {
   return async function sourceEventProjectionHandler(job: MinionJobContext): Promise<unknown> {
     const { sourceId, limit } = parseParams(job.data);
-    const sources = await engine.listAllSources({ includeArchived: false });
-    const source = sources.find((candidate) => candidate.id === sourceId);
+    const source = await fetchSource(engine, sourceId);
     if (!source) {
       throw new Error(`source-event-projection: sourceId '${sourceId}' is not a registered source`);
     }
-    assertSourceEventAdmission(await readSourceEventPolicy(engine), source);
     const lock = await tryAcquireDbLock(engine, sourceEventProjectionLockId(sourceId), LOCK_TTL_MIN);
     if (!lock) return { status: 'already_in_progress', sourceId };
 
     try {
+      if (source.archived === true) {
+        const archivedReceipts = await engine.executeRaw<{ event_id: string; artifact_slug: string }>(
+          `SELECT DISTINCT ON (event_id) event_id,artifact_slug
+             FROM source_event_receipts
+            WHERE source_id=$1
+              AND NOT (errors @> '[{"code":"source_retracted"}]'::jsonb)
+            ORDER BY event_id,observed_at DESC,id DESC`,
+          [sourceId],
+        );
+        const archivedRetractions = uniqueRetractions([
+          ...archivedReceipts,
+          ...await listCanonicalArtifacts(engine, sourceId),
+        ]);
+        for (const row of archivedRetractions) {
+          await retractSourceEvent(engine, {
+            sourceId,
+            eventId: row.event_id,
+            artifactSlug: row.artifact_slug,
+            reason: 'source archived',
+          });
+        }
+        return {
+          status: 'completed', sourceId, scanned: 0, applied: 0, partial: 0,
+          skipped: 0, reviews: 0, failed: 0, errors: 0,
+          retracted: archivedRetractions.length, identity_rejected: 0, silent_skips: 0,
+        };
+      }
+      assertSourceEventAdmission(await readSourceEventPolicy(engine), source);
       const retractions = await engine.executeRaw<{ event_id: string; artifact_slug: string }>(
         `SELECT DISTINCT ON (r.event_id) r.event_id,r.artifact_slug
            FROM source_event_receipts r
@@ -156,7 +218,15 @@ export function makeSourceEventProjectionHandler(engine: BrainEngine) {
           ORDER BY r.event_id,r.observed_at DESC,r.id DESC`,
         [sourceId],
       );
-      for (const row of retractions) {
+      const deletedRows = await engine.executeRaw<{ slug: string }>(
+        `SELECT slug FROM pages WHERE source_id=$1 AND deleted_at IS NOT NULL`,
+        [sourceId],
+      );
+      const deletedSlugs = new Set(deletedRows.map((row) => row.slug));
+      const canonicalRetractions = (await listCanonicalArtifacts(engine, sourceId))
+        .filter((artifact) => artifact.source_slug && deletedSlugs.has(artifact.source_slug));
+      const allRetractions = uniqueRetractions([...retractions, ...canonicalRetractions]);
+      for (const row of allRetractions) {
         await retractSourceEvent(engine, {
           sourceId,
           eventId: row.event_id,
@@ -171,6 +241,7 @@ export function makeSourceEventProjectionHandler(engine: BrainEngine) {
       let reviews = 0;
       let failed = 0;
       let errors = 0;
+      let identityRejected = 0;
       for (let index = 0; index < candidates.length; index++) {
         if (job.signal.aborted) throw job.signal.reason ?? new Error('source-event-projection aborted');
         const row = candidates[index]!;
@@ -178,6 +249,16 @@ export function makeSourceEventProjectionHandler(engine: BrainEngine) {
         // The projector verifies this digest before accepting the event.
         const content = `${row.compiled_truth}\n${row.timeline}`;
         const identity = sourceIdentity(row);
+        if (!identity) {
+          identityRejected++;
+          errors++;
+          await job.log(`source-event-projection: immutable provider identity missing for ${row.slug}`);
+          await job.updateProgress({
+            phase: 'source-event-projection', scanned: index + 1, total: candidates.length,
+            applied, partial, skipped, reviews, failed, errors, identity_rejected: identityRejected,
+          });
+          continue;
+        }
         try {
           const receipt = await projectSourceEvent(engine, {
             sourceId,
@@ -230,7 +311,7 @@ export function makeSourceEventProjectionHandler(engine: BrainEngine) {
         throw new Error(`source-event-projection: ${silentSkips} non-applied receipt(s) have no explicit cause`);
       }
       const status = partial > 0 || skipped > 0 || reviews > 0 || failed > 0 || errors > 0 ? 'partial' : 'completed';
-      return { status, sourceId, scanned: candidates.length, applied, partial, skipped, reviews, failed, errors, retracted: retractions.length, silent_skips: silentSkips };
+      return { status, sourceId, scanned: candidates.length, applied, partial, skipped, reviews, failed, errors, retracted: allRetractions.length, identity_rejected: identityRejected, silent_skips: silentSkips };
     } finally {
       await lock.release();
     }

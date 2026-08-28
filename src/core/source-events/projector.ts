@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { buildGazetteer, findMentionedEntities, resolveLinkableEntityTypes, tokenizeForScan, tokenizeTitle } from '../by-mention.ts';
 import type { BrainEngine } from '../engine.ts';
 import { runFactsBackstop } from '../facts/backstop.ts';
@@ -11,6 +11,7 @@ import {
   type SourceEventRevisionRecord,
 } from './artifact.ts';
 import { assertSourceEventAdmission, readSourceEventPolicy } from './policy.ts';
+import { prepareSourceEventFactFence } from './fact-commit.ts';
 
 export interface SourceEventProjectionInput {
   sourceId: string;
@@ -55,7 +56,12 @@ export interface SourceEventProjectorDeps {
     engine: BrainEngine,
     input: SourceEventProjectionInput,
     targetSlugs: string[],
+    run: { runId: string; factSessionId: string },
   ) => Promise<SourceEventFactsOutcome>;
+  persistArtifact?: typeof persistSourceEventArtifact;
+  finalizeReceipt?: typeof finalizeReceipt;
+  afterCanonicalArtifactWrite?: () => void | Promise<void>;
+  afterFactDbSwap?: () => void | Promise<void>;
 }
 
 export const SOURCE_EVENT_PROCESSOR_VERSION = 'source-event-v3';
@@ -80,6 +86,8 @@ interface ReceiptRow {
   source_key: string;
   source_uri: string;
   source_slug: string;
+  projection_state: 'preparing' | 'pending' | 'committing' | 'committed' | 'aborted';
+  run_id: string | null;
 }
 
 function required(value: string, field: string): string {
@@ -176,18 +184,21 @@ async function defaultFactsRunner(
   engine: BrainEngine,
   input: SourceEventProjectionInput,
   targetSlugs: string[],
+  factSessionId: string,
+  runId: string,
 ): Promise<SourceEventFactsOutcome> {
   const result = await runFactsBackstop(
     { slug: input.sourceSlug, type: input.sourceKind, compiled_truth: input.content, frontmatter: {} },
     {
       engine,
       sourceId: input.sourceId,
-      sessionId: input.sourceKey,
+      sessionId: factSessionId,
       source: 'source-event',
       mode: 'inline',
       entityHints: targetSlugs,
       allowedEntitySlugs: targetSlugs,
       visibility: 'private',
+      pendingRunId: runId,
       validFrom: new Date(input.occurredAt),
       sourceSlug: input.sourceSlug,
     },
@@ -239,10 +250,10 @@ async function assertCanonicalFactOutcome(
 ): Promise<void> {
   if (factIds.length === 0) return;
   const rows = await engine.executeRaw<{
-    id: number; entity_slug: string | null; visibility: string;
+    id: number; entity_slug: string | null; visibility: string; expired_at: Date | string | null;
     row_num: number | null; source_markdown_slug: string | null;
   }>(
-    `SELECT id,entity_slug,visibility,row_num,source_markdown_slug FROM facts
+    `SELECT id,entity_slug,visibility,row_num,source_markdown_slug,expired_at FROM facts
       WHERE source_id=$1 AND id=ANY($2::bigint[])`,
     [sourceId, factIds],
   );
@@ -263,6 +274,9 @@ async function assertCanonicalFactOutcome(
     }
     if (row.row_num === null || row.source_markdown_slug === null) {
       violations.push(`fact ${factId} is not filesystem-canonical`);
+    }
+    if (row.expired_at === null) {
+      violations.push(`fact ${factId} became visible before source-event commit`);
     }
   }
   if (violations.length === 0) return;
@@ -298,11 +312,174 @@ async function retractPriorFacts(
   }
 }
 
+async function factsForSession(
+  engine: BrainEngine,
+  sourceId: string,
+  sourceSession: string,
+): Promise<number[]> {
+  const rows = await engine.executeRaw<{ id: number }>(
+    `SELECT id FROM facts WHERE source_id=$1 AND source_session=$2 ORDER BY id`,
+    [sourceId, sourceSession],
+  );
+  return rows.map((row) => Number(row.id));
+}
+
+function factSwapSets(pendingFactIds: number[], priorFactIds: number[]) {
+  const pending = [...new Set(pendingFactIds.map(Number))];
+  const keep = new Set(pending);
+  const prior = [...new Set(priorFactIds.map(Number).filter((id) => !keep.has(id)))];
+  return { pending, prior };
+}
+
+async function prepareFactSwapFences(
+  engine: BrainEngine,
+  input: {
+    sourceId: string;
+    eventId: string;
+    eventKey: string;
+    runId: string;
+    pendingFactIds: number[];
+    priorFactIds: number[];
+  },
+): Promise<void> {
+  const { pending, prior } = factSwapSets(input.pendingFactIds, input.priorFactIds);
+  const reason = `source event ${input.eventId.slice(0, 12)} corrected`;
+  for (const factId of pending) {
+    await prepareSourceEventFactFence(engine, {
+      sourceId: input.sourceId, factId, action: 'activate_pending', runId: input.runId, reason,
+    });
+  }
+  for (const factId of prior) {
+    await prepareSourceEventFactFence(engine, {
+      sourceId: input.sourceId, factId, action: 'expire_prior', runId: input.runId, reason,
+    });
+  }
+}
+
+async function markFactSwapFencesPending(
+  engine: BrainEngine,
+  input: {
+    sourceId: string;
+    runId: string;
+    pendingFactIds: number[];
+    priorFactIds: number[];
+  },
+): Promise<void> {
+  const { pending, prior } = factSwapSets(input.pendingFactIds, input.priorFactIds);
+  for (const factId of [...pending, ...prior]) {
+    await prepareSourceEventFactFence(engine, {
+      sourceId: input.sourceId,
+      factId,
+      action: 'mark_pending',
+      runId: input.runId,
+      reason: 'source event fact commit pending',
+    });
+  }
+}
+
+async function clearFactSwapFenceMarkers(
+  engine: BrainEngine,
+  input: { sourceId: string; runId: string; factIds: number[] },
+): Promise<string[]> {
+  const errors: string[] = [];
+  for (const factId of [...new Set(input.factIds.map(Number))]) {
+    try {
+      await prepareSourceEventFactFence(engine, {
+        sourceId: input.sourceId,
+        factId,
+        action: 'clear_pending',
+        runId: input.runId,
+        reason: 'source event projection aborted',
+      });
+    } catch (error) {
+      errors.push(`fact ${factId}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  return errors;
+}
+
+async function cleanupAbandonedPendingRevision(
+  engine: BrainEngine,
+  input: {
+    sourceId: string;
+    eventId: string;
+    revision: SourceEventRevisionRecord;
+    priorFactIds: number[];
+  },
+): Promise<void> {
+  const abandonedRunId = input.revision.projection_run_id;
+  if (!abandonedRunId) return;
+  const sessionFactIds = await factsForSession(
+    engine, input.sourceId, `source-event:${abandonedRunId}`,
+  );
+  const prior = new Set(input.priorFactIds.map(Number));
+  const abandonedFactIds = [...new Set([
+    ...input.revision.fact_ids.map(Number),
+    ...sessionFactIds,
+  ])].filter((factId) => !prior.has(factId));
+  await retractPriorFacts(
+    engine,
+    input.sourceId,
+    input.eventId,
+    abandonedFactIds,
+    'source event pending revision abandoned during recovery',
+  );
+  const markerErrors = await clearFactSwapFenceMarkers(engine, {
+    sourceId: input.sourceId,
+    runId: abandonedRunId,
+    factIds: [...abandonedFactIds, ...input.priorFactIds],
+  });
+  if (markerErrors.length > 0) {
+    throw new Error(`source-event: abandoned marker cleanup failed: ${markerErrors.join('; ')}`);
+  }
+}
+
+async function commitFactSwapDb(
+  engine: BrainEngine,
+  input: {
+    sourceId: string;
+    eventKey: string;
+    pendingFactIds: number[];
+    priorFactIds: number[];
+  },
+): Promise<void> {
+  const { pending, prior } = factSwapSets(input.pendingFactIds, input.priorFactIds);
+  await engine.transaction(async (tx) => {
+    if (pending.length > 0) {
+      await tx.executeRaw(
+        `UPDATE facts SET expired_at=NULL,valid_until=NULL
+          WHERE source_id=$1 AND id=ANY($2::bigint[])`,
+        [input.sourceId, pending],
+      );
+    }
+    if (prior.length > 0) {
+      await tx.executeRaw(
+        `UPDATE facts SET expired_at=COALESCE(expired_at,now()),valid_until=COALESCE(valid_until,current_date)
+          WHERE source_id=$1 AND id=ANY($2::bigint[])`,
+        [input.sourceId, prior],
+      );
+    }
+    await tx.executeRaw(
+      `UPDATE source_event_receipts SET projection_state='committed',updated_at=now()
+        WHERE source_id=$1 AND event_key=$2`,
+      [input.sourceId, input.eventKey],
+    );
+  });
+  const visible = await engine.executeRaw<{ id: number; expired_at: Date | string | null }>(
+    `SELECT id,expired_at FROM facts WHERE source_id=$1 AND id=ANY($2::bigint[])`,
+    [input.sourceId, [...pending, ...prior]],
+  );
+  const byId = new Map(visible.map((row) => [Number(row.id), row.expired_at]));
+  if (pending.some((id) => byId.get(id) !== null) || prior.some((id) => byId.get(id) === null)) {
+    throw new Error('source-event: atomic fact swap postcondition failed');
+  }
+}
+
 async function receiptByKey(engine: BrainEngine, sourceId: string, eventKey: string): Promise<ReceiptRow | null> {
   const rows = await engine.executeRaw<ReceiptRow>(
     `SELECT source_id,event_id,revision_id,event_key,artifact_slug,status,candidates_count,
             resolved_count,links_written,timeline_written,facts_written,skipped_count,errors,
-            source_kind,source_key,source_uri,source_slug
+            source_kind,source_key,source_uri,source_slug,projection_state,run_id
        FROM source_event_receipts WHERE source_id=$1 AND event_key=$2`,
     [sourceId, eventKey],
   );
@@ -321,13 +498,14 @@ async function finalizeReceipt(
   },
 ): Promise<SourceEventProjectionReceipt> {
   const rows = await engine.executeRaw<ReceiptRow>(
-    `UPDATE source_event_receipts SET status=$3,target_results=$4::text::jsonb,
+    `UPDATE source_event_receipts SET status=$3,projection_state='committed',pending_revision_id=NULL,
+       pending_fact_ids='[]'::jsonb,target_results=$4::text::jsonb,
        candidates_count=$5,resolved_count=$6,links_written=$7,timeline_written=0,
        facts_written=$8,skipped_count=$9,error_count=$10,errors=$11::text::jsonb,updated_at=now()
      WHERE source_id=$1 AND event_key=$2
      RETURNING source_id,event_id,revision_id,event_key,artifact_slug,status,candidates_count,
        resolved_count,links_written,timeline_written,facts_written,skipped_count,errors,
-       source_kind,source_key,source_uri,source_slug`,
+       source_kind,source_key,source_uri,source_slug,projection_state,run_id`,
     [sourceId,eventKey,values.status,JSON.stringify(values.targetResults),values.candidates,
      values.resolved,values.links,values.facts,values.skipped,values.errors.length,JSON.stringify(values.errors)],
   );
@@ -379,18 +557,25 @@ export async function projectSourceEvent(
   const wasRetracted = existing && (typeof existing.errors === 'string'
     ? existing.errors.includes('source_retracted')
     : existing.errors.some((error) => error.code === 'source_retracted'));
-  if (existing && sameProvenance && !wasRetracted && ['applied', 'partial', 'skipped'].includes(existing.status)) {
+  if (existing && sameProvenance && !wasRetracted && existing.projection_state === 'committed'
+      && ['applied', 'partial', 'skipped'].includes(existing.status)) {
     return rowToReceipt(existing, true);
   }
+  const runId = existing?.run_id ?? randomUUID();
+  const factSessionId = `source-event:${runId}`;
+  const persistProjectionArtifact = (artifact: Parameters<typeof persistSourceEventArtifact>[1]['artifact']) =>
+    (deps.persistArtifact ?? persistSourceEventArtifact)(engine, {
+      sourceId, artifactSlug, artifact, afterCanonicalWrite: deps.afterCanonicalArtifactWrite,
+    });
   if (!existing) {
     const claimed = await engine.executeRaw<{ id: number }>(
       `INSERT INTO source_event_receipts
         (source_id,event_id,revision_id,event_key,artifact_slug,source_kind,source_key,source_uri,
-         source_slug,content_hash,processor_version,observed_at,event_date,status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'processing')
+         source_slug,content_hash,processor_version,observed_at,event_date,status,projection_state,run_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'processing','preparing',$14)
        ON CONFLICT (source_id,event_key) DO NOTHING RETURNING id`,
       [sourceId,eventId,revisionId,eventKey,artifactSlug,sourceKind,sourceKey,sourceUri,sourceSlug,
-       contentHash,processorVersion,occurredAt,occurredAt.slice(0, 10)],
+       contentHash,processorVersion,occurredAt,occurredAt.slice(0, 10),runId],
     );
     if (!claimed[0]) {
       for (let attempt = 0; attempt < 100; attempt++) {
@@ -406,12 +591,16 @@ export async function projectSourceEvent(
   } else {
     await engine.executeRaw(
       `UPDATE source_event_receipts SET status='processing',source_kind=$3,source_key=$4,
-       source_uri=$5,source_slug=$6,attempts=attempts+1,updated_at=now()
+       source_uri=$5,source_slug=$6,run_id=COALESCE(run_id,$7),attempts=attempts+1,updated_at=now()
        WHERE source_id=$1 AND event_key=$2`,
-      [sourceId,eventKey,sourceKind,sourceKey,sourceUri,sourceSlug],
+      [sourceId,eventKey,sourceKind,sourceKey,sourceUri,sourceSlug,runId],
     );
   }
 
+  let artifactCommitted = false;
+  let factDbCommitted = false;
+  let precommitFactIds: number[] = [];
+  let protectedFactIds = new Set<number>();
   try {
     if (!content) return finalizeReceipt(engine, sourceId, eventKey, {
       status: 'skipped', targetResults: [], candidates: 0, resolved: 0, links: 0, facts: 0,
@@ -437,53 +626,183 @@ export async function projectSourceEvent(
       skipped: mentions.length, errors: [{ code: 'too_many_entity_mentions', detail: String(mentions.length) }],
     });
     const targets = mentions.map((mention) => mention.slug);
-    let artifact = await loadSourceEventArtifact(engine, sourceId, artifactSlug);
+    let artifact = await loadSourceEventArtifact(engine, sourceId, artifactSlug, { includeUncommitted: true });
     if (artifact && artifact.event_id !== eventId) throw new Error(`source-event: artifact identity mismatch for '${artifactSlug}'`);
     artifact ??= newSourceEventArtifact({ eventId, sourceId, sourceKind, sourceKey, sourceUri, sourceSlug });
     artifact.source = { source_id: sourceId, kind: sourceKind, key: sourceKey, uri: sourceUri, slug: sourceSlug };
     const priorActive = artifact.revisions.find((revision) => revision.state === 'active');
+    protectedFactIds = new Set(priorActive?.fact_ids ?? []);
     const processorOnlyUpgrade = priorActive?.revision_id === revisionId;
-    for (const old of artifact.revisions) {
-      if (old.state === 'active') {
-        old.state = 'superseded';
-        old.reason = processorOnlyUpgrade ? 'processor_upgrade' : 'source_correction';
-      }
+    const exactCommittedRevision = processorOnlyUpgrade && priorActive?.processor_version === processorVersion;
+
+    if (exactCommittedRevision) {
+      // Receipt loss or a crash after the artifact commit resumes here. Never
+      // append the same immutable revision twice; finish any stale-fact cleanup
+      // and reconcile the artifact-derived links before closing the receipt.
+      const priorFactIds = artifact.revisions
+        .filter((candidate) => candidate.state === 'superseded')
+        .flatMap((candidate) => candidate.fact_ids);
+      const fenceRunId = priorActive?.projection_run_id ?? runId;
+      await markFactSwapFencesPending(engine, {
+        sourceId, runId: fenceRunId, pendingFactIds: priorActive?.fact_ids ?? [], priorFactIds,
+      });
+      const persisted = await persistProjectionArtifact(artifact);
+      artifactCommitted = true;
+      await commitFactSwapDb(engine, {
+        sourceId, eventKey, pendingFactIds: priorActive?.fact_ids ?? [], priorFactIds,
+      });
+      factDbCommitted = true;
+      await deps.afterFactDbSwap?.();
+      await prepareFactSwapFences(engine, {
+        sourceId, eventId, eventKey, runId: fenceRunId,
+        pendingFactIds: priorActive?.fact_ids ?? [], priorFactIds,
+      });
+      const factsStage = priorActive?.facts_stage ?? 'skipped';
+      const errors: Array<{ code: string; detail?: string }> = [];
+      if ((priorActive?.targets.length ?? 0) === 0) errors.push({ code: 'no_known_entity_mentions' });
+      if (factsStage !== 'applied' && (priorActive?.targets.length ?? 0) > 0) errors.push({ code: `facts_${factsStage}` });
+      const targetResults = (priorActive?.targets ?? []).map((slug) => ({
+        slug,
+        relationship: 'canonical_private_artifact',
+        facts: (priorActive?.fact_ids.length ?? 0) > 0 ? 'applied' : factsStage,
+        project_candidate: priorActive?.project_candidates.some((candidate) => candidate.entity_slug === slug) ? 'review' : 'none',
+      }));
+      return (deps.finalizeReceipt ?? finalizeReceipt)(engine, sourceId, eventKey, {
+        status: (priorActive?.targets.length ?? 0) === 0 ? 'skipped' : factsStage === 'applied' ? 'applied' : 'partial',
+        targetResults, candidates: priorActive?.targets.length ?? 0, resolved: priorActive?.targets.length ?? 0,
+        links: persisted.linksWritten, facts: 0, skipped: (priorActive?.targets.length ?? 0) === 0 ? 1 : 0, errors,
+      });
     }
-    const revision: SourceEventRevisionRecord = {
+
+    if (processorOnlyUpgrade && priorActive) {
+      // A processor upgrade re-evaluates relationships but does not create a
+      // second record with the same immutable source revision id.
+      priorActive.processor_version = processorVersion;
+      priorActive.targets = targets;
+      priorActive.changed_at = new Date().toISOString();
+      artifact.state = 'active';
+      artifact.active_revision_id = revisionId;
+      artifact.pending_revision_id = null;
+      const persisted = await persistProjectionArtifact(artifact);
+      artifactCommitted = true;
+      const errors: Array<{ code: string; detail?: string }> = [];
+      if (targets.length === 0) errors.push({ code: 'no_known_entity_mentions' });
+      if (priorActive.facts_stage !== 'applied' && targets.length > 0) errors.push({ code: `facts_${priorActive.facts_stage}` });
+      return (deps.finalizeReceipt ?? finalizeReceipt)(engine, sourceId, eventKey, {
+        status: targets.length === 0 ? 'skipped' : priorActive.facts_stage === 'applied' ? 'applied' : 'partial',
+        targetResults: targets.map((slug) => ({
+          slug, relationship: 'canonical_private_artifact',
+          facts: priorActive.fact_ids.length > 0 ? 'applied' : priorActive.facts_stage,
+          project_candidate: priorActive.project_candidates.some((candidate) => candidate.entity_slug === slug) ? 'review' : 'none',
+        })),
+        candidates: mentions.length, resolved: mentions.length, links: persisted.linksWritten,
+        facts: 0, skipped: targets.length === 0 ? 1 : 0, errors,
+      });
+    }
+
+    let revision = artifact.revisions.find((candidate) => candidate.revision_id === revisionId);
+    const appendRevision = !revision;
+    if (revision?.state === 'pending') {
+      await cleanupAbandonedPendingRevision(engine, {
+        sourceId,
+        eventId,
+        revision,
+        priorFactIds: priorActive?.fact_ids ?? [],
+      });
+    }
+    revision ??= {
       revision_id: revisionId,
+      projection_run_id: runId,
       processor_version: processorVersion,
       content_hash: contentHash,
       occurred_at: occurredAt,
-      state: 'active',
+      state: 'pending',
       targets,
-      fact_ids: processorOnlyUpgrade ? [...(priorActive?.fact_ids ?? [])] : [],
-      facts_stage: processorOnlyUpgrade ? (priorActive?.facts_stage ?? 'skipped') : 'skipped',
-      action_candidates: processorOnlyUpgrade ? [...(priorActive?.action_candidates ?? [])] : [],
-      project_candidates: processorOnlyUpgrade ? [...(priorActive?.project_candidates ?? [])] : [],
+      fact_ids: [],
+      facts_stage: 'skipped',
+      action_candidates: [],
+      project_candidates: [],
       changed_at: new Date().toISOString(),
     };
-    artifact.revisions.push(revision);
-    artifact.state = 'active';
-    artifact.active_revision_id = revisionId;
-    await persistSourceEventArtifact(engine, { sourceId, artifactSlug, artifact });
-
-    if (!processorOnlyUpgrade && priorActive) {
-      await retractPriorFacts(engine, sourceId, eventId, priorActive.fact_ids);
+    if (!appendRevision) {
+      // Restoring a deleted source page reuses its immutable source revision
+      // instead of appending a duplicate id to the audit artifact.
+      revision.processor_version = processorVersion;
+      revision.projection_run_id = runId;
+      revision.content_hash = contentHash;
+      revision.occurred_at = occurredAt;
+      revision.state = 'pending';
+      revision.targets = targets;
+      revision.fact_ids = [];
+      revision.facts_stage = 'skipped';
+      revision.action_candidates = [];
+      revision.project_candidates = [];
+      revision.changed_at = new Date().toISOString();
+      delete revision.reason;
     }
+    if (appendRevision) artifact.revisions.push(revision);
+    artifact.state = 'active';
+    artifact.pending_revision_id = revisionId;
+    await persistProjectionArtifact(artifact);
+    await engine.executeRaw(
+      `UPDATE source_event_receipts SET projection_state='pending',prior_revision_id=$3,
+       pending_revision_id=$4,pending_fact_ids='[]'::jsonb,artifact_hash=$5,updated_at=now()
+       WHERE source_id=$1 AND event_key=$2`,
+      [sourceId,eventKey,priorActive?.revision_id ?? null,revisionId,digest([JSON.stringify(artifact)])],
+    );
+
     let facts: SourceEventFactsOutcome = {
       inserted: 0, duplicate: 0, superseded: 0, factIds: revision.fact_ids,
       stage: revision.facts_stage === 'applied' ? 'applied' : 'skipped',
     };
-    if (!processorOnlyUpgrade && targets.length > 0) {
-      facts = await (deps.runFacts ?? defaultFactsRunner)(engine, normalized, targets);
+    if (targets.length > 0) {
+      facts = deps.runFacts
+        ? await deps.runFacts(engine, normalized, targets, { runId, factSessionId })
+        : await defaultFactsRunner(engine, normalized, targets, factSessionId, runId);
       revision.fact_ids = [...new Set(facts.factIds.map(Number))];
+      precommitFactIds = revision.fact_ids.filter((factId) => !protectedFactIds.has(factId));
       await assertCanonicalFactOutcome(engine, sourceId, targets, revision.fact_ids);
       revision.facts_stage = facts.stage;
       const candidates = await buildReviewCandidates(engine, sourceId, revision.fact_ids);
       revision.action_candidates = candidates.actions;
       revision.project_candidates = candidates.projects;
     }
-    const persisted = await persistSourceEventArtifact(engine, { sourceId, artifactSlug, artifact });
+    await persistProjectionArtifact(artifact);
+    await engine.executeRaw(
+      `UPDATE source_event_receipts SET pending_fact_ids=$3::text::jsonb,artifact_hash=$4,updated_at=now()
+       WHERE source_id=$1 AND event_key=$2`,
+      [sourceId,eventKey,JSON.stringify(revision.fact_ids),digest([JSON.stringify(artifact)])],
+    );
+
+    const priorFactIds = priorActive?.fact_ids ?? [];
+    await markFactSwapFencesPending(engine, {
+      sourceId, runId, pendingFactIds: revision.fact_ids, priorFactIds,
+    });
+    for (const old of artifact.revisions) {
+      if (old !== revision && old.state === 'active') {
+        old.state = 'superseded';
+        old.reason = 'source_correction';
+      }
+    }
+    revision.state = 'active';
+    artifact.state = 'active';
+    artifact.active_revision_id = revisionId;
+    artifact.pending_revision_id = null;
+    const persisted = await persistProjectionArtifact(artifact);
+    artifactCommitted = true;
+    await engine.executeRaw(
+      `UPDATE source_event_receipts SET projection_state='committing',artifact_hash=$3,updated_at=now()
+       WHERE source_id=$1 AND event_key=$2`,
+      [sourceId,eventKey,digest([JSON.stringify(artifact)])],
+    );
+    await commitFactSwapDb(engine, {
+      sourceId, eventKey, pendingFactIds: revision.fact_ids, priorFactIds,
+    });
+    factDbCommitted = true;
+    await deps.afterFactDbSwap?.();
+    await prepareFactSwapFences(engine, {
+      sourceId, eventId, eventKey, runId, pendingFactIds: revision.fact_ids, priorFactIds,
+    });
     const errors: Array<{ code: string; detail?: string }> = [];
     if (targets.length === 0) errors.push({ code: 'no_known_entity_mentions' });
     if (facts.stage !== 'applied' && targets.length > 0) {
@@ -495,7 +814,7 @@ export async function projectSourceEvent(
       facts: revision.fact_ids.length > 0 ? 'applied' : revision.facts_stage,
       project_candidate: revision.project_candidates.some((candidate) => candidate.entity_slug === slug) ? 'review' : 'none',
     }));
-    return finalizeReceipt(engine, sourceId, eventKey, {
+    return (deps.finalizeReceipt ?? finalizeReceipt)(engine, sourceId, eventKey, {
       status: targets.length === 0 ? 'skipped' : facts.stage === 'applied' ? 'applied' : 'partial',
       targetResults,
       candidates: mentions.length,
@@ -506,11 +825,41 @@ export async function projectSourceEvent(
       errors,
     });
   } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
+    let detail = error instanceof Error ? error.message : String(error);
+    const onDisk = await loadSourceEventArtifact(
+      engine, sourceId, artifactSlug, { includeUncommitted: true },
+    ).catch(() => null);
+    if (!artifactCommitted) {
+      // write-through commits the canonical file before derived-link
+      // reconciliation. Detect that durable roll-forward point explicitly.
+      artifactCommitted = onDisk?.active_revision_id === revisionId
+        && onDisk.revisions.some((revision) =>
+          revision.revision_id === revisionId
+          && revision.processor_version === processorVersion
+          && revision.state === 'active',
+        );
+    }
+    if (!artifactCommitted) {
+      try {
+        const sessionFactIds = await factsForSession(engine, sourceId, factSessionId);
+        const cleanupIds = [...new Set([...precommitFactIds, ...sessionFactIds])]
+          .filter((factId) => !protectedFactIds.has(factId));
+        await retractPriorFacts(engine, sourceId, eventId, cleanupIds, 'source event projection aborted before pending facts were hidden');
+        const markerErrors = await clearFactSwapFenceMarkers(engine, {
+          sourceId,
+          runId,
+          factIds: [...cleanupIds, ...protectedFactIds],
+        });
+        if (markerErrors.length > 0) detail += `; marker cleanup failed: ${markerErrors.join('; ')}`;
+      } catch (cleanupError) {
+        detail += `; rollback failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`;
+      }
+    }
     await engine.executeRaw(
-      `UPDATE source_event_receipts SET status='error',error_count=1,errors=$3::text::jsonb,
+      `UPDATE source_event_receipts SET status='error',projection_state=$3,error_count=1,errors=$4::text::jsonb,
        updated_at=now() WHERE source_id=$1 AND event_key=$2`,
-      [sourceId,eventKey,JSON.stringify([{ code: 'projection_failed', detail }])],
+      [sourceId,eventKey,factDbCommitted ? 'committed' : artifactCommitted ? 'committing' : onDisk?.pending_revision_id === revisionId ? 'pending' : 'aborted',
+       JSON.stringify([{ code: 'projection_failed', detail }])],
     ).catch(() => {});
     throw error;
   }
@@ -520,17 +869,52 @@ export async function retractSourceEvent(
   engine: BrainEngine,
   input: { sourceId: string; eventId: string; artifactSlug: string; reason: string },
 ): Promise<void> {
-  const artifact = await loadSourceEventArtifact(engine, input.sourceId, input.artifactSlug);
+  // Retraction is a recovery mutation, not an ordinary read. It must still
+  // work when the DB-only receipt was lost or projection crashed mid-commit.
+  const artifact = await loadSourceEventArtifact(
+    engine, input.sourceId, input.artifactSlug, { includeUncommitted: true },
+  );
   if (!artifact || artifact.event_id !== input.eventId) return;
-  const active = artifact.revisions.find((revision) => revision.state === 'active');
-  if (active) {
-    await retractPriorFacts(engine, input.sourceId, input.eventId, active.fact_ids, input.reason);
-    active.state = 'retracted';
-    active.reason = input.reason;
-    active.changed_at = new Date().toISOString();
+  const retractable = artifact.revisions.filter(
+    (revision) => revision.state === 'active' || revision.state === 'pending',
+  );
+  const markerRunIds = [...new Set(artifact.revisions
+    .map((revision) => revision.projection_run_id)
+    .filter((runId): runId is string => Boolean(runId)))];
+  const sessionFactIds: number[] = [];
+  for (const runId of markerRunIds) {
+    sessionFactIds.push(...await factsForSession(
+      engine, input.sourceId, `source-event:${runId}`,
+    ));
+  }
+  const retractableFactIds = [...new Set([
+    ...retractable.flatMap((revision) => revision.fact_ids),
+    ...sessionFactIds,
+  ])];
+  await retractPriorFacts(
+    engine, input.sourceId, input.eventId, retractableFactIds, input.reason,
+  );
+  const allFactIds = [...new Set([
+    ...artifact.revisions.flatMap((revision) => revision.fact_ids),
+    ...sessionFactIds,
+  ])];
+  const markerErrors: string[] = [];
+  for (const runId of markerRunIds) {
+    markerErrors.push(...await clearFactSwapFenceMarkers(engine, {
+      sourceId: input.sourceId, runId, factIds: allFactIds,
+    }));
+  }
+  if (markerErrors.length > 0) {
+    throw new Error(`source-event: retraction marker cleanup failed: ${markerErrors.join('; ')}`);
+  }
+  for (const revision of retractable) {
+    revision.state = 'retracted';
+    revision.reason = input.reason;
+    revision.changed_at = new Date().toISOString();
   }
   artifact.state = 'retracted';
   artifact.active_revision_id = null;
+  artifact.pending_revision_id = null;
   await persistSourceEventArtifact(engine, { sourceId: input.sourceId, artifactSlug: input.artifactSlug, artifact });
   await engine.executeRaw(
     `UPDATE source_event_receipts SET status='skipped',errors=$3::text::jsonb,error_count=0,

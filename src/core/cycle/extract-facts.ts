@@ -186,6 +186,19 @@ export interface ExtractFactsResult {
   phantomsMorePending: boolean;
 }
 
+function sourceEventPendingRunIds(facts: Array<{ context?: string }>): string[] {
+  const runIds = new Set<string>();
+  for (const fact of facts) {
+    for (const segment of (fact.context ?? '').split('|')) {
+      const trimmed = segment.trim();
+      if (!trimmed.startsWith('source-event-pending:')) continue;
+      const runId = trimmed.slice('source-event-pending:'.length).trim();
+      if (runId) runIds.add(runId);
+    }
+  }
+  return [...runIds];
+}
+
 /**
  * #3625 (adversarial review, 2 rounds): whether `timeline` contains a
  * GENUINE Facts fence marker, as opposed to the marker text merely being
@@ -496,6 +509,24 @@ export async function runExtractFacts(
         `the <!-- timeline --> sentinel, where extract_facts cannot see it. ` +
         `Move the fence above the sentinel and re-save — leaving it in place ` +
         `preserves the existing indexed facts but they will not update.`,
+      );
+      continue;
+    }
+
+    const pendingSourceEventRuns = sourceEventPendingRunIds(parsed.facts);
+    if (pendingSourceEventRuns.length > 0) {
+      const receipts = await engine.executeRaw<{ run_id: string; projection_state: string }>(
+        `SELECT run_id,projection_state FROM source_event_receipts
+          WHERE source_id=$1 AND run_id=ANY($2::text[])`,
+        [sourceId, pendingSourceEventRuns],
+      );
+      const states = new Map(receipts.map((receipt) => [receipt.run_id, receipt.projection_state]));
+      const detail = pendingSourceEventRuns
+        .map((runId) => `${runId}:${states.get(runId) ?? 'receipt_missing'}`)
+        .join(',');
+      result.warnings.push(
+        `${slug}: SOURCE_EVENT_FACT_COMMIT_PENDING: preserving the existing facts index ` +
+        `until the source-event projector finalizes its canonical fence (${detail}).`,
       );
       continue;
     }

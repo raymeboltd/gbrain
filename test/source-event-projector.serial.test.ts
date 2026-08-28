@@ -6,9 +6,11 @@ import { createHash } from 'node:crypto';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { importFromContent } from '../src/core/import-file.ts';
 import { runExtractCore } from '../src/commands/extract.ts';
+import { runExtractFacts } from '../src/core/cycle/extract-facts.ts';
 import { writePageThrough, _resetWriteThroughCacheForTest } from '../src/core/write-through.ts';
 import { operationsByName } from '../src/core/operations.ts';
 import { writeSingleFact } from '../src/core/facts/write-single.ts';
+import { loadSourceEventArtifact } from '../src/core/source-events/artifact.ts';
 import type { OperationContext } from '../src/core/operations.ts';
 import {
   projectSourceEvent,
@@ -18,6 +20,7 @@ import {
   sourceEventId,
   sourceEventRevisionId,
   sourceEventKey,
+  retractSourceEvent,
   type SourceEventProjectionInput,
   type SourceEventProjectorDeps,
 } from '../src/core/source-events/projector.ts';
@@ -249,11 +252,11 @@ describe('source-event projector', () => {
     await engine.executeRaw("UPDATE sources SET local_path=$1 WHERE id='default'", [brainDir]);
     let oldFactId = 0;
     const first = await projectSourceEvent(engine, input(), {
-      runFacts: async (factsEngine, sourceInput) => {
+      runFacts: async (factsEngine, sourceInput, _targets, run) => {
         const written = await writeSingleFact(factsEngine, sourceInput.sourceId, {
           fact: 'The Porsche Project delivery is Friday',
           provenance: `source-event:${sourceInput.sourceKey}`,
-          kind: 'event', entity: 'projects/porsche', visibility: 'private',
+          kind: 'event', entity: 'projects/porsche', visibility: 'private', pendingRunId: run.runId,
         });
         oldFactId = written.id;
         return { inserted: 1, duplicate: 0, superseded: 0, factIds: [written.id], stage: 'applied' };
@@ -267,11 +270,11 @@ describe('source-event projector', () => {
     });
     let newFactId = 0;
     const second = await projectSourceEvent(engine, input({ content: corrected }), {
-      runFacts: async (factsEngine, sourceInput) => {
+      runFacts: async (factsEngine, sourceInput, _targets, run) => {
         const written = await writeSingleFact(factsEngine, sourceInput.sourceId, {
           fact: 'The Porsche Project delivery moved to Monday',
           provenance: `source-event:${sourceInput.sourceKey}`,
-          kind: 'event', entity: 'projects/porsche', visibility: 'private',
+          kind: 'event', entity: 'projects/porsche', visibility: 'private', pendingRunId: run.runId,
         });
         newFactId = written.id;
         return { inserted: 1, duplicate: 0, superseded: 0, factIds: [written.id], stage: 'applied' };
@@ -290,6 +293,443 @@ describe('source-event projector', () => {
     expect(project).toContain('The Porsche Project delivery moved to Monday');
   });
 
+  test('failure after canonical artifact write exposes no mixed facts and retry rolls forward', async () => {
+    await seedKnownTargets();
+    await engine.executeRaw("UPDATE sources SET local_path=$1 WHERE id='default'", [brainDir]);
+    let oldFactId = 0;
+    const first = await projectSourceEvent(engine, input(), {
+      runFacts: async (factsEngine, sourceInput, _targets, run) => {
+        const written = await writeSingleFact(factsEngine, sourceInput.sourceId, {
+          fact: 'The Porsche Project delivery is Friday',
+          provenance: `source-event:${sourceInput.sourceKey}`,
+          kind: 'event', entity: 'projects/porsche', visibility: 'private', pendingRunId: run.runId,
+        });
+        oldFactId = written.id;
+        return { inserted: 1, duplicate: 0, superseded: 0, factIds: [written.id], stage: 'applied' };
+      },
+    });
+    const corrected = 'Victor Example confirmed the Porsche Project delivery moved to Monday.';
+    const correctedInput = input({
+      content: corrected,
+      occurredAt: '2026-08-26T09:00:00.000Z',
+    });
+    await engine.putPage('raw/gmail/msg-123', {
+      type: 'email', title: 'Corrected delivery', compiled_truth: corrected,
+    });
+    let newFactId = 0;
+    let artifactWrites = 0;
+    await expect(projectSourceEvent(engine, correctedInput, {
+      runFacts: async (factsEngine, sourceInput, _targets, run) => {
+        const written = await writeSingleFact(factsEngine, sourceInput.sourceId, {
+          fact: 'The Porsche Project delivery moved to Monday',
+          provenance: `source-event:${sourceInput.sourceKey}`,
+          kind: 'event', entity: 'projects/porsche', visibility: 'private', pendingRunId: run.runId,
+        });
+        newFactId = written.id;
+        return { inserted: 1, duplicate: 0, superseded: 0, factIds: [written.id], stage: 'applied' };
+      },
+      afterCanonicalArtifactWrite: () => {
+        artifactWrites++;
+        if (artifactWrites === 3) throw new Error('injected post-write pre-link failure');
+      },
+    })).rejects.toThrow(/injected post-write pre-link failure/);
+
+    const facts = await engine.executeRaw<{ id: number; expired_at: Date | null }>(
+      'SELECT id,expired_at FROM facts WHERE id=ANY($1::bigint[]) ORDER BY id',
+      [[oldFactId, newFactId]],
+    );
+    expect(facts.find((row) => Number(row.id) === oldFactId)?.expired_at).toBeNull();
+    expect(facts.find((row) => Number(row.id) === newFactId)?.expired_at).not.toBeNull();
+    expect(facts.filter((row) => row.expired_at === null)).toHaveLength(1);
+    const projectPath = path.join(brainDir, 'projects/porsche.md');
+    await importFromContent(engine, 'projects/porsche', fs.readFileSync(projectPath, 'utf8'), {
+      noEmbed: true,
+      sourceId: 'default',
+      sourcePath: 'projects/porsche.md',
+    });
+    const rebuild = await runExtractFacts(engine, {
+      sourceId: 'default',
+      slugs: ['projects/porsche'],
+    });
+    expect(rebuild.warnings).toContainEqual(expect.stringContaining('SOURCE_EVENT_FACT_COMMIT_PENDING'));
+    const afterRebuild = await engine.executeRaw<{ id: number; expired_at: Date | null }>(
+      'SELECT id,expired_at FROM facts WHERE id=ANY($1::bigint[]) ORDER BY id',
+      [[oldFactId, newFactId]],
+    );
+    expect(afterRebuild.find((row) => Number(row.id) === oldFactId)?.expired_at).toBeNull();
+    expect(afterRebuild.find((row) => Number(row.id) === newFactId)?.expired_at).not.toBeNull();
+    const committedView = await loadSourceEventArtifact(engine, 'default', first.artifactSlug);
+    expect(committedView?.active_revision_id).toBe(first.revisionId);
+    expect(committedView?.revisions.find((revision) => revision.revision_id !== first.revisionId)?.state)
+      .toBe('pending');
+    const pendingReceipt = await engine.executeRaw<{ projection_state: string }>(
+      'SELECT projection_state FROM source_event_receipts WHERE revision_id=$1',
+      [sourceEventRevisionId(first.eventId, correctedInput)],
+    );
+    expect(pendingReceipt[0]?.projection_state).toBe('committing');
+    const recovered = await projectSourceEvent(engine, correctedInput);
+    expect(recovered.status).toBe('applied');
+    const finalizedReceipt = await engine.executeRaw<{
+      projection_state: string;
+      pending_revision_id: string | null;
+      pending_fact_ids: unknown;
+    }>(
+      `SELECT projection_state,pending_revision_id,pending_fact_ids
+         FROM source_event_receipts WHERE revision_id=$1`,
+      [sourceEventRevisionId(first.eventId, correctedInput)],
+    );
+    expect(finalizedReceipt[0]).toEqual({
+      projection_state: 'committed', pending_revision_id: null, pending_fact_ids: [],
+    });
+    const converged = await engine.executeRaw<{ id: number; expired_at: Date | null }>(
+      'SELECT id,expired_at FROM facts WHERE id=ANY($1::bigint[]) ORDER BY id', [[oldFactId, newFactId]],
+    );
+    expect(converged.find((row) => Number(row.id) === oldFactId)?.expired_at).not.toBeNull();
+    expect(converged.find((row) => Number(row.id) === newFactId)?.expired_at).toBeNull();
+  });
+
+  test('failure after fact DB swap survives sync and rebuild before retry finalizes fences', async () => {
+    await seedKnownTargets();
+    await engine.executeRaw("UPDATE sources SET local_path=$1 WHERE id='default'", [brainDir]);
+    let oldFactId = 0;
+    const first = await projectSourceEvent(engine, input(), {
+      runFacts: async (factsEngine, sourceInput, _targets, run) => {
+        const written = await writeSingleFact(factsEngine, sourceInput.sourceId, {
+          fact: 'The Porsche Project delivery is Friday', provenance: 'source-event:post-db-old',
+          kind: 'event', entity: 'projects/porsche', visibility: 'private', pendingRunId: run.runId,
+        });
+        oldFactId = written.id;
+        return { inserted: 1, duplicate: 0, superseded: 0, factIds: [written.id], stage: 'applied' };
+      },
+    });
+    const corrected = 'Victor Example confirmed the Porsche Project delivery moved to Monday.';
+    await engine.putPage('raw/gmail/msg-123', {
+      type: 'email', title: 'Corrected delivery', compiled_truth: corrected,
+    });
+    let newFactId = 0;
+    await expect(projectSourceEvent(engine, input({ content: corrected }), {
+      runFacts: async (factsEngine, sourceInput, _targets, run) => {
+        const written = await writeSingleFact(factsEngine, sourceInput.sourceId, {
+          fact: 'The Porsche Project delivery moved to Monday', provenance: 'source-event:post-db-new',
+          kind: 'event', entity: 'projects/porsche', visibility: 'private', pendingRunId: run.runId,
+        });
+        newFactId = written.id;
+        return { inserted: 1, duplicate: 0, superseded: 0, factIds: [written.id], stage: 'applied' };
+      },
+      afterFactDbSwap: () => { throw new Error('injected post-DB-swap failure'); },
+    })).rejects.toThrow(/injected post-DB-swap failure/);
+
+    let rows = await engine.executeRaw<{ id: number; expired_at: Date | null }>(
+      'SELECT id,expired_at FROM facts WHERE id=ANY($1::bigint[]) ORDER BY id', [[oldFactId, newFactId]],
+    );
+    expect(rows.find((row) => Number(row.id) === oldFactId)?.expired_at).not.toBeNull();
+    expect(rows.find((row) => Number(row.id) === newFactId)?.expired_at).toBeNull();
+    const receipt = await engine.executeRaw<{ status: string; projection_state: string }>(
+      'SELECT status,projection_state FROM source_event_receipts WHERE revision_id=$1',
+      [sourceEventRevisionId(first.eventId, input({ content: corrected }))],
+    );
+    expect(receipt[0]).toEqual({ status: 'error', projection_state: 'committed' });
+    const artifactView = await loadSourceEventArtifact(engine, 'default', first.artifactSlug);
+    expect(artifactView?.active_revision_id).toBe(sourceEventRevisionId(first.eventId, input({ content: corrected })));
+
+    const projectPath = path.join(brainDir, 'projects/porsche.md');
+    const pendingFence = fs.readFileSync(projectPath, 'utf8');
+    expect(pendingFence).toContain('source-event-pending:');
+    await importFromContent(engine, 'projects/porsche', pendingFence, {
+      noEmbed: true, sourceId: 'default', sourcePath: 'projects/porsche.md',
+    });
+    const rebuild = await runExtractFacts(engine, { sourceId: 'default', slugs: ['projects/porsche'] });
+    expect(rebuild.warnings).toContainEqual(expect.stringContaining('SOURCE_EVENT_FACT_COMMIT_PENDING'));
+    rows = await engine.executeRaw<{ id: number; expired_at: Date | null }>(
+      'SELECT id,expired_at FROM facts WHERE id=ANY($1::bigint[]) ORDER BY id', [[oldFactId, newFactId]],
+    );
+    expect(rows.find((row) => Number(row.id) === oldFactId)?.expired_at).not.toBeNull();
+    expect(rows.find((row) => Number(row.id) === newFactId)?.expired_at).toBeNull();
+
+    await engine.executeRaw(
+      `UPDATE source_event_receipts SET status='processing',errors='[]'::jsonb
+        WHERE revision_id=$1`,
+      [sourceEventRevisionId(first.eventId, input({ content: corrected }))],
+    );
+    const recovered = await projectSourceEvent(engine, input({ content: corrected }));
+    expect(recovered.status).toBe('applied');
+    const finalizedFence = fs.readFileSync(projectPath, 'utf8');
+    expect(finalizedFence).not.toContain('source-event-pending:');
+    expect(finalizedFence).toContain('~~The Porsche Project delivery is Friday~~');
+    expect(finalizedFence).toContain('The Porsche Project delivery moved to Monday');
+  });
+
+  test('prior-only correction quarantines the old fence before the DB swap', async () => {
+    await seedKnownTargets();
+    await engine.executeRaw("UPDATE sources SET local_path=$1 WHERE id='default'", [brainDir]);
+    let oldFactId = 0;
+    const first = await projectSourceEvent(engine, input(), {
+      runFacts: async (factsEngine, sourceInput, _targets, run) => {
+        const written = await writeSingleFact(factsEngine, sourceInput.sourceId, {
+          fact: 'The Porsche Project delivery is Friday', provenance: 'source-event:prior-only',
+          kind: 'event', entity: 'projects/porsche', visibility: 'private', pendingRunId: run.runId,
+        });
+        oldFactId = written.id;
+        return { inserted: 1, duplicate: 0, superseded: 0, factIds: [written.id], stage: 'applied' };
+      },
+    });
+    const corrected = 'Victor Example said the Porsche Project delivery statement was withdrawn.';
+    await engine.putPage('raw/gmail/msg-123', {
+      type: 'email', title: 'Withdrawn delivery statement', compiled_truth: corrected,
+    });
+    await expect(projectSourceEvent(engine, input({ content: corrected }), {
+      runFacts: async () => ({
+        inserted: 0, duplicate: 0, superseded: 0, factIds: [], stage: 'applied',
+      }),
+      afterFactDbSwap: () => { throw new Error('injected prior-only post-DB-swap failure'); },
+    })).rejects.toThrow(/injected prior-only post-DB-swap failure/);
+
+    const projectPath = path.join(brainDir, 'projects/porsche.md');
+    const pendingFence = fs.readFileSync(projectPath, 'utf8');
+    expect(pendingFence).toContain('source-event-pending:');
+    await importFromContent(engine, 'projects/porsche', pendingFence, {
+      noEmbed: true, sourceId: 'default', sourcePath: 'projects/porsche.md',
+    });
+    const rebuild = await runExtractFacts(engine, { sourceId: 'default', slugs: ['projects/porsche'] });
+    expect(rebuild.warnings).toContainEqual(expect.stringContaining('SOURCE_EVENT_FACT_COMMIT_PENDING'));
+    const rows = await engine.executeRaw<{ expired_at: Date | null }>(
+      'SELECT expired_at FROM facts WHERE id=$1', [oldFactId],
+    );
+    expect(rows[0]?.expired_at).not.toBeNull();
+
+    const recovered = await projectSourceEvent(engine, input({ content: corrected }));
+    expect(recovered.status).toBe('applied');
+    const finalizedFence = fs.readFileSync(projectPath, 'utf8');
+    expect(finalizedFence).not.toContain('source-event-pending:');
+    expect(finalizedFence).toContain('~~The Porsche Project delivery is Friday~~');
+    expect((await loadSourceEventArtifact(engine, 'default', first.artifactSlug))?.active_revision_id)
+      .toBe(sourceEventRevisionId(first.eventId, input({ content: corrected })));
+  });
+
+  test('cross-page correction quarantines both prior and replacement fact pages', async () => {
+    await seedKnownTargets();
+    await engine.executeRaw("UPDATE sources SET local_path=$1 WHERE id='default'", [brainDir]);
+    let oldFactId = 0;
+    const first = await projectSourceEvent(engine, input(), {
+      runFacts: async (factsEngine, sourceInput, _targets, run) => {
+        const written = await writeSingleFact(factsEngine, sourceInput.sourceId, {
+          fact: 'The Porsche Project delivery is Friday', provenance: 'source-event:cross-page-old',
+          kind: 'event', entity: 'projects/porsche', visibility: 'private', pendingRunId: run.runId,
+        });
+        oldFactId = written.id;
+        return { inserted: 1, duplicate: 0, superseded: 0, factIds: [written.id], stage: 'applied' };
+      },
+    });
+    const corrected = 'Victor Example withdrew the Porsche Project date and accepted responsibility.';
+    await engine.putPage('raw/gmail/msg-123', {
+      type: 'email', title: 'Cross-page correction', compiled_truth: corrected,
+    });
+    let newFactId = 0;
+    await expect(projectSourceEvent(engine, input({ content: corrected }), {
+      runFacts: async (factsEngine, sourceInput, _targets, run) => {
+        const written = await writeSingleFact(factsEngine, sourceInput.sourceId, {
+          fact: 'Victor Example accepted responsibility for the delivery update',
+          provenance: 'source-event:cross-page-new', kind: 'commitment',
+          entity: 'people/victor-example', visibility: 'private', pendingRunId: run.runId,
+        });
+        newFactId = written.id;
+        return { inserted: 1, duplicate: 0, superseded: 0, factIds: [written.id], stage: 'applied' };
+      },
+      afterFactDbSwap: () => { throw new Error('injected cross-page post-DB-swap failure'); },
+    })).rejects.toThrow(/injected cross-page post-DB-swap failure/);
+
+    for (const slug of ['projects/porsche', 'people/victor-example']) {
+      const filePath = path.join(brainDir, `${slug}.md`);
+      const pendingFence = fs.readFileSync(filePath, 'utf8');
+      expect(pendingFence).toContain('source-event-pending:');
+      await importFromContent(engine, slug, pendingFence, {
+        noEmbed: true, sourceId: 'default', sourcePath: `${slug}.md`,
+      });
+    }
+    const rebuild = await runExtractFacts(engine, {
+      sourceId: 'default', slugs: ['projects/porsche', 'people/victor-example'],
+    });
+    expect(rebuild.warnings.filter((warning) => warning.includes('SOURCE_EVENT_FACT_COMMIT_PENDING')))
+      .toHaveLength(2);
+    const rows = await engine.executeRaw<{ id: number; expired_at: Date | null }>(
+      'SELECT id,expired_at FROM facts WHERE id=ANY($1::bigint[]) ORDER BY id', [[oldFactId, newFactId]],
+    );
+    expect(rows.find((row) => Number(row.id) === oldFactId)?.expired_at).not.toBeNull();
+    expect(rows.find((row) => Number(row.id) === newFactId)?.expired_at).toBeNull();
+
+    await engine.executeRaw('DELETE FROM source_event_receipts');
+    expect(await loadSourceEventArtifact(engine, 'default', first.artifactSlug)).toBeNull();
+    expect((await projectSourceEvent(engine, input({ content: corrected }))).status).toBe('applied');
+    for (const slug of ['projects/porsche', 'people/victor-example']) {
+      expect(fs.readFileSync(path.join(brainDir, `${slug}.md`), 'utf8'))
+        .not.toContain('source-event-pending:');
+    }
+    expect((await loadSourceEventArtifact(engine, 'default', first.artifactSlug))?.active_revision_id)
+      .toBe(sourceEventRevisionId(first.eventId, input({ content: corrected })));
+  });
+
+  test('facts failure rolls back session-owned writes and healthy retry converges', async () => {
+    await seedKnownTargets();
+    await engine.executeRaw("UPDATE sources SET local_path=$1 WHERE id='default'", [brainDir]);
+    let oldFactId = 0;
+    const first = await projectSourceEvent(engine, input(), {
+      runFacts: async (factsEngine, sourceInput, _targets, run) => {
+        const written = await writeSingleFact(factsEngine, sourceInput.sourceId, {
+          fact: 'The Porsche Project delivery is Friday', provenance: 'source-event:test-old',
+          kind: 'event', entity: 'projects/porsche', visibility: 'private', pendingRunId: run.runId,
+        });
+        oldFactId = written.id;
+        return { inserted: 1, duplicate: 0, superseded: 0, factIds: [written.id], stage: 'applied' };
+      },
+    });
+    const corrected = 'Victor Example confirmed the Porsche Project delivery moved to Monday.';
+    await engine.putPage('raw/gmail/msg-123', {
+      type: 'email', title: 'Corrected delivery', compiled_truth: corrected,
+    });
+    let failedFactId = 0;
+    await expect(projectSourceEvent(engine, input({ content: corrected }), {
+      runFacts: async (factsEngine, sourceInput, _targets, run) => {
+        const written = await writeSingleFact(factsEngine, sourceInput.sourceId, {
+          fact: 'The Porsche Project delivery moved to Monday', provenance: 'source-event:test-failed',
+          kind: 'event', entity: 'projects/porsche', visibility: 'private',
+          sessionId: run.factSessionId,
+          pendingRunId: run.runId,
+        });
+        failedFactId = written.id;
+        throw new Error('injected facts failure after canonical write');
+      },
+    })).rejects.toThrow(/injected facts failure/);
+    const pendingArtifactText = fs.readFileSync(path.join(brainDir, `${first.artifactSlug}.md`), 'utf8');
+    const pendingArtifact = JSON.parse(/```json\s*([\s\S]*?)\s*```/.exec(pendingArtifactText)![1]!);
+    expect(pendingArtifact.active_revision_id).toBe(first.revisionId);
+    expect(pendingArtifact.pending_revision_id).not.toBeNull();
+    let rows = await engine.executeRaw<{ id: number; expired_at: Date | null }>(
+      'SELECT id,expired_at FROM facts WHERE id=ANY($1::bigint[]) ORDER BY id', [[oldFactId, failedFactId]],
+    );
+    expect(rows.find((row) => Number(row.id) === oldFactId)?.expired_at).toBeNull();
+    expect(rows.find((row) => Number(row.id) === failedFactId)?.expired_at).not.toBeNull();
+    expect(fs.readFileSync(path.join(brainDir, 'projects/porsche.md'), 'utf8'))
+      .not.toContain('source-event-pending:');
+
+    let recoveredFactId = 0;
+    const recovered = await projectSourceEvent(engine, input({ content: corrected }), {
+      runFacts: async (factsEngine, sourceInput, _targets, run) => {
+        const written = await writeSingleFact(factsEngine, sourceInput.sourceId, {
+          fact: 'The Porsche Project delivery moved to Monday', provenance: 'source-event:test-retry',
+          kind: 'event', entity: 'projects/porsche', visibility: 'private', pendingRunId: run.runId,
+        });
+        recoveredFactId = written.id;
+        return { inserted: 1, duplicate: 0, superseded: 0, factIds: [written.id], stage: 'applied' };
+      },
+    });
+    expect(recovered.status).toBe('applied');
+    rows = await engine.executeRaw<{ id: number; expired_at: Date | null }>(
+      'SELECT id,expired_at FROM facts WHERE id=ANY($1::bigint[]) ORDER BY id', [[oldFactId, failedFactId, recoveredFactId]],
+    );
+    expect(rows.find((row) => Number(row.id) === recoveredFactId)?.expired_at).toBeNull();
+    expect(rows.filter((row) => row.expired_at === null)).toHaveLength(1);
+    expect(fs.readFileSync(path.join(brainDir, 'projects/porsche.md'), 'utf8'))
+      .not.toContain('source-event-pending:');
+  });
+
+  test('receipt finalization failure rolls forward on retry without duplicate revisions', async () => {
+    await seedKnownTargets();
+    await engine.executeRaw("UPDATE sources SET local_path=$1 WHERE id='default'", [brainDir]);
+    const original = await projectSourceEvent(engine, input());
+    const corrected = 'Victor Example confirmed the Porsche Project delivery moved to Monday.';
+    await engine.putPage('raw/gmail/msg-123', {
+      type: 'email', title: 'Corrected delivery', compiled_truth: corrected,
+    });
+    let committedFactId = 0;
+    const runFacts: NonNullable<SourceEventProjectorDeps['runFacts']> = async (factsEngine, sourceInput, _targets, run) => {
+      const written = await writeSingleFact(factsEngine, sourceInput.sourceId, {
+        fact: 'The Porsche Project delivery moved to Monday', provenance: 'source-event:test-finalize',
+        kind: 'event', entity: 'projects/porsche', visibility: 'private', pendingRunId: run.runId,
+      });
+      committedFactId = written.id;
+      return { inserted: 1, duplicate: 0, superseded: 0, factIds: [written.id], stage: 'applied' as const };
+    };
+    await expect(projectSourceEvent(engine, input({ content: corrected }), {
+      runFacts,
+      finalizeReceipt: async () => { throw new Error('injected receipt finalization failure'); },
+    })).rejects.toThrow(/injected receipt finalization failure/);
+    const recovered = await projectSourceEvent(engine, input({ content: corrected }));
+    expect(recovered.status).toBe('applied');
+    const artifact = fs.readFileSync(path.join(brainDir, `${original.artifactSlug}.md`), 'utf8');
+    expect(artifact.match(/"revision_id":/g)?.length).toBe(2);
+    expect(await engine.executeRaw('SELECT 1 FROM source_event_receipts')).toHaveLength(2);
+    const facts = await engine.executeRaw<{ expired_at: Date | null }>('SELECT expired_at FROM facts WHERE id=$1', [committedFactId]);
+    expect(facts[0]?.expired_at).toBeNull();
+  });
+
+  test('receipt-loss rebuild reuses the committed artifact revision', async () => {
+    await seedKnownTargets();
+    await engine.executeRaw("UPDATE sources SET local_path=$1 WHERE id='default'", [brainDir]);
+    let factId = 0;
+    let factsRuns = 0;
+    const runFacts: NonNullable<SourceEventProjectorDeps['runFacts']> = async (
+      factsEngine, sourceInput, _targets, run,
+    ) => {
+      factsRuns++;
+      const written = await writeSingleFact(factsEngine, sourceInput.sourceId, {
+        fact: 'The Porsche Project delivery is Friday', provenance: 'source-event:receipt-loss',
+        kind: 'event', entity: 'projects/porsche', visibility: 'private', pendingRunId: run.runId,
+      });
+      factId = written.id;
+      return { inserted: 1, duplicate: 0, superseded: 0, factIds: [written.id], stage: 'applied' };
+    };
+    const first = await projectSourceEvent(engine, input(), { runFacts });
+    await engine.executeRaw('DELETE FROM source_event_receipts');
+    expect(await loadSourceEventArtifact(engine, 'default', first.artifactSlug)).toBeNull();
+    const rebuilt = await projectSourceEvent(engine, input(), { runFacts });
+    expect(rebuilt.replayed).toBe(false);
+    expect(factsRuns).toBe(1);
+    const artifact = fs.readFileSync(path.join(brainDir, `${first.artifactSlug}.md`), 'utf8');
+    expect(artifact.match(/"revision_id":/g)?.length).toBe(1);
+    expect(await engine.executeRaw('SELECT 1 FROM source_event_receipts')).toHaveLength(1);
+    expect((await engine.executeRaw<{ expired_at: Date | null }>(
+      'SELECT expired_at FROM facts WHERE id=$1', [factId],
+    ))[0]?.expired_at).toBeNull();
+    expect(await engine.executeRaw(
+      `SELECT 1 FROM links l JOIN pages p ON p.id=l.from_page_id
+        WHERE p.slug=$1 AND l.link_source='markdown'`, [first.artifactSlug],
+    )).toHaveLength(2);
+    expect(fs.readFileSync(path.join(brainDir, 'projects/porsche.md'), 'utf8'))
+      .not.toContain('source-event-pending:');
+  });
+
+  test('retracted source revision restores one active artifact revision and active facts', async () => {
+    await seedKnownTargets();
+    await engine.executeRaw("UPDATE sources SET local_path=$1 WHERE id='default'", [brainDir]);
+    const runFacts: NonNullable<SourceEventProjectorDeps['runFacts']> = async (factsEngine, sourceInput, _targets, run) => {
+      const written = await writeSingleFact(factsEngine, sourceInput.sourceId, {
+        fact: 'The Porsche Project delivery is Friday',
+        provenance: `source-event:${sourceInput.sourceKey}`,
+        kind: 'event', entity: 'projects/porsche', visibility: 'private', pendingRunId: run.runId,
+      });
+      return { inserted: 1, duplicate: 0, superseded: 0, factIds: [written.id], stage: 'applied' as const };
+    };
+    const first = await projectSourceEvent(engine, input(), { runFacts });
+    await retractSourceEvent(engine, {
+      sourceId: first.sourceId,
+      eventId: first.eventId,
+      artifactSlug: first.artifactSlug,
+      reason: 'test source deletion',
+    });
+    const restored = await projectSourceEvent(engine, input(), { runFacts });
+    expect(restored.status).toBe('applied');
+    const artifact = fs.readFileSync(path.join(brainDir, `${first.artifactSlug}.md`), 'utf8');
+    const parsed = JSON.parse(/```json\s*([\s\S]*?)\s*```/.exec(artifact)![1]!);
+    expect(parsed.revisions).toHaveLength(1);
+    expect(parsed.revisions[0].state).toBe('active');
+    expect(parsed.active_revision_id).toBe(parsed.revisions[0].revision_id);
+    const restoredFacts = await engine.executeRaw<{ expired_at: Date | null }>(
+      'SELECT expired_at FROM facts WHERE id=ANY($1::bigint[])', [parsed.revisions[0].fact_ids],
+    );
+    expect(restoredFacts).not.toHaveLength(0);
+    expect(restoredFacts.every((row) => row.expired_at === null)).toBe(true);
+  });
+
   test('timestamp correction creates a new source revision on the stable artifact', async () => {
     await seedKnownTargets();
     const first = await projectSourceEvent(engine, input());
@@ -306,12 +746,12 @@ describe('source-event projector', () => {
     await seedKnownTargets();
     await engine.executeRaw("UPDATE sources SET local_path=$1 WHERE id='default'", [brainDir]);
     let calls = 0;
-    const runFacts: NonNullable<SourceEventProjectorDeps['runFacts']> = async (factsEngine, sourceInput) => {
+    const runFacts: NonNullable<SourceEventProjectorDeps['runFacts']> = async (factsEngine, sourceInput, _targets, run) => {
       calls++;
       const written = await writeSingleFact(factsEngine, sourceInput.sourceId, {
         fact: 'The Porsche Project delivery is Friday',
         provenance: `source-event:${sourceInput.sourceKey}`,
-        kind: 'event', entity: 'projects/porsche', visibility: 'private',
+        kind: 'event', entity: 'projects/porsche', visibility: 'private', pendingRunId: run.runId,
       });
       return { inserted: 1, duplicate: 0, superseded: 0, factIds: [written.id], stage: 'applied' as const };
     };
@@ -323,7 +763,8 @@ describe('source-event projector', () => {
     expect(second.eventKey).not.toBe(first.eventKey);
     expect(await engine.executeRaw('SELECT 1 FROM facts WHERE expired_at IS NULL')).toHaveLength(1);
     const artifact = fs.readFileSync(path.join(brainDir, `${first.artifactSlug}.md`), 'utf8');
-    expect(artifact).toContain('"reason": "processor_upgrade"');
+    expect(artifact.match(/"revision_id":/g)?.length).toBe(1);
+    expect(artifact).toContain('"processor_version": "source-event-v4"');
   });
 
   test('private artifact is visible locally but cannot leak through remote page or backlink reads', async () => {
@@ -344,7 +785,7 @@ describe('source-event projector', () => {
     await seedKnownTargets();
     await engine.executeRaw("UPDATE sources SET local_path=$1 WHERE id='default'", [brainDir]);
     const receipt = await projectSourceEvent(engine, input(), {
-      runFacts: async (factsEngine, sourceInput) => {
+      runFacts: async (factsEngine, sourceInput, _targets, run) => {
         const commitment = await writeSingleFact(factsEngine, sourceInput.sourceId, {
           fact: 'Send the insurance documents tomorrow',
           provenance: `source-event:${sourceInput.sourceKey}`,
@@ -352,6 +793,7 @@ describe('source-event projector', () => {
           entity: 'projects/porsche',
           visibility: 'private',
           confidence: 0.95,
+          pendingRunId: run.runId,
         });
         const update = await writeSingleFact(factsEngine, sourceInput.sourceId, {
           fact: 'The Porsche project delivery is confirmed for Friday',
@@ -360,6 +802,7 @@ describe('source-event projector', () => {
           entity: 'projects/porsche',
           visibility: 'private',
           confidence: 0.95,
+          pendingRunId: run.runId,
         });
         return { inserted: 2, duplicate: 0, superseded: 0, factIds: [commitment.id, update.id], stage: 'applied' };
       },
@@ -380,11 +823,11 @@ describe('source-event projector', () => {
     await engine.executeRaw("UPDATE sources SET local_path=$1 WHERE id='default'", [brainDir]);
     let invalidId = 0;
     await expect(projectSourceEvent(engine, input(), {
-      runFacts: async (factsEngine, sourceInput) => {
+      runFacts: async (factsEngine, sourceInput, _targets, run) => {
         const written = await writeSingleFact(factsEngine, sourceInput.sourceId, {
           fact: 'This must not survive as a world-visible projection fact',
           provenance: `source-event:${sourceInput.sourceKey}`,
-          kind: 'fact', entity: 'projects/porsche', visibility: 'world',
+          kind: 'fact', entity: 'projects/porsche', visibility: 'world', pendingRunId: run.runId,
         });
         invalidId = written.id;
         return { inserted: 1, duplicate: 0, superseded: 0, factIds: [written.id], stage: 'applied' };

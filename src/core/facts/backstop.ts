@@ -74,6 +74,13 @@ export interface FactsBackstopCtx {
    * interactive and sync callers omit it and retain the upstream behavior.
    */
   allowedEntitySlugs?: string[];
+  /**
+   * Source-event two-phase projection only. When set, newly extracted facts
+   * are written to the canonical fence as struck pending rows and indexed
+   * inactive. The source-event commit path activates them atomically with
+   * expiry of the prior revision.
+   */
+  pendingRunId?: string;
   /** Optional visibility tier (default 'private'). extract_facts forwards `world` when caller asks. */
   visibility?: 'private' | 'world';
   /** Override the chat model (extract_facts forwards user's model param when set). */
@@ -645,7 +652,7 @@ async function runPipelineBodyInner(
     // have no embeddings; FS lock + sync invariant means DB == fence
     // at write time). Threshold 0.95 unchanged.
     let matchedExistingId: number | null = null;
-    if (resolvedSlug && f.embedding) {
+    if (!ctx.pendingRunId && resolvedSlug && f.embedding) {
       const candidates = await ctx.engine.findCandidateDuplicates(
         ctx.sourceId,
         resolvedSlug,
@@ -739,6 +746,7 @@ async function runPipelineBodyInner(
       // #4206: caller event-time fallback + provenance context.
       valid_from: f.valid_from ?? ctx.validFrom,
       context: ctx.sourceSlug ?? null,
+      expired_at: ctx.pendingRunId ? new Date() : undefined,
     };
     const result = await ctx.engine.insertFact(newFact, { source_id: ctx.sourceId }); // gbrain-allow-direct-insert: legacy DB-only fallback for unparented / thin-client facts (no entity page to fence onto)
     fact_ids.push(result.id);
@@ -774,6 +782,7 @@ async function runPipelineBodyInner(
       validFrom: f.valid_from ?? ctx.validFrom ?? new Date(),
       embedding: f.embedding ?? null,
       sessionId: f.source_session ?? null,
+      pendingRunId: ctx.pendingRunId,
     }));
 
     const result = await writeFactsToFence(
@@ -812,6 +821,7 @@ async function runPipelineBodyInner(
           // #4206: caller event-time fallback + provenance context.
           valid_from: f.valid_from ?? ctx.validFrom,
           context: ctx.sourceSlug ?? null,
+          expired_at: ctx.pendingRunId ? new Date() : undefined,
         };
         const legacyResult = await ctx.engine.insertFact(newFact, { source_id: ctx.sourceId }); // gbrain-allow-direct-insert: stub-guard / unresolvable-target fallback (no fenceable page or usable tree)
         fact_ids.push(legacyResult.id);
@@ -844,6 +854,7 @@ async function runPipelineBodyInner(
           // #4206: caller event-time fallback + provenance context.
           valid_from: f.valid_from ?? ctx.validFrom,
           context: ctx.sourceSlug ?? null,
+          expired_at: ctx.pendingRunId ? new Date() : undefined,
         };
         const legacyResult = await ctx.engine.insertFact(newFact, { source_id: ctx.sourceId }); // gbrain-allow-direct-insert: DB-only fallback when the fence lane declined the write (write_through opt-out race / localPath echo)
         fact_ids.push(legacyResult.id);

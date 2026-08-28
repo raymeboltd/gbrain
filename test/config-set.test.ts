@@ -42,6 +42,12 @@ describe('KNOWN_CONFIG_KEYS', () => {
     expect(KNOWN_CONFIG_KEYS).toContain('sources.default');
   });
 
+  test('contains the documented source-event activation keys', () => {
+    expect(KNOWN_CONFIG_KEYS).toContain('source_events.source_ids');
+    expect(KNOWN_CONFIG_KEYS).toContain('source_events.enabled');
+    expect(KNOWN_CONFIG_KEY_PREFIXES).not.toContain('source_events.');
+  });
+
   // The fix registers the ONE key the resolver reads, not a `sources.` prefix:
   // a prefix would bless arbitrary unread `sources.*` keys and weaken the
   // unknown-key guard this list exists to provide.
@@ -317,6 +323,19 @@ describe('#2753 — the doctor-proposed gateway-loop command is accepted by `con
     // The false "Nothing in gbrain reads this" line is the bug this fixes.
     expect(errs.join('\n')).not.toContain('Nothing in gbrain reads this');
     expect(setCalls).toEqual([['sources.default', 'wiki']]);
+  });
+
+  test('documented source-event activation commands are accepted without --force', async () => {
+    const { engine, setCalls } = setStubEngine();
+    expect((await runConfigCapture(engine, ['set', 'source_events.source_ids', 'personal'])).exit).toBeNull();
+    expect((await runConfigCapture(engine, ['set', 'source_events.enabled', 'true'])).exit).toBeNull();
+    expect(setCalls).toEqual([
+      ['source_events.source_ids', 'personal'],
+      ['source_events.enabled', 'true'],
+    ]);
+    const rejected = await runConfigCapture(engine, ['set', 'source_events.enable', 'true']);
+    expect(rejected.exit).toBe(1);
+    expect(setCalls).toHaveLength(2);
   });
 
   // A DB failure must not be laundered into "source is not registered" — that

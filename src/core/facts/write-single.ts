@@ -40,6 +40,8 @@ export interface SingleFactInput {
   validUntil?: Date | null;
   sessionId?: string | null;
   confidence?: number;
+  /** Source-event two-phase staging marker; writes the fact inactive until commit. */
+  pendingRunId?: string;
 }
 
 export interface SingleFactResult {
@@ -86,7 +88,7 @@ export async function writeSingleFact(
 
   // Dedup + supersession decision (same candidates + threshold as the pipeline).
   let supersedeId: number | null = null;
-  if (resolvedSlug && embedding) {
+  if (!input.pendingRunId && resolvedSlug && embedding) {
     const candidates = await engine.findCandidateDuplicates(sourceId, resolvedSlug, factText, {
       embedding,
       k: DEDUP_CANDIDATE_LIMIT,
@@ -127,6 +129,7 @@ export async function writeSingleFact(
     confidence: input.confidence ?? 1.0,
     valid_until: validUntil,
     embedding,
+    expired_at: input.pendingRunId ? new Date() : undefined,
   };
 
   // Fence-first write (markdown durability — same policy as the pipeline):
@@ -153,6 +156,7 @@ export async function writeSingleFact(
           validUntil,
           embedding,
           sessionId: input.sessionId ?? null,
+          pendingRunId: input.pendingRunId,
         },
       ],
     );

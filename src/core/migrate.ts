@@ -6333,6 +6333,25 @@ export const MIGRATIONS: Migration[] = [
         ON source_event_receipts(source_id, event_id, observed_at);
     `,
   },
+  {
+    version: 145,
+    name: 'source_event_two_phase_projection',
+    idempotent: true,
+    sql: `
+      ALTER TABLE source_event_receipts
+        ADD COLUMN IF NOT EXISTS projection_state TEXT NOT NULL DEFAULT 'committed'
+          CHECK (projection_state IN ('preparing','pending','committing','committed','aborted'));
+      ALTER TABLE source_event_receipts ADD COLUMN IF NOT EXISTS run_id TEXT;
+      ALTER TABLE source_event_receipts ADD COLUMN IF NOT EXISTS prior_revision_id TEXT;
+      ALTER TABLE source_event_receipts ADD COLUMN IF NOT EXISTS pending_revision_id TEXT;
+      ALTER TABLE source_event_receipts
+        ADD COLUMN IF NOT EXISTS pending_fact_ids JSONB NOT NULL DEFAULT '[]'::jsonb
+          CHECK (jsonb_typeof(pending_fact_ids) = 'array');
+      ALTER TABLE source_event_receipts ADD COLUMN IF NOT EXISTS artifact_hash TEXT;
+      CREATE INDEX IF NOT EXISTS idx_source_event_receipts_projection_state
+        ON source_event_receipts(source_id,projection_state,updated_at);
+    `,
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

@@ -1,4 +1,4 @@
-import type { BrainEngine, SourceRow } from '../engine.ts';
+import type { BrainEngine } from '../engine.ts';
 import { isSourceAutopilotSyncEnabled } from '../sources-load.ts';
 
 const TRUE_VALUES = new Set(['1', 'true', 'yes', 'on']);
@@ -25,7 +25,7 @@ export async function readSourceEventPolicy(engine: BrainEngine): Promise<Source
 
 export function sourceEventAdmissionReason(
   policy: SourceEventPolicy,
-  source: Pick<SourceRow, 'id' | 'config'>,
+  source: { id: string; config: unknown },
 ): SourceEventAdmissionReason | null {
   if (!policy.enabled) return 'disabled';
   if (policy.approvedSourceIds.size === 0) return 'source_unconfigured';
@@ -36,7 +36,7 @@ export function sourceEventAdmissionReason(
 
 export function assertSourceEventAdmission(
   policy: SourceEventPolicy,
-  source: Pick<SourceRow, 'id' | 'config'>,
+  source: { id: string; config: unknown },
 ): void {
   const reason = sourceEventAdmissionReason(policy, source);
   if (!reason) return;

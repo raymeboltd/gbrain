@@ -14,17 +14,32 @@ beforeAll(async () => {
 
 afterAll(async () => engine.disconnect());
 
-describe('migration v143 source-event receipts', () => {
-  test('is the current migration and fresh schema exposes identity columns', async () => {
-    expect(LATEST_VERSION).toBeGreaterThanOrEqual(143);
+describe('migrations v143-v145 source-event receipts', () => {
+  test('v145 is current and fresh schema exposes the full two-phase contract', async () => {
+    expect(LATEST_VERSION).toBe(145);
     const columns = await engine.executeRaw<{ column_name: string }>(
       `SELECT column_name FROM information_schema.columns
         WHERE table_name='source_event_receipts' ORDER BY column_name`,
     );
     const names = columns.map((row) => row.column_name);
-    for (const name of ['source_key', 'processor_version', 'target_results', 'status', 'event_id', 'revision_id', 'artifact_slug']) {
+    for (const name of [
+      'source_key', 'processor_version', 'target_results', 'status', 'event_id',
+      'revision_id', 'artifact_slug', 'projection_state', 'run_id',
+      'prior_revision_id', 'pending_revision_id', 'pending_fact_ids', 'artifact_hash',
+    ]) {
       expect(names).toContain(name);
     }
+    const indexes = await engine.executeRaw<{ indexname: string }>(
+      `SELECT indexname FROM pg_indexes WHERE tablename='source_event_receipts'`,
+    );
+    expect(indexes.map((row) => row.indexname)).toContain('idx_source_event_receipts_projection_state');
+    const constraints = await engine.executeRaw<{ definition: string }>(
+      `SELECT pg_get_constraintdef(oid) AS definition FROM pg_constraint
+        WHERE conrelid='source_event_receipts'::regclass`,
+    );
+    const contract = constraints.map((row) => row.definition).join('\n');
+    expect(contract).toContain("projection_state");
+    expect(contract).toContain("jsonb_typeof(pending_fact_ids) = 'array'");
   });
 
   test('fresh Postgres schema includes receipt metadata in the RLS seal', () => {
@@ -67,7 +82,7 @@ describe('migration v143 source-event receipts', () => {
        VALUES ('default','legacy-key','email','legacy://1','raw/legacy/1','hash',now(),'2026-01-01','partial')`,
     );
     await engine.setConfig('version', '142');
-    expect(await runMigrations(engine)).toEqual({ applied: 2, current: LATEST_VERSION });
+    expect(await runMigrations(engine)).toEqual({ applied: 3, current: LATEST_VERSION });
 
     const rows = await engine.executeRaw<{ source_key: string; processor_version: string; event_id: string; revision_id: string; artifact_slug: string }>(
       `SELECT source_key,processor_version,event_id,revision_id,artifact_slug
