@@ -85,7 +85,7 @@ async function seedLane(slug: string, type: string, date: string, extraFrontmatt
     content_hash: `hash-${type}`,
     effective_date: new Date(`${date}T00:00:00.000Z`),
     effective_date_source: 'date',
-    frontmatter: { date, provider_item_id: `id-${type}-${slug}`, ...extraFrontmatter },
+    frontmatter: { date, provider: type, provider_item_id: `id-${type}-${slug}`, ...extraFrontmatter },
   });
 }
 
@@ -100,13 +100,165 @@ describe('source-event projection handler', () => {
     await seedCanonicalTarget('people/victor-example', 'person', 'Victor Example');
     await engine.putPage('raw/gmail/no-provider-id', {
       type: 'email', title: 'Missing identity', compiled_truth: 'Victor Example replied.',
-      content_hash: 'missing-id', frontmatter: {},
+      content_hash: 'missing-id', frontmatter: { id: 'unattested-bare-id' },
     });
     const result = await makeSourceEventProjectionHandler(engine)(fakeJob({ sourceId: 'default' })) as {
       status: string; identity_rejected: number; errors: number;
     };
     expect(result).toMatchObject({ status: 'partial', identity_rejected: 1, errors: 1 });
     expect(await engine.executeRaw('SELECT 1 FROM source_event_receipts')).toHaveLength(0);
+  });
+
+  test('prioritizes identity-bearing events so malformed legacy rows cannot starve the lane', async () => {
+    await engine.putPage('raw/meetings/legacy-without-id', {
+      type: 'event', title: 'Legacy event', compiled_truth: 'Legacy event without provider identity.',
+      content_hash: 'legacy-event', frontmatter: {
+        provider: 'legacy', account_id: 'personal', native_container_id: 'meeting-a', part_index: 0,
+      },
+    });
+    await engine.putPage('raw/gmail/numeric-provider-id', {
+      type: 'email', title: 'Numeric provider id', compiled_truth: 'Numeric ids are not attested strings.',
+      content_hash: 'numeric-provider-id', frontmatter: { provider: 'gmail', message_id: 123 },
+    });
+    await engine.putPage('raw/gmail/noncanonical-part', {
+      type: 'email', title: 'Noncanonical part', compiled_truth: 'Leading-zero parts are rejected.',
+      content_hash: 'noncanonical-part', frontmatter: {
+        provider: 'gmail', account_id: 'personal', native_container_id: 'thread-leading-zero', part_index: '01',
+      },
+    });
+    await engine.putPage('raw/sessions/numeric-session-id', {
+      type: 'conversation', title: 'Numeric session', compiled_truth: 'Numeric session ids are invalid.',
+      frontmatter: { transcript_import: { harness: 'chatgpt', session_id: 123, part: 1 } },
+    });
+    await engine.putPage('raw/gmail/numeric-k1-provider', {
+      type: 'email', title: 'Numeric K1 provider', compiled_truth: 'Numeric providers are invalid.',
+      frontmatter: { provider: 123, account_id: 'personal', native_container_id: 'thread-provider', part_index: 1 },
+    });
+    await engine.putPage('raw/gmail/numeric-k1-owner', {
+      type: 'email', title: 'Numeric K1 owner', compiled_truth: 'Numeric owners are invalid.',
+      frontmatter: { provider: 'gmail', account_id: 123, native_container_id: 'thread-owner', part_index: 1 },
+    });
+    await engine.putPage('raw/gmail/numeric-k1-container', {
+      type: 'email', title: 'Numeric K1 container', compiled_truth: 'Numeric containers are invalid.',
+      frontmatter: { provider: 'gmail', account_id: 'personal', native_container_id: 123, part_index: 1 },
+    });
+    await engine.putPage('raw/gmail/valid-with-id', {
+      type: 'email', title: 'Valid email', compiled_truth: 'A valid email with no known entity.',
+      content_hash: 'valid-email', frontmatter: { provider: 'gmail', message_id: 'valid-email-1' },
+    });
+    await engine.executeRaw(
+      `UPDATE pages SET updated_at='2020-01-01T00:00:00Z'
+        WHERE slug <> 'raw/gmail/valid-with-id'`,
+    );
+
+    const first = await makeSourceEventProjectionHandler(engine)(
+      fakeJob({ sourceId: 'default', limit: 1 }),
+    ) as { scanned: number; identity_rejected: number; skipped: number };
+    expect(first).toMatchObject({ scanned: 1, identity_rejected: 0, skipped: 1 });
+    const receipts = await engine.executeRaw<{ source_slug: string }>('SELECT source_slug FROM source_event_receipts');
+    expect(receipts).toEqual([{ source_slug: 'raw/gmail/valid-with-id' }]);
+  });
+
+  test('uses K1 native-container identity across document revisions and account namespaces', async () => {
+    await seedCanonicalTarget('people/victor-example', 'person', 'Victor Example');
+    const putRetrievalDocument = async (
+      slug: string, provider: string | undefined, accountId: string, documentId: string, text: string,
+    ) => {
+      await engine.putPage(slug, {
+        type: 'email', title: 'Materialized Gmail thread', compiled_truth: text,
+        frontmatter: {
+          provider, account_id: accountId, source_id: 'gmail',
+          native_container_id: 'gmail-thread:thread-a', part_index: 1,
+          document_id: documentId, input_manifest_sha256: `${documentId}-manifest`,
+          materializer_version: 'vault-os-k1-v1',
+        },
+      });
+    };
+    await putRetrievalDocument('conversations/gmail/alpha-thread-a', 'gmail', 'alpha@example.com', 'doc-alpha-v1',
+      'Victor Example confirmed the first delivery.');
+    await putRetrievalDocument('conversations/gmail/beta-thread-a', 'gmail', 'beta@example.com', 'doc-beta-v1',
+      'Victor Example confirmed the second delivery.');
+    await putRetrievalDocument('conversations/gmail/alpha-thread-a-slack', 'slack', 'alpha@example.com', 'doc-alpha-slack-v1',
+      'Victor Example confirmed the third delivery.');
+
+    const handler = makeSourceEventProjectionHandler(engine);
+    await handler(fakeJob({ sourceId: 'default' }));
+    const first = await engine.executeRaw<{ source_slug: string; event_id: string; source_key: string }>(
+      `SELECT source_slug,event_id,source_key FROM source_event_receipts ORDER BY source_slug`,
+    );
+    expect(first).toHaveLength(3);
+    expect(new Set(first.map((row) => row.event_id)).size).toBe(3);
+    const alpha = first.find((row) => row.source_slug === 'conversations/gmail/alpha-thread-a');
+    const beta = first.find((row) => row.source_slug === 'conversations/gmail/beta-thread-a');
+    const alphaSlack = first.find((row) => row.source_slug === 'conversations/gmail/alpha-thread-a-slack');
+    expect(alpha?.source_key).toContain('retrieval-document:gmail:owner:alpha%40example.com');
+    expect(beta?.source_key).toContain('retrieval-document:gmail:owner:beta%40example.com');
+    expect(alphaSlack?.source_key).toContain('retrieval-document:slack:owner:alpha%40example.com');
+    const alphaEventId = alpha!.event_id;
+
+    await putRetrievalDocument('conversations/gmail/alpha-thread-a', 'gmail', 'alpha@example.com', 'doc-alpha-v2',
+      'Victor Example confirmed the revised delivery date.');
+    const replay = await handler(fakeJob({ sourceId: 'default' })) as { scanned: number; identity_rejected: number };
+    expect(replay).toMatchObject({ scanned: 1, identity_rejected: 0 });
+    const alphaRevisions = await engine.executeRaw<{ event_id: string; source_key: string }>(
+      `SELECT event_id,source_key FROM source_event_receipts
+        WHERE source_slug='conversations/gmail/alpha-thread-a' ORDER BY observed_at`,
+    );
+    expect(alphaRevisions).toHaveLength(2);
+    expect(alphaRevisions.every((row) => row.event_id === alphaEventId)).toBe(true);
+    expect(new Set(alphaRevisions.map((row) => row.source_key)).size).toBe(1);
+  });
+
+  test('rejects K1 documents without provider and transcripts without a valid part', async () => {
+    await engine.putPage('raw/gmail/k1-without-provider', {
+      type: 'email', title: 'Missing K1 provider', compiled_truth: 'Provider is missing.',
+      frontmatter: {
+        account_id: 'alpha@example.com', source_id: 'gmail',
+        native_container_id: 'gmail-thread:thread-a', part_index: 1,
+      },
+    });
+    await engine.putPage('raw/sessions/transcript-without-part', {
+      type: 'conversation', title: 'Missing transcript part', compiled_truth: 'Part is missing.',
+      frontmatter: { transcript_import: { harness: 'chatgpt', session_id: 'session-a' } },
+    });
+    await engine.putPage('raw/sessions/transcript-leading-zero-part', {
+      type: 'conversation', title: 'Invalid transcript part', compiled_truth: 'Part is noncanonical.',
+      frontmatter: { transcript_import: { harness: 'chatgpt', session_id: 'session-b', part: '01' } },
+    });
+    await engine.putPage('raw/sessions/transcript-without-harness', {
+      type: 'conversation', title: 'Missing transcript harness', compiled_truth: 'Harness is missing.',
+      frontmatter: { transcript_import: { session_id: 'session-c', part: 1 } },
+    });
+    await engine.putPage('raw/gmail/providerless-message-id', {
+      type: 'email', title: 'Missing generic provider', compiled_truth: 'Provider is missing.',
+      frontmatter: { message_id: 'message-a' },
+    });
+
+    const result = await makeSourceEventProjectionHandler(engine)(fakeJob({ sourceId: 'default' })) as {
+      status: string; identity_rejected: number; errors: number;
+    };
+    expect(result).toMatchObject({ status: 'partial', identity_rejected: 5, errors: 5 });
+    expect(await engine.executeRaw('SELECT 1 FROM source_event_receipts')).toHaveLength(0);
+  });
+
+  test('namespaces identical generic ids by mandatory provider', async () => {
+    await engine.putPage('raw/gmail/provider-collision', {
+      type: 'email', title: 'Gmail message', compiled_truth: 'No known entity.',
+      frontmatter: { provider: 'gmail', message_id: 'shared-42' },
+    });
+    await engine.putPage('raw/outlook/provider-collision', {
+      type: 'email', title: 'Outlook message', compiled_truth: 'No known entity.',
+      frontmatter: { provider: 'outlook', message_id: 'shared-42' },
+    });
+
+    await makeSourceEventProjectionHandler(engine)(fakeJob({ sourceId: 'default' }));
+    const rows = await engine.executeRaw<{ event_id: string; source_key: string }>(
+      'SELECT event_id,source_key FROM source_event_receipts ORDER BY source_key',
+    );
+    expect(rows.map((row) => row.source_key)).toEqual([
+      'gmail:message_id:shared-42', 'outlook:message_id:shared-42',
+    ]);
+    expect(new Set(rows.map((row) => row.event_id)).size).toBe(2);
   });
 
   test('enforces enablement and approved-source admission inside the handler', async () => {
@@ -132,11 +284,11 @@ describe('source-event projection handler', () => {
     });
     await engine.putPage('raw/gmail/review-1', {
       type: 'email', title: 'Review', compiled_truth: 'Alex Example replied.',
-      content_hash: 'review-hash', frontmatter: { message_id: 'review-1' },
+      content_hash: 'review-hash', frontmatter: { provider: 'gmail', message_id: 'review-1' },
     });
     await engine.putPage('raw/gmail/unknown-1', {
       type: 'email', title: 'Unknown', compiled_truth: 'Nobody Known replied.',
-      content_hash: 'unknown-hash', frontmatter: { message_id: 'unknown-1' },
+      content_hash: 'unknown-hash', frontmatter: { provider: 'gmail', message_id: 'unknown-1' },
     });
     const result = await makeSourceEventProjectionHandler(engine)(fakeJob({ sourceId: 'default' })) as {
       status: string; scanned: number; applied: number; partial: number; skipped: number; reviews: number; errors: number;
@@ -151,7 +303,9 @@ describe('source-event projection handler', () => {
     await seedLane('raw/calendar/event-1', 'calendar-event', '2026-08-23', { provider_item_id: undefined, event_id: 'calendar-event-1' });
     await seedLane('raw/meetings/note-1', 'meeting-note', '2026-08-24', { provider_item_id: undefined, note_id: 'granola-note-1' });
     await seedLane('events/event-1', 'event', '2026-08-25');
-    await seedLane('raw/sessions/session-1', 'conversation', '2026-08-26', { provider_item_id: undefined, thread_id: 'codex-thread-1', source_tool: 'codex' });
+    await seedLane('raw/sessions/session-1', 'conversation', '2026-08-26', {
+      provider: undefined, provider_item_id: undefined, thread_id: 'codex-thread-1', source_tool: 'codex',
+    });
     await seedLane('raw/meetings/native-1', 'meeting', '2026-08-26');
     await seedLane('raw/imessage/day-1', 'imessage-daily', '2026-08-26');
     await seedLane('raw/slack/thread-1', 'slack', '2026-08-26');
@@ -192,7 +346,7 @@ describe('source-event projection handler', () => {
     await seedCanonicalTarget('people/victor-example', 'person', 'Victor Example');
     await engine.putPage('raw/gmail/empty-1', {
       type: 'email', title: 'Empty', compiled_truth: '', content_hash: 'empty-hash',
-      frontmatter: { message_id: 'empty-1' },
+      frontmatter: { provider: 'gmail', message_id: 'empty-1' },
     });
     await seedLane('raw/messages/valid-1', 'message', '2026-08-27');
 
@@ -215,7 +369,7 @@ describe('source-event projection handler', () => {
     fs.mkdirSync(path.join(brainDir, 'source-events', `${eventId}.md`), { recursive: true });
     await engine.putPage('raw/gmail/unknown-2', {
       type: 'email', title: 'Unknown', compiled_truth: 'Nobody Known replied.',
-      content_hash: 'unknown-2-hash', frontmatter: { message_id: 'unknown-2' },
+      content_hash: 'unknown-2-hash', frontmatter: { provider: 'gmail', message_id: 'unknown-2' },
     });
 
     await expect(
@@ -285,7 +439,7 @@ describe('source-event projection handler', () => {
     const content = 'Victor Example confirmed the delivery update in this message.';
     await engine.putPage(sourceSlug, {
       type: 'message', title: 'Receipt loss delete', compiled_truth: content,
-      frontmatter: { provider_item_id: 'receipt-loss-delete' },
+      frontmatter: { provider: 'beeper', provider_item_id: 'receipt-loss-delete' },
     });
     let factId = 0;
     const receipt = await projectSourceEvent(engine, {
@@ -334,7 +488,7 @@ describe('source-event projection handler', () => {
     await engine.putPage(sourceSlug, {
       type: 'message', title: 'Staged receipt loss', compiled_truth: compiledTruth,
       effective_date: new Date('2026-08-27T00:00:00.000Z'),
-      frontmatter: { provider_item_id: 'staged-receipt-loss' },
+      frontmatter: { provider: 'beeper', provider_item_id: 'staged-receipt-loss' },
     });
     const projectionInput = {
       sourceId: 'default', sourceKind: 'message',

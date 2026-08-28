@@ -21,6 +21,11 @@ const SUPPORTED_SOURCE_EVENT_TYPES = [
 const LOCK_TTL_MIN = 20;
 const DEFAULT_LIMIT = 100;
 const MAX_LIMIT = 500;
+const MAX_SOURCE_EVENT_PART = 999_999_999;
+const IMMUTABLE_IDENTITY_FIELDS = [
+  'provider_item_id', 'message_id', 'event_id', 'note_id', 'session_id',
+  'thread_id', 'capture_id', 'revision_id', 'conversation_id',
+] as const;
 
 interface CandidateRow {
   slug: string;
@@ -100,9 +105,71 @@ async function listCandidates(engine: BrainEngine, sourceId: string, limit: numb
              AND r.status IN ('applied','partial','skipped')
              AND NOT (r.errors @> '[{"code":"source_retracted"}]'::jsonb)
         )
-      ORDER BY p.updated_at, p.slug
+      ORDER BY CASE WHEN
+        (
+          jsonb_typeof(p.frontmatter#>'{transcript_import,session_id}') = 'string'
+          AND jsonb_typeof(p.frontmatter#>'{transcript_import,harness}') = 'string'
+          AND NULLIF(BTRIM(COALESCE(p.frontmatter#>>'{transcript_import,session_id}', '')), '') IS NOT NULL
+          AND NULLIF(BTRIM(COALESCE(p.frontmatter#>>'{transcript_import,harness}', '')), '') IS NOT NULL
+          AND (
+            (
+              jsonb_typeof(p.frontmatter#>'{transcript_import,part}') = 'string'
+              AND COALESCE(p.frontmatter#>>'{transcript_import,part}', '') ~ '^[1-9][0-9]{0,8}$'
+            )
+            OR (
+              jsonb_typeof(p.frontmatter#>'{transcript_import,part}') = 'number'
+              AND (p.frontmatter#>>'{transcript_import,part}')::numeric BETWEEN 1 AND 999999999
+              AND (p.frontmatter#>>'{transcript_import,part}')::numeric =
+                  TRUNC((p.frontmatter#>>'{transcript_import,part}')::numeric)
+            )
+          )
+        )
+        OR (
+          EXISTS (
+            SELECT 1 FROM jsonb_each_text(COALESCE(p.frontmatter, '{}'::jsonb)) provider_meta
+             WHERE provider_meta.key = ANY(ARRAY['provider','source_tool','network']::text[])
+               AND jsonb_typeof(p.frontmatter->provider_meta.key) = 'string'
+               AND NULLIF(BTRIM(provider_meta.value), '') IS NOT NULL
+          )
+          AND EXISTS (
+            SELECT 1 FROM jsonb_each_text(COALESCE(p.frontmatter, '{}'::jsonb)) identity_meta
+             WHERE identity_meta.key = ANY($5::text[])
+               AND jsonb_typeof(p.frontmatter->identity_meta.key) = 'string'
+               AND NULLIF(BTRIM(identity_meta.value), '') IS NOT NULL
+          )
+        )
+        OR (
+          jsonb_typeof(p.frontmatter->'native_container_id') = 'string'
+          AND NULLIF(BTRIM(COALESCE(p.frontmatter->>'native_container_id', '')), '') IS NOT NULL
+          AND (
+            (
+              jsonb_typeof(p.frontmatter->'part_index') = 'string'
+              AND COALESCE(p.frontmatter->>'part_index', '') ~ '^[1-9][0-9]{0,8}$'
+            )
+            OR (
+              jsonb_typeof(p.frontmatter->'part_index') = 'number'
+              AND (p.frontmatter->>'part_index')::numeric BETWEEN 1 AND 999999999
+              AND (p.frontmatter->>'part_index')::numeric = TRUNC((p.frontmatter->>'part_index')::numeric)
+            )
+          )
+          AND EXISTS (
+            SELECT 1 FROM jsonb_each_text(COALESCE(p.frontmatter, '{}'::jsonb)) provider_meta
+             WHERE provider_meta.key = ANY(ARRAY['provider','source_tool','network']::text[])
+               AND jsonb_typeof(p.frontmatter->provider_meta.key) = 'string'
+               AND NULLIF(BTRIM(provider_meta.value), '') IS NOT NULL
+          )
+          AND EXISTS (
+            SELECT 1 FROM jsonb_each_text(COALESCE(p.frontmatter, '{}'::jsonb)) owner_meta
+             WHERE owner_meta.key = ANY(ARRAY['account_id','source_id']::text[])
+               AND jsonb_typeof(p.frontmatter->owner_meta.key) = 'string'
+               AND NULLIF(BTRIM(owner_meta.value), '') IS NOT NULL
+          )
+        )
+        THEN 0 ELSE 1 END,
+        p.updated_at, p.slug
       LIMIT $3`,
-    [sourceId, [...SUPPORTED_SOURCE_EVENT_TYPES], limit, SOURCE_EVENT_PROCESSOR_VERSION],
+    [sourceId, [...SUPPORTED_SOURCE_EVENT_TYPES], limit, SOURCE_EVENT_PROCESSOR_VERSION,
+     [...IMMUTABLE_IDENTITY_FIELDS]],
   );
 }
 
@@ -116,6 +183,17 @@ function metadata(row: CandidateRow): Record<string, unknown> {
   }
 }
 
+function positivePart(value: unknown): string | null {
+  const normalized = typeof value === 'number'
+    ? value
+    : typeof value === 'string' && /^[1-9]\d{0,8}$/.test(value.trim())
+      ? Number(value.trim())
+      : Number.NaN;
+  return Number.isSafeInteger(normalized) && normalized >= 1 && normalized <= MAX_SOURCE_EVENT_PART
+    ? String(normalized)
+    : null;
+}
+
 function sourceIdentity(row: CandidateRow): { sourceKey: string; sourceUri: string } | null {
   const meta = metadata(row);
   const transcript = meta.transcript_import && typeof meta.transcript_import === 'object'
@@ -124,25 +202,41 @@ function sourceIdentity(row: CandidateRow): { sourceKey: string; sourceUri: stri
   const transcriptSession = transcript?.session_id;
   const transcriptHarness = transcript?.harness;
   const transcriptPart = transcript?.part;
-  if (typeof transcriptSession === 'string' && transcriptSession.trim()) {
-    const harness = typeof transcriptHarness === 'string' && transcriptHarness.trim()
-      ? transcriptHarness.trim()
-      : 'unknown';
-    const part = typeof transcriptPart === 'number' && Number.isInteger(transcriptPart)
-      ? String(transcriptPart)
-      : '1';
+  const transcriptPartValue = positivePart(transcriptPart);
+  if (typeof transcriptSession === 'string' && transcriptSession.trim()
+      && typeof transcriptHarness === 'string' && transcriptHarness.trim() && transcriptPartValue) {
+    const harness = transcriptHarness.trim();
     return {
-      sourceKey: `conversation:${harness}:session_id:${transcriptSession.trim()}:part:${part}`,
+      sourceKey: `conversation:${harness}:session_id:${transcriptSession.trim()}:part:${transcriptPartValue}`,
       sourceUri: typeof meta.source_uri === 'string' && meta.source_uri.trim()
         ? meta.source_uri.trim()
         : `gbrain://${encodeURIComponent(row.slug)}`,
     };
   }
-  const keyFields = [
-    'provider_item_id', 'message_id', 'event_id', 'note_id', 'session_id',
-    'thread_id', 'capture_id', 'revision_id', 'conversation_id', 'id',
-  ];
-  const matched = keyFields
+  // Vault OS K1 retrieval documents intentionally separate stable container
+  // identity from revision identity. document_id/input_manifest_sha256 change
+  // when raw inputs change, so they must never become the source event id.
+  // provider + account/source namespace + native container + part remains
+  // stable across those revisions and across page renames.
+  const nativeContainer = typeof meta.native_container_id === 'string'
+    ? meta.native_container_id.trim()
+    : '';
+  const part = positivePart(meta.part_index);
+  const ownerNamespace = [meta.account_id, meta.source_id]
+    .find((value) => typeof value === 'string' && value.trim()) as string | undefined;
+  const retrievalProvider = [meta.provider, meta.source_tool, meta.network]
+    .find((value) => typeof value === 'string' && value.trim()) as string | undefined;
+  if (nativeContainer && part && ownerNamespace && retrievalProvider) {
+    const encode = (value: string) => encodeURIComponent(value.trim());
+    return {
+      sourceKey: `retrieval-document:${encode(retrievalProvider)}` +
+        `:owner:${encode(ownerNamespace)}:native_container_id:${encode(nativeContainer)}:part:${part}`,
+      sourceUri: typeof meta.source_uri === 'string' && meta.source_uri.trim()
+        ? meta.source_uri.trim()
+        : `gbrain://${encodeURIComponent(row.slug)}`,
+    };
+  }
+  const matched = IMMUTABLE_IDENTITY_FIELDS
     .map((field) => ({ field, value: meta[field] }))
     .find(({ value }) => typeof value === 'string' && value.trim());
   const providerFields = ['provider', 'source_tool', 'network'];
@@ -152,7 +246,8 @@ function sourceIdentity(row: CandidateRow): { sourceKey: string; sourceUri: stri
   // Always namespace provider ids. When producer metadata omits an explicit
   // provider, the closed source-event type is the deterministic fallback;
   // bare `id:123` values from email/message/calendar lanes must not collide.
-  const namespace = `${provider?.trim() || row.type}:`;
+  if (!provider) return null;
+  const namespace = `${provider.trim()}:`;
   const uri = meta.source_uri;
   if (!matched) return null;
   return {
