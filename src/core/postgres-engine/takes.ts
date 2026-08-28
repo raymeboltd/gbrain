@@ -420,7 +420,16 @@ export async function listStaleTakes(deps: PgTakesDeps): Promise<StaleTakeRow[]>
       ORDER BY t.id
       LIMIT 100000
     `;
-    return rows as unknown as StaleTakeRow[];
+    // postgres.js returns BIGSERIAL/INT8 as bigint. The public engine contract
+    // is numeric and updateTakeEmbeddings validates Number ids; leaking the
+    // raw driver row makes every real Postgres backfill fail as "invalid
+    // take_id" even though PGLite succeeds.
+    return (rows as unknown as Array<Record<string, unknown>>).map((row) => ({
+      take_id: Number(row.take_id),
+      page_slug: String(row.page_slug),
+      row_num: Number(row.row_num),
+      claim: String(row.claim),
+    }));
   }
 
 export async function updateTakeEmbeddings(

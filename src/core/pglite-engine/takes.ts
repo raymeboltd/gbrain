@@ -407,7 +407,14 @@ export async function listStaleTakes(deps: PgliteTakesDeps): Promise<StaleTakeRo
        ORDER BY t.id
        LIMIT 100000`
     );
-    return rows as unknown as StaleTakeRow[];
+    // Keep both engines on the same plain-number contract even if a PGLite
+    // driver version starts returning BIGINT columns as native bigint.
+    return (rows as Array<Record<string, unknown>>).map((row) => ({
+      take_id: Number(row.take_id),
+      page_slug: String(row.page_slug),
+      row_num: Number(row.row_num),
+      claim: String(row.claim),
+    }));
   }
 
 export async function updateTakeEmbeddings(
