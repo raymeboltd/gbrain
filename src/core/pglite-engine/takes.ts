@@ -409,12 +409,22 @@ export async function listStaleTakes(deps: PgliteTakesDeps): Promise<StaleTakeRo
     );
     // Keep both engines on the same plain-number contract even if a PGLite
     // driver version starts returning BIGINT columns as native bigint.
-    return (rows as Array<Record<string, unknown>>).map((row) => ({
-      take_id: Number(row.take_id),
-      page_slug: String(row.page_slug),
-      row_num: Number(row.row_num),
-      claim: String(row.claim),
-    }));
+    return (rows as Array<Record<string, unknown>>).map((row) => {
+      const takeId = Number(row.take_id);
+      const rowNum = Number(row.row_num);
+      if (!Number.isSafeInteger(takeId) || takeId <= 0) {
+        throw new Error('invalid take_id: outside JavaScript safe integer range');
+      }
+      if (!Number.isSafeInteger(rowNum)) {
+        throw new Error('invalid row_num: outside JavaScript safe integer range');
+      }
+      return {
+        take_id: takeId,
+        page_slug: String(row.page_slug),
+        row_num: rowNum,
+        claim: String(row.claim),
+      };
+    });
   }
 
 export async function updateTakeEmbeddings(
@@ -437,7 +447,7 @@ async function _updateTakeEmbeddingsOnce(
 ): Promise<number> {
   const seen = new Set<number>();
   const rows = rowsIn.map(({ take_id, embedding }) => {
-    if (!Number.isInteger(take_id) || take_id <= 0) throw new Error(`invalid take_id: ${take_id}`);
+    if (!Number.isSafeInteger(take_id) || take_id <= 0) throw new Error(`invalid take_id: ${take_id}`);
     if (seen.has(take_id)) throw new Error(`duplicate take_id in embedding batch: ${take_id}`);
     seen.add(take_id);
     const values = Array.from(embedding);

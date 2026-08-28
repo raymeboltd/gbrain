@@ -22,4 +22,18 @@ describe('Postgres stale-take row normalization', () => {
     expect(Number.isInteger(rows[0].take_id)).toBe(true);
     expect(() => JSON.stringify(rows)).not.toThrow();
   });
+
+  test('fails closed instead of rounding a bigint outside the safe integer range', async () => {
+    const sql = async () => [{
+      take_id: BigInt(Number.MAX_SAFE_INTEGER) + 1n,
+      page_slug: 'projects/car',
+      row_num: 7n,
+      claim: 'Insurance documents are due tomorrow',
+    }];
+    const deps = { sql } as unknown as PgTakesDeps;
+
+    await expect(listStaleTakes(deps)).rejects.toThrow(
+      'invalid take_id: outside JavaScript safe integer range',
+    );
+  });
 });
