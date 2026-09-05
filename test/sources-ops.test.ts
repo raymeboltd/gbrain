@@ -139,7 +139,9 @@ async function withEnv2<T>(fn: () => Promise<T>): Promise<T> {
 describe('addSource — Q4 pre-flight collision', () => {
   test('rejects existing id BEFORE any clone work', async () => {
     await withEnv2(async () => {
-      await addSource(engine, { id: 'taken', localPath: '/tmp/a' });
+      // This call only seeds the collision row. The fixture path is deliberately
+      // synthetic, so bypass the independent committed-Git-source preflight.
+      await addSource(engine, { id: 'taken', localPath: '/tmp/a', force: true });
       try {
         await addSource(engine, {
           id: 'taken',
