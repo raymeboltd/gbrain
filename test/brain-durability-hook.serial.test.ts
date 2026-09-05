@@ -126,6 +126,46 @@ describe('brain-commit-push.sh (D13 guarantee)', () => {
     expect(code).toBe(2);
   });
 
+  test('commits only requested paths and preserves unrelated staged changes', () => {
+    rmSync(join(work, '.git', 'hooks', 'post-commit'));
+    writeFileSync(join(work, 'unrelated.md'), 'staged elsewhere\n');
+    git(work, 'add', 'unrelated.md');
+    writeFileSync(join(work, 'README.md'), 'scoped change\n');
+    execFileSync('bash', [join(work, 'scripts', 'brain-commit-push.sh'), 'scoped', 'README.md'], {
+      cwd: work, stdio: ['ignore', 'pipe', 'pipe'], env: process.env,
+    });
+    expect(git(work, 'show', '--format=', '--name-only', 'HEAD').trim()).toBe('README.md');
+    expect(git(work, 'diff', '--cached', '--name-only').trim()).toBe('unrelated.md');
+  });
+
+  test('no scoped change still confirms and pushes an existing local commit', () => {
+    rmSync(join(work, '.git', 'hooks', 'post-commit'));
+    writeFileSync(join(work, 'pending.md'), 'pending\n');
+    git(work, 'add', 'pending.md'); git(work, 'commit', '-qm', 'pending local');
+    const head = git(work, 'rev-parse', 'HEAD');
+    expect(originHead(bare)).not.toBe(head);
+    execFileSync('bash', [join(work, 'scripts', 'brain-commit-push.sh'), 'noop', 'README.md'], {
+      cwd: work, stdio: ['ignore', 'pipe', 'pipe'], env: process.env,
+    });
+    expect(originHead(bare)).toBe(head);
+  });
+
+  test('repo-local merge policy reconciles shared history without rebasing', () => {
+    rmSync(join(work, '.git', 'hooks', 'post-commit'));
+    git(work, 'config', 'gbrain.durabilityReconcile', 'merge');
+    const other = mkdtempSync(join(root, 'merge-other-'));
+    execFileSync('git', ['-c', 'protocol.file.allow=always', 'clone', '-q', bare, other], { stdio: 'ignore', env: process.env });
+    git(other, 'config', 'user.email', 'o@o.o'); git(other, 'config', 'user.name', 'other');
+    writeFileSync(join(other, 'remote-merge.md'), 'remote\n');
+    git(other, 'add', 'remote-merge.md'); git(other, 'commit', '-qm', 'remote merge'); git(other, 'push', '-q', 'origin', 'main');
+    writeFileSync(join(work, 'README.md'), 'local merge policy\n');
+    execFileSync('bash', [join(work, 'scripts', 'brain-commit-push.sh'), 'local merge', 'README.md'], {
+      cwd: work, stdio: ['ignore', 'pipe', 'pipe'], env: process.env,
+    });
+    expect(git(work, 'show', '-s', '--format=%P', 'HEAD').trim().split(/\s+/)).toHaveLength(2);
+    expect(originHead(bare)).toBe(git(work, 'rev-parse', 'HEAD'));
+  });
+
   test('#2426 — commits a MODIFIED tracked file even when the remote advanced (commit before pull)', () => {
     // Pre-fix, the helper ran `git pull --rebase` BEFORE staging, so any dirty
     // tree (a modified/enriched page — exactly the write-through case) aborted

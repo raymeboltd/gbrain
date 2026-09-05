@@ -180,12 +180,23 @@ brain_push() {
     exec 9>"$_gd/gbrain-push.lock"
     flock -w "\${GBRAIN_PUSH_LOCK_WAIT_SECONDS:-30}" 9 || { echo "$(date -u +%FT%TZ) [push] lock-timeout $_branch" >>"$_log"; return ${lockTimeoutRc}; }
   fi
-  if git push origin "HEAD:$_branch" >>"$_log" 2>&1; then
+  _confirm_remote_head() {
+    _local_head="$(git rev-parse HEAD 2>/dev/null)" || return 1
+    _remote_head="$(git ls-remote --exit-code origin "refs/heads/$_branch" 2>>"$_log" | awk 'NR == 1 { print $1 }')" || return 1
+    [ "$_local_head" = "$_remote_head" ]
+  }
+  if git push origin "HEAD:$_branch" >>"$_log" 2>&1 && _confirm_remote_head; then
     echo "$(date -u +%FT%TZ) [push] ok $_branch $(git rev-parse --short HEAD 2>/dev/null)" >>"$_log"; return 0
   fi
-  echo "$(date -u +%FT%TZ) [push] rejected; rebase-pull $_branch" >>"$_log"
-  if git pull --rebase origin "$_branch" >>"$_log" 2>&1 && git push origin "HEAD:$_branch" >>"$_log" 2>&1; then
-    echo "$(date -u +%FT%TZ) [push] ok-after-rebase $_branch $(git rev-parse --short HEAD 2>/dev/null)" >>"$_log"; return 0
+  _strategy="$(git config --get gbrain.durabilityReconcile 2>/dev/null || echo rebase)"
+  case "$_strategy" in
+    rebase) _pull_flag=--rebase ;;
+    merge) _pull_flag=--no-rebase ;;
+    *) echo "$(date -u +%FT%TZ) [push] invalid reconcile policy: $_strategy" >>"$_log"; return 1 ;;
+  esac
+  echo "$(date -u +%FT%TZ) [push] rejected; $_strategy-pull $_branch" >>"$_log"
+  if git pull "$_pull_flag" origin "$_branch" >>"$_log" 2>&1 && git push origin "HEAD:$_branch" >>"$_log" 2>&1 && _confirm_remote_head; then
+    echo "$(date -u +%FT%TZ) [push] ok-after-$_strategy $_branch $(git rev-parse --short HEAD 2>/dev/null)" >>"$_log"; return 0
   fi
   git rebase --abort >/dev/null 2>&1 || true
   echo "$(date -u +%FT%TZ) [push] LOCAL-ONLY, NEEDS ATTENTION: $_branch @ $(git rev-parse --short HEAD 2>/dev/null) could not reach origin. Run: gbrain sources pull <id> && git push" >>"$_log"
@@ -245,8 +256,11 @@ fi
 # write-through case). Stage + commit first; brain_push below already handles
 # a remote that advanced (push -> rejected -> pull --rebase -> push).
 git add -- "$@"
-if git diff --cached --quiet; then echo "nothing to commit"; exit 0; fi
-git commit -m "$_msg"
+if git diff --cached --quiet -- "$@"; then
+  echo "nothing scoped to commit; confirming pending push"
+else
+  git commit --only -m "$_msg" -- "$@"
+fi
 
 if brain_push "$_branch"; then exit 0; fi
 echo "PUSH FAILED — commit is local-only, NEEDS ATTENTION (see ${'$'}{GBRAIN_HOME:-$HOME}/.gbrain/brain-push.log)" >&2

@@ -272,6 +272,11 @@ What hardening guarantees:
   commits and pushes atomically and refuses to report success without a
   confirmed push. The post-commit hook is a best-effort background fallback;
   the helper is the guarantee.
+- **Shared history can forbid rebases.** The retry default remains `rebase`.
+  Repositories whose reviewed policy requires append-only shared history set
+  `git config --local gbrain.durabilityReconcile merge`; the generated helper
+  and hook then merge a remote advance before retrying the push. Any other
+  value fails closed.
 - **No silent staleness.** A 30-minute background pull keeps an idle session
   current. It runs DB-free, so it never contends with a live brain for the
   PGLite single-writer lock.
