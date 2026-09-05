@@ -57,7 +57,7 @@ import { runMigrations } from './migrate.ts';
 import { hnswEfSearchFor, hnswIndexExpected, HNSW_EF_SEARCH_MAX } from './vector-index.ts';
 import { PGLITE_SCHEMA_SQL, getPGLiteSchema } from './pglite-schema.ts';
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } from './ai/defaults.ts';
-import { DELETE_BATCH_SIZE } from './engine-constants.ts';
+import { DELETE_BATCH_SIZE, TRAVERSE_PATH_ROW_CAP } from './engine-constants.ts';
 import { PageMissingError } from './engine-errors.ts';
 import { SOURCE_CONFIG_OBJECT_SQL } from './source-config-sql.ts';
 import { MARKDOWN_CHUNKER_VERSION } from './chunkers/recursive.ts';
@@ -99,7 +99,7 @@ import { unverifiedExtractionFragment } from './extraction-review.ts';
 import { shouldExcludeFromOrphanReporting, loadOrphanPolicyOverrides } from './orphan-policy.ts';
 import { LINK_EXTRACTOR_VERSION_TS } from './link-extraction.ts';
 import { EMBED_SKIP_FILTER_FRAGMENT } from './embed-skip.ts';
-import { QUARANTINE_FILTER_FRAGMENT } from './quarantine.ts';
+import { QUARANTINE_FILTER_FRAGMENT, quarantineFilterFragment } from './quarantine.ts';
 import {
   normalizeEngineColumn,
   buildVectorCastFragment,
@@ -240,8 +240,6 @@ export function tryLoadSnapshot(snapshotPath: string): Blob | null {
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       const fs = require('node:fs') as typeof import('node:fs'); // engine-dynamic-import-ok
       const crypto = require('node:crypto') as typeof import('node:crypto'); // engine-dynamic-import-ok
-      const { MIGRATIONS } = require('./migrate.ts') as typeof import('./migrate.ts'); // engine-dynamic-import-ok
-      const { PGLITE_SCHEMA_SQL } = require('./pglite-schema.ts') as typeof import('./pglite-schema.ts'); // engine-dynamic-import-ok
 
       if (!fs.existsSync(snapshotPath)) {
         if (!_snapshotWarnLogged) {
@@ -263,7 +261,10 @@ export function tryLoadSnapshot(snapshotPath: string): Blob | null {
         return null;
       }
       if (_snapshotSchemaHashMemo === null) {
-        _snapshotSchemaHashMemo = computeSnapshotSchemaHash(MIGRATIONS, PGLITE_SCHEMA_SQL, crypto);
+        // 'unavailable' (source files unreadable — compiled binary) never
+        // matches a hex hash below, so the snapshot is refused via the same
+        // stale path. Memoized either way: one file read per process.
+        _snapshotSchemaHashMemo = computeSnapshotSchemaHash(crypto, fs) ?? 'unavailable';
       }
       const versionLines = fs.readFileSync(versionPath, 'utf8').trim().split('\n');
       if (_snapshotSchemaHashMemo !== (versionLines[0] ?? '')) {
@@ -326,32 +327,36 @@ export function tryLoadSnapshot(snapshotPath: string): Blob | null {
 }
 
 export function computeSnapshotSchemaHash(
-  migrations: Array<{ version: number; name: string; sql?: string; sqlFor?: { pglite?: string }; handler?: unknown }>,
-  schemaSQL: string,
   crypto: typeof import('node:crypto'),
-): string {
-  const hash = crypto.createHash('sha256');
-  hash.update('schema:');
-  hash.update(schemaSQL);
-  hash.update('\nmigrations:\n');
-  for (const m of migrations) {
-    hash.update(String(m.version));
-    hash.update('\t');
-    hash.update(m.name);
-    hash.update('\t');
-    hash.update(m.sql ?? '');
-    hash.update('\t');
-    hash.update(m.sqlFor?.pglite ?? '');
-    hash.update('\t');
-    // W0 fix-wave (D5.13, Codex #4): 19+ migrations carry executable
-    // `handler` code with empty/absent sql — invisible to the sql-only hash,
-    // so editing a handler reused a stale snapshot. Function.prototype
-    // .toString folds the handler SOURCE into the hash (deterministic within
-    // a checkout; this is a dev/test fixture, not a shipped artifact).
-    hash.update(typeof m.handler === 'function' ? String(m.handler) : '');
-    hash.update('\n');
+  fs: typeof import('node:fs'),
+): string | null {
+  // Instrumentation-immune schema hash: the raw FILE BYTES of migrate.ts +
+  // pglite-schema.ts, resolved relative to this module.
+  //
+  // The previous form hashed the in-memory MIGRATIONS array, folding each
+  // migration handler's Function.prototype.toString (W0 D5.13 — editing a
+  // handler must stale the snapshot). But coverage instrumentation rewrites
+  // LOADED function bodies, so under `bun test --coverage` (every CI shard)
+  // the runtime hash never matched the plain-`bun run` builder's, and every
+  // CI engine silently cold-initted ("snapshot stale") — a permanent
+  // CI-vs-local timing divergence that amplified ordering flakes. File bytes
+  // keep the D5.13 property (a handler edit edits the file) and are identical
+  // under any loader, runtime, or instrumentation. They are also the same
+  // inputs CI's snapshot-cache key hashes, so builder, engine, and cache can
+  // no longer disagree in kind.
+  //
+  // Returns null when the source files are unreadable (compiled binary) —
+  // the snapshot is a dev/test fixture; no-snapshot is the safe answer there.
+  try {
+    const hash = crypto.createHash('sha256');
+    hash.update('files:v2\n');
+    hash.update(fs.readFileSync(new URL('./migrate.ts', import.meta.url)));
+    hash.update('\n--\n');
+    hash.update(fs.readFileSync(new URL('./pglite-schema.ts', import.meta.url)));
+    return hash.digest('hex');
+  } catch {
+    return null;
   }
-  return hash.digest('hex');
 }
 
 /**
@@ -1347,7 +1352,7 @@ export class PGLiteEngine implements BrainEngine {
         && !needsMinionJobsPrivateQueue
         && !needsSourceEventReceiptIndexColumns) return;
 
-    process.stderr.write('  Pre-v0.21 brain detected, applying forward-reference bootstrap\n');
+    process.stderr.write('  Schema forward-reference gap detected, applying bootstrap\n');
 
     if (needsPagesBootstrap) {
       // Mirror schema-embedded.ts shape for `sources` so the subsequent
@@ -1894,6 +1899,29 @@ export class PGLiteEngine implements BrainEngine {
     );
     if (rows.length === 0) return null;
     return { slug: (rows[0] as { slug: string }).slug };
+  }
+
+  /**
+   * #4587 — batch soft-delete primitive. See BrainEngine.softDeletePages
+   * JSDoc. Parity implementation with PostgresEngine.softDeletePages:
+   * deletePages' shape (empty-array early-return, batch-size throw,
+   * RETURNING slug) with softDeletePage's `deleted_at IS NULL` idempotency
+   * predicate. Nothing cascades — the 72h purge phase owns the eventual
+   * hard delete. PGLite binds `slug = ANY($1)` array params natively
+   * (deletePages already proves this).
+   */
+  async softDeletePages(slugs: string[], opts: { sourceId: string }): Promise<string[]> {
+    if (slugs.length === 0) return [];
+    if (slugs.length > DELETE_BATCH_SIZE) {
+      throw new Error(
+        `softDeletePages: input size ${slugs.length} exceeds DELETE_BATCH_SIZE=${DELETE_BATCH_SIZE}. Caller must chunk.`,
+      );
+    }
+    const { rows } = await this.db.query<{ slug: string }>(
+      'UPDATE pages SET deleted_at = now() WHERE slug = ANY($1::text[]) AND source_id = $2 AND deleted_at IS NULL RETURNING slug',
+      [slugs, opts.sourceId],
+    );
+    return rows.map(r => r.slug);
   }
 
   async restorePage(slug: string, opts?: { sourceId?: string }): Promise<boolean> {
@@ -2486,6 +2514,10 @@ export class PGLiteEngine implements BrainEngine {
         const fallbackParams = [...params];
         fallbackParams[0] = orQuery;
         ({ rows } = await this.db.query(keywordSql, fallbackParams));
+        // 2026-09 (#3617 follow-up): relaxed rows are TAGGED so hybrid's
+        // fusion can demote them — an OR-of-common-terms match must not
+        // outvote a healthy vector arm (SearchResult.keyword_relaxed doc).
+        return (rows as Record<string, unknown>[]).map((r) => ({ ...rowToSearchResult(r), keyword_relaxed: true as const }));
       }
     }
 
@@ -2564,7 +2596,8 @@ export class PGLiteEngine implements BrainEngine {
     // chunkless pages retrievable (the extreme D1 case: a title with no
     // body) with the alias-hop row shape (chunk_id 0, empty chunk_text).
     // Accepted limitations (Reviewer F5/F6): the synthetic chunkless row
-    // inherits the compiled-truth RRF boost and dedups on empty chunk_text;
+    // dedups on empty chunk_text (fusion's compiledTruthBoost skips it since
+    // #3695 — chunk_id 0 + empty chunk_text never gains chunk authority);
     // and detail='low' filters only the REPRESENTATIVE — pages without a
     // compiled_truth chunk still surface (unlike the keyword arm's filter).
     const titlesSql =
@@ -2602,6 +2635,9 @@ export class PGLiteEngine implements BrainEngine {
         const fallbackParams = [...params];
         fallbackParams[0] = boundWebsearchQuery(orQuery);
         ({ rows } = await this.db.query(titlesSql, fallbackParams));
+        // 2026-09 (#3617 follow-up): same relaxed-row tagging as the keyword
+        // arm — see SearchResult.keyword_relaxed.
+        return (rows as Record<string, unknown>[]).map((r) => ({ ...rowToSearchResult(r), keyword_relaxed: true as const }));
       }
     }
     return (rows as Record<string, unknown>[]).map(rowToSearchResult);
@@ -4170,6 +4206,13 @@ export class PGLiteEngine implements BrainEngine {
     slug: string,
     opts?: { depth?: number; linkType?: string; direction?: 'in' | 'out' | 'both'; sourceId?: string; sourceIds?: string[] },
   ): Promise<GraphPath[]> {
+    return (await this.traversePathsDetailed(slug, opts)).paths;
+  }
+
+  async traversePathsDetailed(
+    slug: string,
+    opts?: { depth?: number; linkType?: string; direction?: 'in' | 'out' | 'both'; sourceId?: string; sourceIds?: string[] },
+  ): Promise<{ paths: GraphPath[]; truncated: boolean }> {
     const depth = opts?.depth ?? 5;
     const direction = opts?.direction ?? 'out';
     const linkType = opts?.linkType ?? null;
@@ -4231,6 +4274,7 @@ export class PGLiteEngine implements BrainEngine {
           ${linkTypeWhere}
           ${stepScope}
         ORDER BY depth, from_slug, to_slug
+        LIMIT ${TRAVERSE_PATH_ROW_CAP + 1}
       `;
     } else if (direction === 'in') {
       sql = `
@@ -4258,6 +4302,7 @@ export class PGLiteEngine implements BrainEngine {
           ${linkTypeWhere}
           ${stepScope}
         ORDER BY depth, from_slug, to_slug
+        LIMIT ${TRAVERSE_PATH_ROW_CAP + 1}
       `;
     } else {
       // both: walk in both directions, emit every traversed edge (preserving its
@@ -4290,14 +4335,19 @@ export class PGLiteEngine implements BrainEngine {
           ${pfScope}
           ${ptScope}
         ORDER BY depth, from_slug, to_slug
+        LIMIT ${TRAVERSE_PATH_ROW_CAP + 1}
       `;
     }
 
     const { rows } = await this.db.query(sql, params);
+    // Row cap: the LIMIT above fetched CAP + 1 rows; the probe row only tells
+    // us the walk overflowed and is dropped with everything past the cap.
+    const truncated = rows.length > TRAVERSE_PATH_ROW_CAP;
+    const bounded = (truncated ? rows.slice(0, TRAVERSE_PATH_ROW_CAP) : rows) as Record<string, unknown>[];
     // Dedup edges (same from/to/type/depth can appear via multiple visited paths).
     const seen = new Set<string>();
     const result: GraphPath[] = [];
-    for (const r of rows as Record<string, unknown>[]) {
+    for (const r of bounded) {
       const key = `${r.from_slug}|${r.to_slug}|${r.link_type}|${r.depth}`;
       if (seen.has(key)) continue;
       seen.add(key);
@@ -4309,7 +4359,7 @@ export class PGLiteEngine implements BrainEngine {
         depth: r.depth as number,
       });
     }
-    return result;
+    return { paths: result, truncated };
   }
 
   async relationalFanout(
@@ -4576,7 +4626,7 @@ export class PGLiteEngine implements BrainEngine {
     sourceId?: string;
     sourceIds?: string[];
     mode?: 'inbound' | 'islanded';
-  }): Promise<Array<{ slug: string; title: string; domain: string | null }>> {
+  }): Promise<Array<{ slug: string; title: string; domain: string | null; type?: string | null; quarantined?: boolean }>> {
     // Soft-delete filter on BOTH sides:
     //   - candidate: p.deleted_at IS NULL — soft-deleted pages aren't orphan candidates
     //   - link source: src.deleted_at IS NULL — links FROM soft-deleted pages don't count as inbound
@@ -4615,7 +4665,9 @@ export class PGLiteEngine implements BrainEngine {
       `SELECT
          p.slug,
          COALESCE(p.title, p.slug) AS title,
-         p.frontmatter->>'domain' AS domain
+         p.frontmatter->>'domain' AS domain,
+         p.type,
+         (NOT ${QUARANTINE_FILTER_FRAGMENT}) AS quarantined
        FROM pages p
        WHERE p.deleted_at IS NULL
          ${sourceFilter}
@@ -4630,7 +4682,7 @@ export class PGLiteEngine implements BrainEngine {
        ORDER BY p.slug`,
       params
     );
-    return rows as Array<{ slug: string; title: string; domain: string | null }>;
+    return rows as Array<{ slug: string; title: string; domain: string | null; type?: string | null; quarantined?: boolean }>;
   }
 
   // Tags
@@ -5206,7 +5258,8 @@ export class PGLiteEngine implements BrainEngine {
               score, content_type, segments, entities, model, triage_version
        FROM dream_verdicts
        WHERE file_path = $1 AND content_hash = $2
-         AND expires_at > now()`,
+         -- NULL = pre-TTL row in the #4657 bootstrap window; a miss here re-judges the corpus
+         AND (expires_at IS NULL OR expires_at > now())`,
       [filePath, contentHash]
     );
     if (result.rows.length === 0) return null;
@@ -5590,26 +5643,42 @@ export class PGLiteEngine implements BrainEngine {
   }
 
   // Stats + health
-  async getStats(): Promise<BrainStats> {
+  async getStats(opts?: { sourceId?: string; sourceIds?: string[] }): Promise<BrainStats> {
+    // #4592: optional source scope — parity with postgres-engine.getStats.
+    // Bound as $1 (NEVER interpolated: remote callers influence the value).
+    const scope: string[] | null = opts?.sourceIds ?? (opts?.sourceId ? [opts.sourceId] : null);
     // S2: embedded_count keys on the registry-ACTIVE column (fallback to
     // legacy on a broken registry — diagnostics never crash).
     const colId = await this.activeEmbeddingColId({ fallbackToLegacy: true });
     const { rows: [stats] } = await this.db.query(`
       SELECT
         -- v0.26.5: exclude soft-deleted from page_count (mirrors postgres-engine).
-        (SELECT count(*) FROM pages WHERE deleted_at IS NULL) as page_count,
-        (SELECT count(*) FROM content_chunks) as chunk_count,
+        (SELECT count(*) FROM pages p WHERE p.deleted_at IS NULL
+           AND ($1::text[] IS NULL OR p.source_id = ANY($1))) as page_count,
+        (SELECT count(*) FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
+          WHERE ($1::text[] IS NULL OR p.source_id = ANY($1))) as chunk_count,
         -- Keyed on the stored VECTOR, not embedded_at (parity with
         -- postgres-engine): a schema rebuild NULLs every vector without
         -- touching embedded_at.
-        (SELECT count(*) FROM content_chunks WHERE ${colId} IS NOT NULL) as embedded_count,
-        (SELECT count(*) FROM links) as link_count,
-        (SELECT count(DISTINCT tag) FROM tags) as tag_count,
-        (SELECT count(*) FROM timeline_entries) as timeline_entry_count
-    `);
+        (SELECT count(*) FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
+          WHERE cc.${colId} IS NOT NULL
+            AND ($1::text[] IS NULL OR p.source_id = ANY($1))) as embedded_count,
+        -- EXISTS (not JOIN) so a legacy dead link still counts unscoped.
+        (SELECT count(*) FROM links l
+          WHERE ($1::text[] IS NULL
+             OR (EXISTS (SELECT 1 FROM pages pf WHERE pf.id = l.from_page_id AND pf.source_id = ANY($1))
+                 AND EXISTS (SELECT 1 FROM pages pt WHERE pt.id = l.to_page_id AND pt.source_id = ANY($1))))) as link_count,
+        (SELECT count(DISTINCT t.tag) FROM tags t JOIN pages p ON p.id = t.page_id
+          WHERE ($1::text[] IS NULL OR p.source_id = ANY($1))) as tag_count,
+        (SELECT count(*) FROM timeline_entries te JOIN pages p ON p.id = te.page_id
+          WHERE ($1::text[] IS NULL OR p.source_id = ANY($1))) as timeline_entry_count
+    `, [scope]);
 
     const { rows: types } = await this.db.query(
-      `SELECT type, count(*)::int as count FROM pages WHERE deleted_at IS NULL GROUP BY type ORDER BY count DESC`
+      `SELECT type, count(*)::int as count FROM pages p WHERE p.deleted_at IS NULL
+         AND ($1::text[] IS NULL OR p.source_id = ANY($1))
+       GROUP BY type ORDER BY count DESC`,
+      [scope]
     );
     const pages_by_type: Record<string, number> = {};
     for (const t of types as { type: string; count: number }[]) {
@@ -5628,7 +5697,7 @@ export class PGLiteEngine implements BrainEngine {
     };
   }
 
-  async getHealth(): Promise<BrainHealth> {
+  async getHealth(opts?: { sourceId?: string; sourceIds?: string[] }): Promise<BrainHealth> {
     // Combined metrics from master (brain_score components: dead_links, link_count,
     // pages_with_timeline) and v0.10.3 graph layer (link_coverage, timeline_coverage,
     // most_connected). Both coexist: master's brain_score is the composite
@@ -5638,13 +5707,27 @@ export class PGLiteEngine implements BrainEngine {
     // Chunk/link counts stay raw (storage until the purge phase), matching
     // getStats, and destructive-removal counts elsewhere deliberately stay raw.
     // S2: coverage + missing_embeddings key on the registry-ACTIVE column.
+    // #4592: optional source scope — parity with postgres-engine.getHealth
+    // (bound as $1, never interpolated; both-endpoint rule for link-derived
+    // numbers; out-of-scope endpoints can't rescue a page from orphan-hood).
+    const scope: string[] | null = opts?.sourceIds ?? (opts?.sourceId ? [opts.sourceId] : null);
     const colId = await this.activeEmbeddingColId({ fallbackToLegacy: true });
     const { rows: [h] } = await this.db.query(`
-      WITH entity_pages AS (
-        SELECT id, slug FROM pages WHERE type IN ('entity', 'person', 'company') AND deleted_at IS NULL
+      WITH scoped_pages AS (
+        SELECT id, slug, frontmatter, deleted_at, source_id FROM pages p
+        WHERE ($1::text[] IS NULL OR p.source_id = ANY($1))
+      ),
+      entity_pages AS (
+        -- #4280: quarantined entity shells are not served memory — keep them
+        -- out of the link/timeline coverage denominators (parity with
+        -- onboard's VISIBLE_ENTITY_PREDICATE).
+        SELECT id, slug FROM scoped_pages WHERE id IN (
+          SELECT id FROM pages WHERE type IN ('entity', 'person', 'company') AND deleted_at IS NULL
+            AND ${quarantineFilterFragment('pages')}
+        )
       )
       SELECT
-        (SELECT count(*) FROM pages WHERE deleted_at IS NULL) as page_count,
+        (SELECT count(*) FROM scoped_pages WHERE deleted_at IS NULL) as page_count,
         -- Parity with postgres-engine: stored-VECTOR truth over ELIGIBLE
         -- chunks (embedding, not embedded_at; embed_skip excluded from BOTH
         -- sides; zero eligible = vacuous 100%).
@@ -5656,13 +5739,15 @@ export class PGLiteEngine implements BrainEngine {
               / count(*) FILTER (WHERE NOT jsonb_exists(COALESCE(p.frontmatter, '{}'::jsonb), 'embed_skip'))::float
          END
          FROM content_chunks cc
-         JOIN pages p ON p.id = cc.page_id) as embed_coverage,
+         JOIN scoped_pages p ON p.id = cc.page_id) as embed_coverage,
         0 as stale_pages,
         -- Bug 11 — orphan = islanded (no inbound AND no outbound). The raw
         -- list is filtered in TS using the shared orphan-reporting policy.
         0 as orphan_pages,
         (SELECT count(*) FROM links l
          WHERE NOT EXISTS (SELECT 1 FROM pages p WHERE p.id = l.to_page_id)
+           AND ($1::text[] IS NULL
+                OR EXISTS (SELECT 1 FROM scoped_pages sp WHERE sp.id = l.from_page_id))
         ) as dead_links,
         -- Parity with postgres-engine.ts: same predicate as
         -- buildStaleChunkWhere / countStaleChunks, i.e. what 'embed --stale'
@@ -5670,11 +5755,14 @@ export class PGLiteEngine implements BrainEngine {
         -- be non-NULL while embedding is NULL) and embed_skip excluded, so the
         -- count can reach zero and the embed.stale remediation can converge.
         (SELECT count(*) FROM content_chunks cc
-           JOIN pages p ON p.id = cc.page_id
+           JOIN scoped_pages p ON p.id = cc.page_id
           WHERE cc.${colId} IS NULL
             AND NOT jsonb_exists(COALESCE(p.frontmatter, '{}'::jsonb), 'embed_skip')
         ) as missing_embeddings,
-        (SELECT count(*) FROM links) as link_count,
+        (SELECT count(*) FROM links l
+          WHERE ($1::text[] IS NULL
+             OR (EXISTS (SELECT 1 FROM scoped_pages sp WHERE sp.id = l.from_page_id)
+                 AND EXISTS (SELECT 1 FROM scoped_pages sp WHERE sp.id = l.to_page_id)))) as link_count,
         (SELECT count(*) FROM entity_pages) as entity_page_count,
         -- gbrain#4153 consistency: an inbound link counts toward coverage
         -- only when its SOURCE page is live — the same endpoint-liveness rule
@@ -5683,23 +5771,34 @@ export class PGLiteEngine implements BrainEngine {
         -- AND islanded in one payload.
         (SELECT count(*) FROM entity_pages e
          WHERE EXISTS (SELECT 1 FROM links l
-                       JOIN pages src ON src.id = l.from_page_id
+                       JOIN scoped_pages src ON src.id = l.from_page_id
                        WHERE l.to_page_id = e.id AND src.deleted_at IS NULL))::float /
           GREATEST((SELECT count(*) FROM entity_pages), 1)::float as link_coverage,
         (SELECT count(*) FROM entity_pages e
          WHERE EXISTS (SELECT 1 FROM timeline_entries te WHERE te.page_id = e.id))::float /
           GREATEST((SELECT count(*) FROM entity_pages), 1)::float as timeline_coverage
-    `);
+    `, [scope]);
 
     // Top 5 most connected entities by total link count (in + out).
+    // X8 (#4592): a degree counts an edge only when its FAR endpoint is in
+    // scope too — parity with postgres-engine's rule and comment.
     const { rows: connected } = await this.db.query(`
       SELECT p.slug,
-             (SELECT count(*) FROM links l WHERE l.from_page_id = p.id OR l.to_page_id = p.id)::int as link_count
+             (SELECT count(*) FROM links l
+               WHERE (l.from_page_id = p.id
+                      AND ($1::text[] IS NULL
+                           OR EXISTS (SELECT 1 FROM pages fp WHERE fp.id = l.to_page_id AND fp.source_id = ANY($1))))
+                  OR (l.to_page_id = p.id
+                      AND ($1::text[] IS NULL
+                           OR EXISTS (SELECT 1 FROM pages fp WHERE fp.id = l.from_page_id AND fp.source_id = ANY($1))))
+             )::int as link_count
       FROM pages p
       WHERE p.type IN ('entity', 'person', 'company') AND p.deleted_at IS NULL
+        AND ${QUARANTINE_FILTER_FRAGMENT}
+        AND ($1::text[] IS NULL OR p.source_id = ANY($1))
       ORDER BY link_count DESC
       LIMIT 5
-    `);
+    `, [scope]);
 
     // Per-page flags for the linkable scope: orphan_pages and the
     // no-orphans / timeline-coverage DENOMINATORS are all computed over
@@ -5715,26 +5814,40 @@ export class PGLiteEngine implements BrainEngine {
     // TARGET is live. Without this, get_health's orphan_pages disagreed with
     // `gbrain orphans` whenever a soft-deleted page still linked to (or was
     // linked from) a live one.
+    // #4592: out-of-scope endpoints cannot rescue a page from orphan-hood.
+    // #4280: quarantined pages drop out of the linkable scope in SQL;
+    // machine leaf types (atom/conversation/source) drop out through the
+    // shared policy below via p.type.
     const { rows: pageScopeRows } = await this.db.query(`
-      SELECT p.slug,
+      SELECT p.slug, p.type,
              (NOT EXISTS (SELECT 1 FROM links l
                           JOIN pages src ON src.id = l.from_page_id
-                          WHERE l.to_page_id = p.id AND src.deleted_at IS NULL)
+                          WHERE l.to_page_id = p.id AND src.deleted_at IS NULL
+                            AND ($1::text[] IS NULL OR src.source_id = ANY($1)))
               AND NOT EXISTS (SELECT 1 FROM links l
                           JOIN pages tgt ON tgt.id = l.to_page_id
-                          WHERE l.from_page_id = p.id AND tgt.deleted_at IS NULL)) as islanded,
+                          WHERE l.from_page_id = p.id AND tgt.deleted_at IS NULL
+                            AND ($1::text[] IS NULL OR tgt.source_id = ANY($1)))) as islanded,
              EXISTS (SELECT 1 FROM timeline_entries te WHERE te.page_id = p.id) as has_timeline
       FROM pages p
       WHERE p.deleted_at IS NULL
-    `);
+        AND ${QUARANTINE_FILTER_FRAGMENT}
+        AND ($1::text[] IS NULL OR p.source_id = ANY($1))
+    `, [scope]);
 
     const r = h as Record<string, unknown>;
     const pageCount = Number(r.page_count);
     const embedCoverage = Number(r.embed_coverage);
-    const stalePages = await this.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS });
+    // Scoped: sum the scalar-sourceId counter per grant (parity with
+    // postgres-engine; the unmatchable __all__ scalar fail-closes to 0).
+    const stalePages = scope === null
+      ? await this.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS })
+      : (await Promise.all(scope.map(sid =>
+          this.countStalePagesForExtraction({ sourceId: sid, versionTs: LINK_EXTRACTOR_VERSION_TS }),
+        ))).reduce((a, b) => a + b, 0);
     const orphanOverrides = await loadOrphanPolicyOverrides(this);
-    const linkablePages = (pageScopeRows as { slug: string; islanded: boolean; has_timeline: boolean }[])
-      .filter(row => !shouldExcludeFromOrphanReporting(row.slug, orphanOverrides));
+    const linkablePages = (pageScopeRows as { slug: string; type: string; islanded: boolean; has_timeline: boolean }[])
+      .filter(row => !shouldExcludeFromOrphanReporting(row.slug, orphanOverrides, { type: row.type }));
     const linkablePageCount = linkablePages.length;
     const orphanPages = linkablePages.filter(row => row.islanded).length;
     const linkableTimelinePages = linkablePages.filter(row => row.has_timeline).length;
@@ -5846,10 +5959,17 @@ export class PGLiteEngine implements BrainEngine {
     slug: string,
     sourceOrSources: string | readonly string[],
   ): Promise<string> {
+    return (await this.resolveSlugWithAliasDetailed(slug, sourceOrSources))?.canonical_slug ?? slug;
+  }
+
+  async resolveSlugWithAliasDetailed(
+    slug: string,
+    sourceOrSources: string | readonly string[],
+  ): Promise<{ canonical_slug: string; source_id: string } | null> {
     const sources = Array.isArray(sourceOrSources)
       ? [...sourceOrSources]
       : [sourceOrSources as string];
-    if (sources.length === 0) return slug;
+    if (sources.length === 0) return null;
     try {
       // PGLite supports `= ANY($N::text[])` per pgvector / postgres semantics.
       // ORDER BY array_position pins the federated-read precedence so the
@@ -5863,7 +5983,7 @@ export class PGLiteEngine implements BrainEngine {
          ORDER BY id`,
         [slug, ...sources],
       );
-      if (rows.length === 0) return slug;
+      if (rows.length === 0) return null;
       if (rows.length > 1) {
         warnOncePerProcess(
           `resolveSlugWithAlias:multi_match:${slug}`,
@@ -5876,9 +5996,9 @@ export class PGLiteEngine implements BrainEngine {
         order: sources.indexOf((r as { source_id: string }).source_id),
       }));
       indexedRows.sort((a, b) => a.order - b.order);
-      return indexedRows[0].canonical_slug ?? slug;
+      return { canonical_slug: indexedRows[0].canonical_slug, source_id: indexedRows[0].source_id };
     } catch (e) {
-      if (isUndefinedTableError(e)) return slug;
+      if (isUndefinedTableError(e)) return null;
       throw e;
     }
   }

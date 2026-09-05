@@ -10,15 +10,14 @@
  *   gbrain check-backlinks fix --dry-run                  # preview fixes
  */
 
-import { readFileSync, readdirSync, lstatSync, existsSync } from 'fs';
-import { join, relative, basename, resolve, dirname, isAbsolute, sep } from 'path';
+import { readFileSync, readdirSync, statSync, lstatSync, existsSync } from 'fs';
+import { join, relative, basename } from 'path';
 import { extractEntityRefs as canonicalExtractEntityRefs } from '../core/link-extraction.ts';
 import { createProgress, startHeartbeat } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
-import { parseMarkdown, frontmatterBodyOffset } from '../core/markdown.ts';
+import { parseMarkdown, frontmatterBodyOffset, findTimelineSplitIndex } from '../core/markdown.ts';
 import { atomicWriteFileSync } from '../core/atomic-write.ts';
 import { withPageLock } from '../core/page-lock.ts';
-import { isPathContained } from '../core/path-confine.ts';
 
 export interface BacklinkGap {
   /** The page that mentions the entity */
@@ -77,8 +76,8 @@ export function hasBacklink(targetContent: string, sourceFilename: string): bool
   return targetContent.includes(sourceFilename);
 }
 
-/** Build a timeline back-link entry */
-export function buildBacklinkEntry(sourceTitle: string, sourcePath: string, date: string): string {
+/** Build an undated back-link entry without inventing event chronology. */
+export function buildBacklinkEntry(sourceTitle: string, sourcePath: string): string {
   // #1776: dir-shaped sources get an extension-less link (the brain-slug
   // convention the canonical extractor parses, so a freshly-written row is
   // credited by the next check pass instead of re-flagged). Root-level
@@ -88,144 +87,51 @@ export function buildBacklinkEntry(sourceTitle: string, sourcePath: string, date
   // non-idempotent (duplicate rows on every run).
   const bare = sourcePath.replace(/^(?:\.\.\/)+/, '');
   const linkPath = bare.includes('/') ? sourcePath.replace(/\.md$/, '') : sourcePath;
-  return `- **${date}** | Referenced in [${sourceTitle}](${linkPath})`;
-}
-
-/**
- * Reject traversal and every symlink component before a backlinks read/write.
- * `isPathContained` realpaths both sides; the lstat walk additionally rejects
- * symlinks that happen to resolve back inside the brain.
- */
-function isSafeExistingBrainFile(filePath: string, brainDir: string): boolean {
-  const root = resolve(brainDir);
-  const file = resolve(filePath);
-  const rel = relative(root, file);
-  if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return false;
-
-  let cursor = file;
-  while (true) {
-    try {
-      if (lstatSync(cursor).isSymbolicLink()) return false;
-    } catch {
-      return false;
-    }
-    if (cursor === root) break;
-    const parent = dirname(cursor);
-    if (parent === cursor) return false;
-    cursor = parent;
-  }
-  return isPathContained(file, root);
-}
-
-const PEOPLE_COMPANY_MARKDOWN_REF_RE = /\]\((?:\.\.\/)*(?:people|companies)\//;
-const PEOPLE_COMPANY_WIKILINK_RE = /\[\[(?:[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?:)?(?:people|companies)\//;
-
-function mayContainPeopleCompanyRef(content: string): boolean {
-  return PEOPLE_COMPANY_MARKDOWN_REF_RE.test(content) || PEOPLE_COMPANY_WIKILINK_RE.test(content);
+  return `- Referenced in [${sourceTitle}](${linkPath})`;
 }
 
 /** Scan a brain directory for back-link gaps */
 export function findBacklinkGaps(brainDir: string): BacklinkGap[] {
   const gaps: BacklinkGap[] = [];
 
-  // Walk lazily. The previous implementation retained the complete Markdown
-  // corpus plus extracted copies for the duration of the scan. On large brains
-  // that amplified an 0.82 GiB corpus into ~10 GiB RSS and starved the Minion
-  // lease-renewal loop. Only people/company pages can be backlink targets, so
-  // retain that small target index and stream every possible source page.
-  function* walk(dir: string): Generator<{ path: string; relPath: string }> {
+  // Collect all markdown files
+  const allPages: { path: string; relPath: string; content: string }[] = [];
+  function walk(dir: string) {
     for (const entry of readdirSync(dir)) {
       if (entry.startsWith('.')) continue;
       const full = join(dir, entry);
-      let stat;
-      try {
-        stat = lstatSync(full);
-      } catch {
-        continue;
-      }
-      if (stat.isSymbolicLink()) continue;
-      if (stat.isDirectory()) {
-        yield* walk(full);
+      if (lstatSync(full).isDirectory()) {
+        walk(full);
       } else if (entry.endsWith('.md') && !entry.startsWith('_')) {
-        yield { path: full, relPath: relative(brainDir, full) };
+        const relPath = relative(brainDir, full);
+        try {
+          allPages.push({ path: full, relPath, content: readFileSync(full, 'utf-8') });
+        } catch { /* skip unreadable */ }
       }
     }
   }
+  walk(brainDir);
 
-  // #1776: index only target paths. Target contents are loaded through a
-  // bounded LRU below so a large people/companies directory cannot recreate
-  // the whole-corpus retention bug.
-  const targetPathsBySlug = new Map<string, string>();
-  for (const page of walk(brainDir)) {
-    const slug = page.relPath.replace(/\.md$/, '');
-    if (!slug.startsWith('people/') && !slug.startsWith('companies/')) continue;
-    if (!isSafeExistingBrainFile(page.path, brainDir)) continue;
-    targetPathsBySlug.set(slug, page.path);
+  // Build a lookup of existing pages by directory/slug. #1776: extract each
+  // page's canonical refs ONCE here — they feed both the gap candidates
+  // (people/companies projection) and the backlink-credit slug set, so
+  // extension-less convention links ([Alice](../people/alice),
+  // [[people/alice]]) count as backlinks even though the legacy
+  // `<basename>.md` substring check can't see them.
+  const pagesBySlug = new Map<string, { path: string; content: string }>();
+  const refsByRelPath = new Map<string, { name: string; slug: string; dir: string }[]>();
+  const outgoingSlugsBySlug = new Map<string, Set<string>>();
+  for (const page of allPages) {
+    const slug = page.relPath.replace('.md', '');
+    pagesBySlug.set(slug, { path: page.path, content: page.content });
+    const canonical = canonicalExtractEntityRefs(page.content);
+    refsByRelPath.set(page.relPath, canonical);
+    outgoingSlugsBySlug.set(slug, new Set(canonical.map(r => r.slug)));
   }
 
-  type TargetSnapshot = { content: string; outgoingSlugs: Set<string>; estimatedBytes: number };
-  const targetCache = new Map<string, TargetSnapshot>();
-  const targetCacheMaxBytes = 8 * 1024 * 1024;
-  let targetCacheBytes = 0;
-  let targetCacheEvictionsSinceGc = 0;
-
-  function loadTarget(slug: string): TargetSnapshot | undefined {
-    const cached = targetCache.get(slug);
-    if (cached) {
-      targetCache.delete(slug);
-      targetCache.set(slug, cached);
-      return cached;
-    }
-    const path = targetPathsBySlug.get(slug);
-    if (!path || !isSafeExistingBrainFile(path, brainDir)) return undefined;
-    try {
-      const content = readFileSync(path, 'utf-8');
-      if (!isSafeExistingBrainFile(path, brainDir)) return undefined;
-      const outgoingSlugs = new Set(canonicalExtractEntityRefs(content).map(r => r.slug));
-      const snapshot = {
-        content,
-        outgoingSlugs,
-        estimatedBytes: content.length * 2 + outgoingSlugs.size * 128,
-      };
-      if (snapshot.estimatedBytes <= targetCacheMaxBytes) {
-        while (targetCacheBytes + snapshot.estimatedBytes > targetCacheMaxBytes && targetCache.size > 0) {
-          const oldestSlug = targetCache.keys().next().value as string;
-          const oldest = targetCache.get(oldestSlug)!;
-          targetCache.delete(oldestSlug);
-          targetCacheBytes -= oldest.estimatedBytes;
-          targetCacheEvictionsSinceGc++;
-        }
-        targetCache.set(slug, snapshot);
-        targetCacheBytes += snapshot.estimatedBytes;
-        // Bun's allocator otherwise keeps evicted multi-MiB strings at its
-        // high-water mark until the scan ends. Only force a collection after
-        // sustained cache pressure; normal brains never enter this branch.
-        if (targetCacheEvictionsSinceGc >= 16) {
-          Bun.gc(false);
-          targetCacheEvictionsSinceGc = 0;
-        }
-      }
-      return snapshot;
-    } catch {
-      return undefined;
-    }
-  }
-
-  // For each page, check entity references, then release its content and all
-  // extraction intermediates before reading the next page.
-  for (const page of walk(brainDir)) {
-    if (!isSafeExistingBrainFile(page.path, brainDir)) continue;
-    let content: string;
-    try {
-      content = readFileSync(page.path, 'utf-8');
-    } catch {
-      continue;
-    }
-    // Canonical people/company refs always contain the directory segment.
-    // Avoid the extractor's full-size masking copies for raw/session pages
-    // that cannot possibly contribute a target candidate.
-    if (!mayContainPeopleCompanyRef(content)) continue;
-    const refs = projectPeopleCompaniesRefs(canonicalExtractEntityRefs(content));
+  // For each page, check entity references
+  for (const page of allPages) {
+    const refs = projectPeopleCompaniesRefs(refsByRelPath.get(page.relPath) ?? []);
     const sourceFilename = basename(page.relPath);
     const sourceSlug = page.relPath.replace(/\.md$/, '');
     // LOCAL PATCH (paolo, 2026-05-12): dedupe (source, target) pairs within
@@ -242,7 +148,7 @@ export function findBacklinkGaps(brainDir: string): BacklinkGap[] {
       const targetSlug = `${ref.dir}/${ref.slug}`;
       if (seen.has(targetSlug)) continue;
       seen.add(targetSlug);
-      const target = loadTarget(targetSlug);
+      const target = pagesBySlug.get(targetSlug);
       if (!target) continue; // target page doesn't exist
 
       // Check if the target already has a back-link to this source page.
@@ -251,12 +157,12 @@ export function findBacklinkGaps(brainDir: string): BacklinkGap[] {
       // outgoing refs containing the source slug (extension-less
       // convention links and wikilinks the substring check misses).
       if (hasBacklink(target.content, sourceFilename)) continue;
-      if (target.outgoingSlugs.has(sourceSlug)) continue;
+      if (outgoingSlugsBySlug.get(targetSlug)?.has(sourceSlug)) continue;
       gaps.push({
         sourcePage: page.relPath,
         targetPage: targetSlug + '.md',
         entityName: ref.name,
-        sourceTitle: extractPageTitle(content),
+        sourceTitle: extractPageTitle(page.content),
       });
     }
   }
@@ -288,37 +194,54 @@ function firstEditBlockingError(content: string, filePath: string): string | nul
 }
 
 /**
- * Insert a timeline entry into the body of `content`, never touching bytes
- * before `bodyStart`. The `## Timeline` heading is matched only as a real
- * heading line at/after bodyStart (CRLF-tolerant), so a `## Timeline` string
- * inside YAML frontmatter, a `### Timeline` sub-heading, or a
- * `## Timeline (2026)` variant never anchors the insertion. With multiple real
- * headings, the FIRST one wins deterministically (post-validation guards the
- * result either way). Exported for direct unit tests.
+ * Insert an undated back-link into a dedicated `## Referenced by` section,
+ * never touching bytes before `bodyStart` and never inserting into the
+ * timeline region. Existing timeline sentinels take precedence over bare
+ * `## Timeline` / `## History` headings.
  */
-export function insertTimelineEntry(content: string, bodyStart: number, entry: string): string {
+export function insertBacklinkEntry(content: string, bodyStart: number, entry: string): string {
   const bodySlice = content.slice(bodyStart);
-  const headingMatch = /^## Timeline[ \t]*\r?$/m.exec(bodySlice);
-
-  if (!headingMatch) {
-    // No real Timeline heading in the body — append a fresh section.
-    return content.trimEnd() + '\n\n## Timeline\n\n' + entry + '\n';
+  const lines = bodySlice.split('\n');
+  const splitIndex = findTimelineSplitIndex(lines);
+  let timelineStart = content.length;
+  if (splitIndex >= 0) {
+    timelineStart = bodyStart;
+    for (let i = 0; i < splitIndex; i++) timelineStart += lines[i].length + 1;
+  } else {
+    const bareTimeline = /^## (?:Timeline|History)[ \t]*\r?$/im.exec(bodySlice);
+    if (bareTimeline) timelineStart = bodyStart + bareTimeline.index;
   }
 
-  const headingAbs = bodyStart + headingMatch.index;
-  const headingLineEnd = content.indexOf('\n', headingAbs);
-  const sectionStart = headingLineEnd === -1 ? content.length : headingLineEnd + 1;
+  const beforeTimeline = content.slice(bodyStart, timelineStart);
+  const headingMatch = /^## Referenced by[ \t]*\r?$/im.exec(beforeTimeline);
+  const eol = bodySlice.includes('\r\n') ? '\r\n' : '\n';
 
-  const nextHeading = /^## /m.exec(content.slice(sectionStart));
-  if (nextHeading) {
-    const insertAt = sectionStart + nextHeading.index;
-    return content.slice(0, insertAt) + entry + '\n' + content.slice(insertAt);
+  if (headingMatch) {
+    const headingAbs = bodyStart + headingMatch.index;
+    const headingLineEnd = content.indexOf('\n', headingAbs);
+    const sectionStart = headingLineEnd === -1 ? content.length : headingLineEnd + 1;
+    const nextHeading = /^##\s+\S/m.exec(content.slice(sectionStart, timelineStart));
+    const sectionEnd = nextHeading ? sectionStart + nextHeading.index : timelineStart;
+    const suffix = content.slice(sectionEnd);
+    const updatedSection = content.slice(0, sectionEnd).trimEnd() + eol + entry + eol;
+    return suffix ? updatedSection + eol + suffix : updatedSection;
   }
-  return content.trimEnd() + '\n' + entry + '\n';
+
+  const prefix = content.slice(0, timelineStart).trimEnd();
+  const suffix = content.slice(timelineStart);
+  const section = `${prefix}${prefix ? eol + eol : ''}## Referenced by${eol}${eol}${entry}${eol}`;
+  return suffix ? section + eol + suffix : section;
 }
 
 /**
- * Fix back-link gaps by inserting timeline entries into target pages.
+ * @deprecated Compat alias whose name predates the undated 'Referenced by'
+ * behavior (entries are no longer dated timeline lines). Kept for downstream
+ * imports; new code uses insertBacklinkEntry.
+ */
+export const insertTimelineEntry = insertBacklinkEntry;
+
+/**
+ * Fix back-link gaps by inserting undated entries into target pages.
  *
  * Safety pipeline per target file (each failure isolates to that file and is
  * reported in `skipped` — one bad page can't kill the batch or corrupt itself):
@@ -333,7 +256,6 @@ export async function fixBacklinkGaps(
   dryRun: boolean = false,
   opts?: { lockRoot?: string },
 ): Promise<BacklinkFixOutcome> {
-  const today = new Date().toISOString().slice(0, 10);
   const outcome: BacklinkFixOutcome = { fixed: 0, skipped: [] };
 
   // Group gaps by target page to batch writes
@@ -347,32 +269,11 @@ export async function fixBacklinkGaps(
   for (const [targetPage, targetGaps] of byTarget) {
     const targetPath = join(brainDir, targetPage);
     if (!existsSync(targetPath)) continue;
-    if (!isSafeExistingBrainFile(targetPath, brainDir)) {
-      outcome.skipped.push({
-        page: targetPage,
-        reason: 'unsafe target path (traversal or symlink) — file left untouched',
-      });
-      continue;
-    }
 
     const lockKey = targetPage.replace(/\.md$/, '');
     try {
       await withPageLock(lockKey, async () => {
-        if (!isSafeExistingBrainFile(targetPath, brainDir)) {
-          outcome.skipped.push({
-            page: targetPage,
-            reason: 'unsafe target path after lock acquisition — file left untouched',
-          });
-          return;
-        }
         let content = readFileSync(targetPath, 'utf-8');
-        if (!isSafeExistingBrainFile(targetPath, brainDir)) {
-          outcome.skipped.push({
-            page: targetPage,
-            reason: 'target path changed while reading — file left untouched',
-          });
-          return;
-        }
 
         const preError = firstEditBlockingError(content, targetPath);
         if (preError) {
@@ -384,29 +285,18 @@ export async function fixBacklinkGaps(
         }
 
         const bodyStart = frontmatterBodyOffset(content);
-        const creditedSourceSlugs = new Set(canonicalExtractEntityRefs(content).map(ref => ref.slug));
         let inserted = 0;
         for (const gap of targetGaps) {
-          const sourceFilename = basename(gap.sourcePage);
-          const sourceSlug = gap.sourcePage.replace(/\.md$/, '');
-          // The scan and fix can be separated by minutes on a live brain.
-          // Re-check under the target lock so a concurrently-added backlink is
-          // never duplicated from a stale gap list.
-          if (hasBacklink(content, sourceFilename) || creditedSourceSlugs.has(sourceSlug)) continue;
-
           // Compute relative path from target to source
           const targetDir = targetPage.split('/').slice(0, -1);
           const depth = targetDir.length;
           const relPrefix = '../'.repeat(depth);
           const relPath = relPrefix + gap.sourcePage;
 
-          const entry = buildBacklinkEntry(gap.sourceTitle, relPath, today);
-          content = insertTimelineEntry(content, bodyStart, entry);
-          creditedSourceSlugs.add(sourceSlug);
+          const entry = buildBacklinkEntry(gap.sourceTitle, relPath);
+          content = insertBacklinkEntry(content, bodyStart, entry);
           inserted++;
         }
-
-        if (inserted === 0) return;
 
         const postError = firstEditBlockingError(content, targetPath);
         if (postError) {
@@ -418,13 +308,6 @@ export async function fixBacklinkGaps(
         }
 
         if (!dryRun) {
-          if (!isSafeExistingBrainFile(targetPath, brainDir)) {
-            outcome.skipped.push({
-              page: targetPage,
-              reason: 'target path changed before write — file left untouched',
-            });
-            return;
-          }
           atomicWriteFileSync(targetPath, content, {
             verify: (onDisk) => {
               const diskError = firstEditBlockingError(onDisk, targetPath);

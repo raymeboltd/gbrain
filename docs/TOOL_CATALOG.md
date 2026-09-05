@@ -4,14 +4,14 @@
 <!-- Regenerate: bun run scripts/generate-tool-catalog.ts -->
 <!-- Freshness-guarded by scripts/check-tool-catalog-fresh.sh (bun run verify). -->
 
-Every non-localOnly operation on the MCP surface: 121 tools across 23 areas. **Starter** marks membership in the ~27-op `starter` surface (`src/mcp/surface.ts`); **Gate** names the config key that must be true before remote callers see/call the op (`gbrain config set <key> true`). What a given token actually sees is further filtered per request by scope, bound-client fence, publish gates, and the per-client surface — see `docs/operations/mcp-surface-runbook.md`. Area names are non-contractual groupings.
+Every non-localOnly operation on the MCP surface: 122 tools across 23 areas. **Starter** marks membership in the ~27-op `starter` surface (`src/mcp/surface.ts`); **Gate** names the config key that must be true before remote callers see/call the op (`gbrain config set <key> true`). What a given token actually sees is further filtered per request by scope, bound-client fence, publish gates, and the per-client surface — see `docs/operations/mcp-surface-runbook.md`. Area names are non-contractual groupings.
 
 ## admin
 
 | Tool | Description | Scope | Starter | Gate |
 |---|---|---|---|---|
-| `get_health` | Brain health dashboard (embed coverage, stale pages, orphans). | admin |  |  |
-| `get_stats` | Brain statistics (page count, chunk count, etc.) | admin |  |  |
+| `get_health` | Brain health dashboard (embed coverage, stale pages, orphans) — remote callers see counters confined to their source grant. | admin |  |  |
+| `get_stats` | Brain statistics (page count, chunk count, etc.) — remote callers see counters confined to their source grant. | admin |  |  |
 | `get_status_snapshot` | Snapshot for `gbrain status` thin-client mode: sync freshness + last cycle + queue depths + worker liveness. | admin |  |  |
 | `get_usage` | Aggregate chat usage + cost from the chat_usage_log ledger (per-model and per-phase token counts, cache reads/writes, USD estimates) with explicit coverage fields. | admin |  |  |
 | `quarantine_list` | List quarantined (hidden) and optionally content-flagged pages by scanning page frontmatter, newest-updated first. | admin |  |  |
@@ -64,7 +64,7 @@ Every non-localOnly operation on the MCP surface: 121 tools across 23 areas. **S
 
 | Tool | Description | Scope | Starter | Gate |
 |---|---|---|---|---|
-| `get_brain_identity` | Brain identity + counters for thin-client banner. | read |  |  |
+| `get_brain_identity` | Brain identity + counters for thin-client banner — remote callers see counters confined to their source grant. | read |  |  |
 | `whoami` | Introspect the calling identity. | read | yes |  |
 
 ## ingest
@@ -122,13 +122,14 @@ Every non-localOnly operation on the MCP surface: 121 tools across 23 areas. **S
 |---|---|---|---|---|
 | `loops_close` | Close an open loop by id: status 'done' (handled) or 'dropped' (not going to). | write |  |  |
 | `loops_mute` | Suppress a sender (email address) or thread id from opening NEW loops — the detector feedback primitive behind "never track this sender". | write |  |  |
+| `loops_unmute` | Remove a sender/thread suppression added by loops_mute, so the detector can open NEW loops for it again. | write |  |  |
 | `open_loops` | The open-loop engine's killer output: who is waiting on you, what you promised, and the context needed to respond. | read |  |  |
 
 ## memory
 
 | Tool | Description | Scope | Starter | Gate |
 |---|---|---|---|---|
-| `extract_facts` | v0.31: extract personal-knowledge facts (events, preferences, commitments, beliefs) from a conversation turn into the per-source hot memory. | write |  |  |
+| `extract_facts` | v0.31: extract personal-knowledge facts (events, preferences, commitments, beliefs, ideas, and plain facts) from a conversation turn into the per-source hot memory. | write |  |  |
 | `forget_fact` | v0.32.2: forget a fact. | write |  |  |
 
 ## memory-verbs
@@ -164,7 +165,7 @@ Every non-localOnly operation on the MCP surface: 121 tools across 23 areas. **S
 | `get_raw_data` | Retrieve raw data for a page | read |  |  |
 | `get_versions` | Page version history | read |  |  |
 | `list_pages` | List pages with optional filters. | read | yes |  |
-| `put_page` | Write/update a page (markdown with frontmatter). | write | yes |  |
+| `put_page` | Write or replace a page (markdown with frontmatter). | write | yes |  |
 | `put_raw_data` | Store raw API response data for a page | write |  |  |
 | `resolve_slugs` | Fuzzy-resolve a partial slug to matching page slugs | read | yes |  |
 | `restore_page` | v0.26.5 — restore a soft-deleted page (clear deleted_at). | write |  |  |
@@ -192,7 +193,7 @@ Every non-localOnly operation on the MCP surface: 121 tools across 23 areas. **S
 | `query` | Hybrid search with vector + keyword + multi-query expansion. | read | yes |  |
 | `search` | Cheap hybrid search (vector + keyword + RRF) with no LLM expansion. | read | yes |  |
 | `search_by_image` | v0.36 cross-modal Phase 2: image-as-query retrieval. | read |  |  |
-| `search_modes` | Read-only search-mode dashboard: active mode, per-knob resolved value with attribution (mode default vs config override), and the three frozen bundles. | read |  |  |
+| `search_modes` | Read-only search-mode dashboard: active mode, EVERY mode-bundle knob resolved with attribution (mode default vs config override), the three frozen bundles, and a reranker_readiness verdict (whether the resolved reranker will actually run; remote callers get the verdict without the host key inventory). | read |  |  |
 | `search_stats` | Search observability over a window: cache hit rate, intent/mode mix, budget drops, rank-1 score drift, graph-signals failure counts. | admin |  |  |
 | `search_tune` | Read-only tuning recommendations derived from the last 7 days of search telemetry: what should change, why, and the paste-ready config command per recommendation — relay them to the user. | admin |  |  |
 

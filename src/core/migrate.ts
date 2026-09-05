@@ -6553,6 +6553,27 @@ export const MIGRATIONS: Migration[] = [
       );
     `,
   },
+  // Upstream v0.48.2 used v145 for this migration. This fork already has a
+  // durable source-event v145, so the compatible merge applies the same,
+  // idempotent facts CHECK repair at v149 instead of reusing a recorded id.
+  {
+    version: 149,
+    name: 'upstream_facts_kind_idea_alter',
+    idempotent: true,
+    sql: `
+      DO $$ BEGIN
+        IF EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conname = 'facts_kind_check'
+            AND conrelid = 'facts'::regclass
+        ) THEN
+          ALTER TABLE facts DROP CONSTRAINT facts_kind_check;
+        END IF;
+        ALTER TABLE facts ADD CONSTRAINT facts_kind_check
+          CHECK (kind IN ('event','preference','commitment','belief','fact','idea'));
+      END $$;
+    `,
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

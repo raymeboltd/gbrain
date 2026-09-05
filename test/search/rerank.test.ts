@@ -11,7 +11,15 @@
  *  - rerankerFn test seam used over gateway.rerank
  */
 
-import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
+import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from 'bun:test';
+import { __setSunsetClockForTests } from '../../src/core/ai/gateway.ts';
+
+// Pin a pre-sunset clock: the auth-audit test below reaches the REAL
+// gateway.rerank with zerank-2; past ZEROENTROPY_SUNSET_DATE the short-circuit
+// would fire before the missing-key check and flip the audited reason from
+// 'auth' to 'sunset_short_circuit' — a deterministic wall-clock time bomb.
+beforeEach(() => __setSunsetClockForTests(() => new Date('2026-09-01T00:00:00Z')));
+afterEach(() => __setSunsetClockForTests(null));
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -166,11 +174,14 @@ describe('applyReranker — fail-open on every RerankError reason', () => {
     expect(out).toEqual(results);
   });
 
-  test('missing gateway reranker API key fail-opens and audits auth', async () => {
-    const { configureGateway } = await import('../../src/core/ai/gateway.ts');
+  test('missing gateway reranker API key fail-opens and audits ONE no_key row (v0.48.2)', async () => {
+    const { configureGateway, _resetSunsetWarningsForTest } = await import('../../src/core/ai/gateway.ts');
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gbrain-rerank-search-'));
     try {
       await withEnv({ GBRAIN_AUDIT_DIR: tmpDir }, async () => {
+        // The no_key row is once-per-process-per-model — clear the memo so
+        // this test observes the write regardless of file order.
+        _resetSunsetWarningsForTest();
         configureGateway({
           reranker_model: 'zeroentropyai:zerank-2',
           env: {},
@@ -187,7 +198,7 @@ describe('applyReranker — fail-open on every RerankError reason', () => {
         expect(out).toEqual(results);
         const failures = readRecentRerankFailures(1);
         expect(failures).toHaveLength(1);
-        expect(failures[0]!.reason).toBe('auth');
+        expect(failures[0]!.reason).toBe('no_key');
         expect(failures[0]!.error_summary).toContain('ZEROENTROPY_API_KEY');
       });
     } finally {
@@ -242,15 +253,147 @@ describe('applyReranker — fail-open on every RerankError reason', () => {
   });
 
   test('fail-open on malformed reranker response (empty results array)', async () => {
-    const results = [makeResult('a', 1.0, 'a')];
-    const opts: RerankerOpts = {
-      enabled: true,
-      topNIn: 1,
-      topNOut: null,
-      rerankerFn: async () => [],
-    };
-    const out = await applyReranker('q', results, opts);
-    expect(out).toEqual(results);
+    // #4648: this pass-through now writes an audit row — scope it to a
+    // tmpdir so the default audit dir stays clean for sibling tests.
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gbrain-rerank-failopen-'));
+    try {
+      await withEnv({ GBRAIN_AUDIT_DIR: tmpDir }, async () => {
+        const results = [makeResult('a', 1.0, 'a')];
+        const opts: RerankerOpts = {
+          enabled: true,
+          topNIn: 1,
+          topNOut: null,
+          rerankerFn: async () => [],
+        };
+        const out = await applyReranker('q', results, opts);
+        expect(out).toEqual(results);
+      });
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('applyReranker — #4648 success-shaped pass-throughs leave a trace', () => {
+  test('empty result set for a non-empty batch: audit row (empty_result_set) + onPassThrough + unchanged results', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gbrain-rerank-empty-'));
+    try {
+      await withEnv({ GBRAIN_AUDIT_DIR: tmpDir }, async () => {
+        const results = [makeResult('a', 1.0, 'doc a'), makeResult('b', 0.5, 'doc b')];
+        const seen: string[] = [];
+        const out = await applyReranker('q', results, {
+          enabled: true,
+          topNIn: 2,
+          topNOut: null,
+          model: 'acmecorp:rerank-x',
+          // HTTP 200 `{"results":[]}` — a legal answer at least one
+          // OpenAI-shaped endpoint gives; previously the unaudited path.
+          rerankerFn: async () => [],
+          onPassThrough: (reason) => { seen.push(reason); },
+        });
+        expect(out).toEqual(results);
+        expect(seen).toEqual(['empty_result_set']);
+        const failures = readRecentRerankFailures(1);
+        expect(failures).toHaveLength(1);
+        expect(failures[0]!.reason).toBe('empty_result_set');
+        expect(failures[0]!.doc_count).toBe(2);
+        expect(failures[0]!.error_summary).toContain('unreranked');
+      });
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test('non-array result shape: audit row (malformed_shape) + onPassThrough + unchanged results', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gbrain-rerank-malformed-'));
+    try {
+      await withEnv({ GBRAIN_AUDIT_DIR: tmpDir }, async () => {
+        const results = [makeResult('a', 1.0, 'doc a')];
+        const seen: string[] = [];
+        const out = await applyReranker('q', results, {
+          enabled: true,
+          topNIn: 1,
+          topNOut: null,
+          rerankerFn: async () => (null as unknown as RerankResult[]),
+          onPassThrough: (reason) => { seen.push(reason); },
+        });
+        expect(out).toEqual(results);
+        expect(seen).toEqual(['malformed_shape']);
+        const failures = readRecentRerankFailures(1);
+        expect(failures).toHaveLength(1);
+        expect(failures[0]!.reason).toBe('malformed_shape');
+      });
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test('stderr note fires once per process per reason (warnOncePerProcess)', async () => {
+    const { _resetWarnOnceForTests } = await import('../../src/core/utils.ts');
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gbrain-rerank-once-'));
+    const warnings: string[] = [];
+    const origWarn = console.warn;
+    console.warn = ((...args: unknown[]) => { warnings.push(args.map(String).join(' ')); }) as typeof console.warn;
+    try {
+      _resetWarnOnceForTests();
+      await withEnv({ GBRAIN_AUDIT_DIR: tmpDir }, async () => {
+        const opts: RerankerOpts = {
+          enabled: true,
+          topNIn: 1,
+          topNOut: null,
+          rerankerFn: async () => [],
+        };
+        await applyReranker('q1', [makeResult('a', 1.0, 'a')], opts);
+        await applyReranker('q2', [makeResult('b', 1.0, 'b')], opts);
+      });
+      const passThroughNotes = warnings.filter((w) => w.includes('passed through in RRF order'));
+      expect(passThroughNotes).toHaveLength(1);
+    } finally {
+      console.warn = origWarn;
+      _resetWarnOnceForTests();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test('a throwing onPassThrough never breaks search', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gbrain-rerank-throwcb-'));
+    try {
+      await withEnv({ GBRAIN_AUDIT_DIR: tmpDir }, async () => {
+        const results = [makeResult('a', 1.0, 'doc a')];
+        const out = await applyReranker('q', results, {
+          enabled: true,
+          topNIn: 1,
+          topNOut: null,
+          rerankerFn: async () => [],
+          onPassThrough: () => { throw new Error('meta stamping bug'); },
+        });
+        expect(out).toEqual(results);
+      });
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test('enabled=false pass-through stays silent (no audit row, no callback — "off" is not "died")', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gbrain-rerank-off-'));
+    try {
+      await withEnv({ GBRAIN_AUDIT_DIR: tmpDir }, async () => {
+        const results = [makeResult('a', 1.0, 'doc a')];
+        const seen: string[] = [];
+        const out = await applyReranker('q', results, {
+          enabled: false,
+          topNIn: 1,
+          topNOut: null,
+          rerankerFn: async () => [],
+          onPassThrough: (reason) => { seen.push(reason); },
+        });
+        expect(out).toEqual(results);
+        expect(seen).toEqual([]);
+        expect(readRecentRerankFailures(1)).toHaveLength(0);
+      });
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 });
 

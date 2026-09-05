@@ -111,7 +111,7 @@ function stripPrivacyFencesForRemoteReader(page: Page): Page {
 
 const get_page: Operation = {
   name: 'get_page',
-  description: 'Read a page by slug (supports optional fuzzy matching). To edit a page, pass include_content: true — the returned `content` field is the canonical full markdown (frontmatter + body + timeline sentinel); edit THAT and pass it back to put_page to round-trip losslessly. Reassembling compiled_truth/timeline by hand risks dropping sections. Soft-deleted pages are hidden by default; pass include_deleted: true to surface them with deleted_at populated (see v0.26.5 recovery window).',
+  description: 'Read a page by slug (supports optional fuzzy matching). Slug aliases left by renames redirect to the canonical page in the source that owns the alias (archived sources excluded); a redirected read reports `resolved_slug`. To edit a page, pass include_content: true — the returned `content` field is the canonical full markdown (frontmatter + body + timeline sentinel); edit THAT and pass it back to put_page to round-trip losslessly. Reassembling compiled_truth/timeline by hand risks dropping sections. Soft-deleted pages are hidden by default; pass include_deleted: true to surface them with deleted_at populated (see v0.26.5 recovery window).',
   params: {
     slug: { type: 'string', required: true, description: 'Page slug' },
     fuzzy: { type: 'boolean', description: 'Enable fuzzy slug resolution (default: false)' },
@@ -149,6 +149,42 @@ const get_page: Operation = {
     let page = await ctx.engine.getPage(slug, { includeDeleted, ...sourceOpts });
     if (page && excludePrivate && isPrivatePage(page.frontmatter)) page = null;
     let resolved_slug: string | undefined;
+
+    // #4275: slug aliases are redirects — dedup/migration retires a slug and
+    // registers alias → canonical. Search and the wikilink resolver already
+    // follow them (resolveSlugWithAlias documents get_page as a consumer);
+    // the direct exact read 404ing on a retired slug made the surfaces
+    // disagree. Resolution runs ONLY on an exact-read miss, so a live page at
+    // the requested slug (or, with include_deleted, its recoverable shell —
+    // restore workflows need the shell, not a redirect) always wins, and it
+    // runs BEFORE fuzzy (the alias table is authoritative; fuzzy is a guess).
+    // Scope: federated grants consult only granted sources' alias rows, so an
+    // out-of-grant alias behaves exactly like a missing page; a scalar scope
+    // consults that source (the remote '__all__' literal matches no real
+    // source and fail-closes); the trusted UNSCOPED read consults every LIVE
+    // source (archived sources are excluded everywhere else in the ladder; their
+    // alias rows count only when include_deleted asks for retired material).
+    // The canonical is then read in the source that OWNS the alias row: a
+    // federated getPage prefers the anchor source, so an unrelated live page at
+    // the canonical slug in another granted source would otherwise shadow it.
+    // No catch here: a pre-v104 brain (no slug_aliases table) is the ENGINE's
+    // contract to absorb (resolveSlugWithAliasDetailed → null); anything else
+    // (connection reset, timeout) must surface, not degrade to page_not_found.
+    if (!page) {
+      const aliasScope: string | readonly string[] = sourceOpts.sourceIds?.length
+        ? sourceOpts.sourceIds
+        : sourceOpts.sourceId !== undefined
+          ? sourceOpts.sourceId
+          : (await ctx.engine.listAllSources({ includeArchived: includeDeleted })).map(s => s.id);
+      const hit = await ctx.engine.resolveSlugWithAliasDetailed(slug, aliasScope);
+      if (hit) {
+        const aliasPage = await ctx.engine.getPage(hit.canonical_slug, { includeDeleted, sourceId: hit.source_id });
+        if (aliasPage && !(excludePrivate && isPrivatePage(aliasPage.frontmatter))) {
+          page = aliasPage;
+          resolved_slug = hit.canonical_slug;
+        }
+      }
+    }
 
     if (!page && fuzzy) {
       let candidates = await ctx.engine.resolveSlugs(slug, fuzzyScope);
@@ -324,10 +360,10 @@ const fetch_page: Operation = {
 
 const put_page: Operation = {
   name: 'put_page',
-  description: 'Write/update a page (markdown with frontmatter). Chunks, embeds, reconciles tags, and (when auto_link/auto_timeline are enabled) extracts + reconciles graph links and timeline entries. Remote (MCP) callers: body wikilinks are NOT reconciled into the graph — auto_link/auto_timeline are skipped for untrusted writers (response reports auto_links: {skipped: "remote"}); use local capture/put_page for link extraction. For large content on Windows (pipe-buffer limit ~45KB) or any file-as-input workflow, use `gbrain capture --file PATH --slug SLUG` — capture reads the file as a Buffer with a binary-NUL guard and adds provenance write-through (v0.39.3.0).',
+  description: 'Write or replace a page (markdown with frontmatter). REPLACES the entire page; this is not a partial edit. Before modifying an existing page, read its canonical content with `get_page include_content:true`, then submit the complete page. Chunks, embeds, reconciles tags, and (when auto_link/auto_timeline are enabled) extracts + reconciles graph links and timeline entries. Remote (MCP) callers: body wikilinks are NOT reconciled into the graph — auto_link/auto_timeline are skipped for untrusted writers (response reports auto_links: {skipped: "remote"}); use local capture/put_page for link extraction. For large content on Windows (pipe-buffer limit ~45KB) or any file-as-input workflow, use `gbrain capture --file PATH --slug SLUG` — capture reads the file as a Buffer with a binary-NUL guard and adds provenance write-through (v0.39.3.0).',
   params: {
     slug: { type: 'string', required: true, description: 'Page slug' },
-    content: { type: 'string', required: true, description: 'Full markdown content with YAML frontmatter' },
+    content: { type: 'string', required: true, description: 'Complete markdown content with YAML frontmatter. REPLACES the entire page; this is not a partial edit. Read the canonical page first with `get_page include_content:true` before modifying it.' },
     allow_empty: { type: 'boolean', required: false, description: 'Allow overwriting an existing non-empty page with empty/whitespace-only content (default: false). Without it, put_page rejects the empty overwrite — the empty-stdin failure class.' },
     // v0.39.3.0 provenance write-through (WARN-8 + A1 + CV6). Optional fields
     // for trusted local callers (capture CLI, autopilot, dream cycle). Remote
@@ -343,6 +379,7 @@ const put_page: Operation = {
   scope: 'write',
   handler: async (ctx, p) => {
     const slug = p.slug as string;
+    validatePageSlug(slug);
 
     // v0.39.3.0 CV6 trust gate for provenance write-through (WARN-8).
     // Only trusted LOCAL callers (ctx.remote === false — capture CLI,
@@ -1372,7 +1409,7 @@ const capture: Operation = {
   params: {
     content: { type: 'string', required: true, description: 'Markdown or plain text to capture. File paths are NOT accepted over MCP — read the file yourself and pass its content (the CLI --file lane is local-only).' },
     slug: { type: 'string', required: false, description: "Target slug. Default: inbox/YYYY-MM-DD-<sha8-of-content> (stable per content — recapturing identical text hits the same slug); type diary/event routes under life/. Fenced clients: the default lands under your first bound prefix." },
-    type: { type: 'string', required: false, description: "Page type for the stamped frontmatter (default 'note')." },
+    type: { type: 'string', required: false, description: "Page type for the stamped frontmatter. Omitted: the content's frontmatter `type:` when present, else 'note'. An explicit type (this param or a frontmatter `type:`) must be declared by the active schema pack; undeclared types are rejected before writing, naming the declared vocabulary." },
   },
   scope: 'write',
   mutating: true,
@@ -1383,7 +1420,7 @@ const capture: Operation = {
   handler: async (ctx, p) => {
     const {
       detectBinaryNullByte, normalizeForHash, mergeCaptureFrontmatter,
-      defaultSlug,
+      defaultSlug, explicitCaptureType,
     } = await import('../capture-content.ts');
     const { computeContentHash } = await import('../ingestion/types.ts');
     const content = p.content as string;
@@ -1397,7 +1434,26 @@ const capture: Operation = {
     if (normalized.length === 0) {
       throw new OperationError('invalid_params', 'Refusing to capture empty content.');
     }
-    const type = typeof p.type === 'string' && p.type.length > 0 ? p.type : 'note';
+    // #4655: fail-loud rejection of an EXPLICIT undeclared page type (the
+    // `type` param or a frontmatter `type:` in the content) BEFORE writing,
+    // naming the declared vocabulary so agents can self-correct. Best-effort:
+    // no resolvable pack → no check; the default-'note' path is never checked.
+    // The validated explicit type IS the effective type (else 'note') for both
+    // the default slug and the merge below — approved as X, stored as X.
+    const explicitType = explicitCaptureType(content, typeof p.type === 'string' && p.type.length > 0 ? p.type : undefined);
+    if (explicitType) {
+      const { loadActivePackForWriteVocabulary, packDeclaresPageType, undeclaredPageTypeMessage, undeclaredPageTypeSuggestion } =
+        await import('../schema-pack/write-vocabulary.ts');
+      const activePack = await loadActivePackForWriteVocabulary(ctx);
+      if (activePack && !packDeclaresPageType(activePack, explicitType)) {
+        throw new OperationError(
+          'invalid_params',
+          undeclaredPageTypeMessage(explicitType, activePack, 'capture'),
+          undeclaredPageTypeSuggestion(activePack),
+        );
+      }
+    }
+    const type = explicitType ?? 'note';
     let slug = typeof p.slug === 'string' && p.slug.length > 0 ? p.slug : undefined;
     if (slug) {
       // Defense-in-depth on the caller-supplied slug (matches the takes ops);

@@ -43,7 +43,11 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
-import { BudgetTracker, BudgetExhausted } from '../budget/budget-tracker.ts';
+import {
+  BudgetTracker,
+  BudgetExhausted,
+  loadPricingOverrides,
+} from '../budget/budget-tracker.ts';
 import { withBudgetTracker } from '../ai/gateway.ts';
 import { listSources } from '../sources-ops.ts';
 import {
@@ -182,6 +186,7 @@ export async function runPhaseConversationFactsBackfill(
   opts: ConversationFactsBackfillPhaseOpts = {},
 ): Promise<ConversationFactsBackfillPhaseResult> {
   const cfg = await loadCfg(engine);
+  const pricingOverrides = await loadPricingOverrides(engine);
 
   if (!cfg.enabled) {
     if (!opts.once) {
@@ -286,6 +291,7 @@ export async function runPhaseConversationFactsBackfill(
         maxCostUsd: perSourceCapUsd,
         maxRuntimeMs: perSourceWallMs,
         label: `conversation_facts_backfill:${src.id}`,
+        pricingOverrides,
       });
 
       // Per-source deadline signal. The tracker's maxRuntimeMs fires at LLM

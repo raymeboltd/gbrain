@@ -11,57 +11,57 @@
  * every test that imports shouldExclude/deriveDomain/formatOrphansText).
  * Testing against real calls is honest and mock-leak-free.
  *
+ * Cost model: ONE engine per file (beforeAll + afterAll disconnect,
+ * resetPgliteState per test) and ONE build-once git fixture
+ * (fixture.reset() per test = git clean -fdx + reset --hard). No test
+ * here commits to the repo and runCycle never auto-commits, so reset()
+ * needs no commit rewind; untracked artifacts a phase drops into the
+ * repo are cleaned per test. The fixture's empty initial commit keeps
+ * rev-parse HEAD working; the tree stays empty so lint/backlinks have
+ * nothing to scan → status=clean.
+ *
  * What this test file does NOT cover: the exhaustive dryRun-×-phases-×-
  * lock matrix, which test/core/cycle.test.ts handles (in isolation).
  * Here we only verify that dream.ts routes args correctly.
  */
 
-import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test';
+import { describe, test, expect, beforeAll, afterAll, beforeEach, spyOn } from 'bun:test';
 import { mkdtempSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { execSync } from 'child_process';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { resetPgliteState } from './helpers/reset-pglite.ts';
+import { makeGitFixture, type GitFixture } from './helpers/git-fixture.ts';
 import { runDream } from '../src/commands/dream.ts';
+import { ALL_PHASES, SOURCE_FRESHNESS_PHASES } from '../src/core/cycle.ts';
 
-// ─── Helpers ───────────────────────────────────────────────────────
+// ─── Shared fixtures (built once; reset per test) ──────────────────
 
-/** Make an empty, engine-backed PGLite brain. */
-async function makePGLite() {
-  const engine = new PGLiteEngine();
+let engine: PGLiteEngine;
+let fixture: GitFixture;
+let repo: string;
+
+beforeAll(async () => {
+  engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
-  return engine;
-}
+  repo = mkdtempSync(join(tmpdir(), 'gbrain-dream-repo-'));
+  fixture = await makeGitFixture(repo);
+}, 300_000); // OAuth v25 + git init; needs breathing room under full-suite + parallel-agent load
 
-/** Make an empty git repo. Lint/backlinks have nothing to scan → status=clean. */
-function makeGitRepo(): string {
-  const dir = mkdtempSync(join(tmpdir(), 'gbrain-dream-repo-'));
-  execSync('git init', { cwd: dir, stdio: 'pipe' });
-  execSync('git config user.email t@t.co', { cwd: dir, stdio: 'pipe' });
-  execSync('git config user.name t', { cwd: dir, stdio: 'pipe' });
-  // Commit an empty .gitkeep so rev-parse HEAD succeeds.
-  require('fs').writeFileSync(join(dir, '.gitkeep'), '');
-  execSync('git add -A && git commit -m init', { cwd: dir, stdio: 'pipe' });
-  return dir;
-}
+afterAll(async () => {
+  await engine.disconnect();
+  rmSync(repo, { recursive: true, force: true });
+}, 300_000);
+
+beforeEach(async () => {
+  await resetPgliteState(engine);
+  fixture.reset();
+}, 300_000);
 
 // ─── brainDir resolution ───────────────────────────────────────────
 
 describe('runDream — brainDir resolution', () => {
-  let repo: string;
-  let engine: InstanceType<typeof PGLiteEngine>;
-
-  beforeEach(async () => {
-    repo = makeGitRepo();
-    engine = await makePGLite();
-  }, 300_000); // OAuth v25 + git init; needs breathing room under full-suite + parallel-agent load
-
-  afterEach(async () => {
-    if (engine) await engine.disconnect();
-    rmSync(repo, { recursive: true, force: true });
-  }, 300_000);
-
   test('explicit --dir takes precedence over engine config', async () => {
     await engine.setConfig('sync.repo_path', '/configured/dir');
     const report = await runDream(engine, ['--dir', repo, '--json']);
@@ -106,19 +106,6 @@ describe('runDream — brainDir resolution', () => {
 // ─── Phase selection (single-phase runs stay fast) ─────────────────
 
 describe('runDream — --phase <name> restricts the cycle', () => {
-  let repo: string;
-  let engine: InstanceType<typeof PGLiteEngine>;
-
-  beforeEach(async () => {
-    repo = makeGitRepo();
-    engine = await makePGLite();
-  }, 300_000); // OAuth v25 + git init; needs breathing room under full-suite + parallel-agent load
-
-  afterEach(async () => {
-    if (engine) await engine.disconnect();
-    rmSync(repo, { recursive: true, force: true });
-  }, 300_000);
-
   test('--phase lint produces a report with exactly one phase = lint', async () => {
     const report = await runDream(engine, ['--dir', repo, '--phase', 'lint', '--json']);
     expect(report).toBeTruthy();
@@ -218,19 +205,6 @@ describe('runDream — --phase <name> restricts the cycle', () => {
 // ─── --once (issue #2860) ───────────────────────────────────────────
 
 describe('runDream — --once (issue #2860)', () => {
-  let repo: string;
-  let engine: InstanceType<typeof PGLiteEngine>;
-
-  beforeEach(async () => {
-    repo = makeGitRepo();
-    engine = await makePGLite();
-  }, 300_000);
-
-  afterEach(async () => {
-    if (engine) await engine.disconnect();
-    rmSync(repo, { recursive: true, force: true });
-  }, 300_000);
-
   test('bare --once (no --phase) exits 2 with a usage hint', async () => {
     const exitSpy = spyOn(process, 'exit').mockImplementation(() => { throw new Error('EXIT'); });
     const errSpy = spyOn(console, 'error').mockImplementation(() => {});
@@ -331,19 +305,6 @@ describe('runDream — --once (issue #2860)', () => {
 // ─── Output format ─────────────────────────────────────────────────
 
 describe('runDream — output format', () => {
-  let repo: string;
-  let engine: InstanceType<typeof PGLiteEngine>;
-
-  beforeEach(async () => {
-    repo = makeGitRepo();
-    engine = await makePGLite();
-  }, 300_000); // OAuth v25 + git init; needs breathing room under full-suite + parallel-agent load
-
-  afterEach(async () => {
-    if (engine) await engine.disconnect();
-    rmSync(repo, { recursive: true, force: true });
-  }, 300_000);
-
   test('--json emits parsable CycleReport JSON with schema_version', async () => {
     const lines: string[] = [];
     const logSpy = spyOn(console, 'log').mockImplementation((msg: string) => { lines.push(String(msg)); });
@@ -396,19 +357,6 @@ describe('runDream — output format', () => {
 // ─── Dry-run propagation ───────────────────────────────────────────
 
 describe('runDream — dry-run propagates through to runCycle', () => {
-  let repo: string;
-  let engine: InstanceType<typeof PGLiteEngine>;
-
-  beforeEach(async () => {
-    repo = makeGitRepo();
-    engine = await makePGLite();
-  }, 300_000); // OAuth v25 + git init; needs breathing room under full-suite + parallel-agent load
-
-  afterEach(async () => {
-    if (engine) await engine.disconnect();
-    rmSync(repo, { recursive: true, force: true });
-  }, 300_000);
-
   test('--dry-run produces a report where no DB-mutating work happened', async () => {
     // Before: empty pages table.
     const { rows: before } = await (engine as any).db.query('SELECT COUNT(*)::int AS n FROM pages');
@@ -425,19 +373,6 @@ describe('runDream — dry-run propagates through to runCycle', () => {
 // ─── Exit-code semantics ───────────────────────────────────────────
 
 describe('runDream — exit-code semantics', () => {
-  let repo: string;
-  let engine: InstanceType<typeof PGLiteEngine>;
-
-  beforeEach(async () => {
-    repo = makeGitRepo();
-    engine = await makePGLite();
-  }, 300_000); // OAuth v25 + git init; needs breathing room under full-suite + parallel-agent load
-
-  afterEach(async () => {
-    if (engine) await engine.disconnect();
-    rmSync(repo, { recursive: true, force: true });
-  }, 300_000);
-
   test('clean/ok/partial statuses do not call process.exit', async () => {
     const spy = spyOn(process, 'exit').mockImplementation(() => { throw new Error('UNEXPECTED_EXIT'); });
     await runDream(engine, ['--dir', repo, '--phase', 'lint', '--json']);
@@ -460,9 +395,6 @@ describe('runDream — exit-code semantics', () => {
 //   - back-compat regression: bare `gbrain dream` writes no per-source stamp
 
 describe('runDream — --source / --source-id (v0.41.13)', () => {
-  let repo: string;
-  let engine: InstanceType<typeof PGLiteEngine>;
-
   async function seedSource(id: string, archived: boolean = false): Promise<void> {
     await engine.executeRaw(
       `INSERT INTO sources (id, name, local_path, config, archived, created_at)
@@ -480,15 +412,16 @@ describe('runDream — --source / --source-id (v0.41.13)', () => {
     return typeof raw === 'string' ? raw : null;
   }
 
-  beforeEach(async () => {
-    repo = makeGitRepo();
-    engine = await makePGLite();
-  }, 300_000);
+  function phaseByName(report: any, name: string): any {
+    return report?.phases?.find((p: any) => p.phase === name);
+  }
 
-  afterEach(async () => {
-    if (engine) await engine.disconnect();
-    rmSync(repo, { recursive: true, force: true });
-  }, 300_000);
+  function expectNoImplicitSourceExclusions(report: any): void {
+    expect(report?.phases.map((p: any) => p.phase)).toEqual(ALL_PHASES);
+    for (const p of report.phases) {
+      expect(p.details?.reason).not.toBe('excluded_from_implicit_source_cycle');
+    }
+  }
 
   // ─── parseArgs: --source missing / conflict / repetition ────────────
 
@@ -600,9 +533,13 @@ describe('runDream — --source / --source-id (v0.41.13)', () => {
     } catch (e: any) {
       thrown = e.message;
     }
-    // New contract: resolver throws the actionable error (central catch
-    // prints + verdict 1); accept either the throw or the legacy exit path.
-    const errOut = errSpy.mock.calls.flat().join(' ') + ' ' + thrown;
+    // Review fix: assertSourceExists now says "not found or is archived." —
+    // dream's isResolverUserError must match BOTH wordings (like
+    // code-callers/code-callees) so the resolver's user error surfaces as a
+    // clean stderr line + exit 1, never a propagated stack trace.
+    expect(thrown).toBe('EXIT');
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    const errOut = errSpy.mock.calls.flat().join(' ');
     expect(errOut).toMatch(/Source "no-such-source" not found/);
     expect(errOut).toMatch(/gbrain sources list/);
     exitSpy.mockRestore();
@@ -676,6 +613,100 @@ describe('runDream — --source / --source-id (v0.41.13)', () => {
     expect(await readLastFullCycleAt('beta')).toBeNull();
   }, 300_000);
 
+  // ─── #4700: bare dream against a default-like source runs the FULL cycle ─
+
+  test('bare dream runs the full cycle for a non-default sources.default target (#4700)', async () => {
+    await seedSource('primary');
+    await engine.setConfig('sources.default', 'primary');
+    await engine.setConfig('sync.repo_path', repo);
+
+    const report = await runDream(engine, ['--dry-run', '--json']);
+    expect(report).toBeTruthy();
+    expectNoImplicitSourceExclusions(report);
+  }, 300_000);
+
+  test('bare dream runs the full cycle for the sole non-default source (#4700)', async () => {
+    await seedSource('solo');
+    await engine.setConfig('sync.repo_path', repo);
+
+    const report = await runDream(engine, ['--dry-run', '--json']);
+    expect(report).toBeTruthy();
+    expectNoImplicitSourceExclusions(report);
+  }, 300_000);
+
+  test('bare dream survives a stale sources.default: warns and falls back to the sole non-default source (#4700 review fix)', async () => {
+    await seedSource('solo');
+    // sources.default points at a source that no longer exists (deleted or
+    // never restored) — the tier-5 fail-open posture treats it as absent.
+    await engine.setConfig('sources.default', 'ghost-gone');
+    await engine.setConfig('sync.repo_path', repo);
+
+    const errSpy = spyOn(console, 'error').mockImplementation(() => {});
+    let report: any;
+    let errOut = '';
+    try {
+      report = await runDream(engine, ['--dry-run', '--json']);
+      errOut = errSpy.mock.calls.flat().join(' ');
+    } finally {
+      errSpy.mockRestore();
+    }
+    expect(report).toBeTruthy();
+    expectNoImplicitSourceExclusions(report); // fell back to 'solo' as the implicit default
+    expect(errOut).toMatch(/ghost-gone/);
+    expect(errOut).toMatch(/sources\.default/);
+  }, 300_000);
+
+  test('explicit --source remains a freshness-only source cycle even when it is sources.default', async () => {
+    await seedSource('primary');
+    await engine.setConfig('sources.default', 'primary');
+
+    const report = await runDream(engine, ['--source', 'primary', '--dry-run', '--json']);
+    expect(report).toBeTruthy();
+    const synthesize = phaseByName(report, 'synthesize');
+    expect(synthesize?.details?.reason).toBe('excluded_from_implicit_source_cycle');
+    for (const phase of SOURCE_FRESHNESS_PHASES) {
+      expect(phaseByName(report, phase)?.details?.reason).not.toBe('excluded_from_implicit_source_cycle');
+    }
+  }, 300_000);
+
+  // ─── #4700 path-derived arm (#4745 ship-review gap): a `--dir` run derives
+  // its source from the checkout; when that source IS the brain's default-like
+  // source the run is still the canonical default cycle (full phase set), and
+  // when it is some OTHER source it stays a freshness-only source cycle.
+  // Two non-default sources with distinct local_paths so sole-non-default
+  // routing cannot be what decides it — only sources.default can.
+
+  test('--dir on the default-like source (sources.default) keeps the FULL implicit cycle', async () => {
+    await seedSource('primary'); // local_path = repo → derived from --dir
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path, config, archived, created_at)
+       VALUES ('other', 'other', '/somewhere/else', '{}'::jsonb, false, NOW())`,
+    );
+    await engine.setConfig('sources.default', 'primary');
+
+    const report = await runDream(engine, ['--dir', repo, '--dry-run', '--json']);
+    expect(report).toBeTruthy();
+    expectNoImplicitSourceExclusions(report);
+  }, 300_000);
+
+  test('--dir on a NON-default-like source stays freshness-only even though sources.default names another source', async () => {
+    await seedSource('other'); // local_path = repo → derived from --dir
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path, config, archived, created_at)
+       VALUES ('primary', 'primary', '/somewhere/else', '{}'::jsonb, false, NOW())`,
+    );
+    await engine.setConfig('sources.default', 'primary');
+
+    const report = await runDream(engine, ['--dir', repo, '--dry-run', '--json']);
+    expect(report).toBeTruthy();
+    // Freshness-only: the brain-wide phases are recorded as excluded...
+    expect(phaseByName(report, 'synthesize')?.details?.reason).toBe('excluded_from_implicit_source_cycle');
+    // ...while the per-source freshness phases still run.
+    for (const phase of SOURCE_FRESHNESS_PHASES) {
+      expect(phaseByName(report, phase)?.details?.reason).not.toBe('excluded_from_implicit_source_cycle');
+    }
+  }, 300_000);
+
   // ─── --source-id alias equivalence (D3) ─────────────────────────────
 
   test('--source-id <existing> is equivalent to --source (writes timestamp)', async () => {
@@ -699,7 +730,9 @@ describe('runDream — --source / --source-id (v0.41.13)', () => {
     // matches resolver-user-error message shapes; a TypeError thrown
     // from any source-resolution path must bubble up with its original
     // stack trace (proving real programmer bugs are NOT hidden behind
-    // operator-error UX).
+    // operator-error UX). The patch MUST restore in finally — the engine
+    // is shared file-wide; a leaked patch breaks every later test's
+    // resetPgliteState.
     await seedSource('gamma');
     const original = (engine as any).executeRaw.bind(engine);
     let restored = false;
@@ -724,6 +757,44 @@ describe('runDream — --source / --source-id (v0.41.13)', () => {
   });
 });
 
+// ─── #4730: --drain --dry-run --json payload shape ─────────────────────
+//
+// The dry-run preview never runs the drain loop, so it hand-builds the
+// result envelope. It must carry the SAME #4730 keys as a real drain
+// (`failures`, `omitted_failure_count`) so a `--json` consumer can parse
+// both shapes with one schema.
+
+describe('runDream — --drain --dry-run --json payload (#4730)', () => {
+  test('carries failures: [] and omitted_failure_count: 0 alongside the legacy counters', async () => {
+    const lines: string[] = [];
+    const logSpy = spyOn(console, 'log').mockImplementation((msg: string) => { lines.push(String(msg)); });
+    const errSpy = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      // Empty brain → remaining 0 → no EXIT_DRAIN_INCOMPLETE exit.
+      await runDream(engine, ['--drain', '--dry-run', '--json']);
+    } finally {
+      logSpy.mockRestore();
+      errSpy.mockRestore();
+    }
+    const line = lines.find(l => l.trim().startsWith('{'));
+    expect(line).toBeDefined();
+    const payload = JSON.parse(line!);
+    expect(payload).toMatchObject({
+      phase: 'extract_atoms',
+      status: 'ok',
+      dry_run: true,
+      extracted: 0,
+      remaining: 0,
+      failure_count: 0,
+      failures: [],
+      omitted_failure_count: 0,
+      last_error: null,
+    });
+    expect(Array.isArray(payload.failures)).toBe(true);
+    expect(payload.failure_count).toBe(payload.failures.length + payload.omitted_failure_count);
+  }, 300_000);
+});
+
 // ─── v0.41.13 D5: end-to-end dream → checkCycleFreshness parity ───────
 //
 // Closes the column-rename drift class: if a future PR renames
@@ -732,19 +803,6 @@ describe('runDream — --source / --source-id (v0.41.13)', () => {
 // chain through the exact seam both sides consume.
 
 describe('runDream → checkCycleFreshness end-to-end (D5)', () => {
-  let repo: string;
-  let engine: InstanceType<typeof PGLiteEngine>;
-
-  beforeEach(async () => {
-    repo = makeGitRepo();
-    engine = await makePGLite();
-  }, 300_000);
-
-  afterEach(async () => {
-    if (engine) await engine.disconnect();
-    rmSync(repo, { recursive: true, force: true });
-  }, 300_000);
-
   test('stale source becomes fresh after dream --source (column-name drift guard)', async () => {
     // Seed source with last_full_cycle_at backdated 25h (above warn floor).
     const stale = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();

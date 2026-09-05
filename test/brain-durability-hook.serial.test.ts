@@ -8,8 +8,9 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { execFileSync } from 'child_process';
+import { execFileSync, spawn } from 'child_process';
 import { hardenBrainRepo, unhardenBrainRepo } from '../src/core/brain-repo-durability.ts';
+import { crontabAvailable } from './helpers/fs-perms.ts';
 import { runPull } from '../src/commands/sources-harden.ts';
 
 // #2943 root cause: `env: process.env` is REQUIRED here. Bun snapshots
@@ -209,7 +210,10 @@ describe('post-commit hook (D9 local, D7 self-contained)', () => {
 // then invokes that exact command to prove it performs a real pull. It always
 // unregisters the launchd/cron job afterward so no scheduled job survives.
 describe('durability schedule (installCron:true) [D2/D12]', () => {
-  test('registers the DB-free pull job with the right command + interval, and the job performs a real pull', async () => {
+  // skipIf: needs a real crontab/launchctl to register against — on hosts
+  // without one (some sandboxes) hardenBrainRepo correctly degrades the cron
+  // step to 'skipped', which is the product working, not this arc.
+  test.skipIf(!crontabAvailable() && process.platform !== 'darwin')('registers the DB-free pull job with the right command + interval, and the job performs a real pull', async () => {
     const sourceId = 'wiki';
     const report = await hardenBrainRepo({
       repoPath: work, sourceId, pat: 'ghp_x', installCron: true, intervalSec: 900, verify: false,
@@ -262,4 +266,78 @@ describe('durability schedule (installCron:true) [D2/D12]', () => {
       await unhardenBrainRepo({ repoPath: work, sourceId });
     }
   }, 60_000);
+});
+
+// #4682 — the synchronous helper is the fail-loud guarantee: a push-lock
+// timeout means NO push happened and nothing confirmed the remote, so it must
+// not exit 0. The detached post-commit hook keeps rc 0 on the same branch of
+// the shared template: skipping a push another holder is already performing
+// is its designed coalescing outcome. GBRAIN_PUSH_LOCK_WAIT_SECONDS shortens
+// flock's wait so the test doesn't burn the 30s default.
+describe('#4682 — push-lock timeout is fail-loud for the helper only', () => {
+  const flockPath = Bun.which('flock');
+
+  // The holder owns the lock once a non-blocking acquire FAILS.
+  async function waitForLockHeld(lockPath: string, ms = 10_000): Promise<boolean> {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+      try {
+        execFileSync('flock', ['-n', lockPath, 'true'], { stdio: 'ignore', env: process.env });
+      } catch {
+        return true;
+      }
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    return false;
+  }
+
+  test.skipIf(!flockPath)('helper --push-only exits non-zero on lock timeout instead of claiming success', async () => {
+    // An unpushed local commit. Remove the post-commit hook first so its
+    // detached background push can't land the commit behind the lock holder
+    // (--no-verify does NOT skip post-commit; same precedent as the #2426
+    // test above). This test targets the HELPER's lock-timeout path.
+    rmSync(join(work, '.git', 'hooks', 'post-commit'));
+    writeFileSync(join(work, 'pending.md'), 'pending\n');
+    git(work, 'add', 'pending.md');
+    git(work, 'commit', '-qm', 'pending');
+    const head = git(work, 'rev-parse', 'HEAD');
+    expect(originHead(bare)).not.toBe(head);
+
+    const lockPath = join(git(work, 'rev-parse', '--absolute-git-dir'), 'gbrain-push.lock');
+    const holder = spawn('flock', [lockPath, 'sleep', '30'], { stdio: 'ignore', env: process.env });
+    try {
+      expect(await waitForLockHeld(lockPath)).toBe(true);
+      let code = 0;
+      try {
+        execFileSync('bash', [join(work, 'scripts', 'brain-commit-push.sh'), '--push-only', 'main'], {
+          cwd: work, stdio: ['ignore', 'pipe', 'pipe'],
+          env: { ...process.env, GBRAIN_PUSH_LOCK_WAIT_SECONDS: '1' },
+        });
+      } catch (e: any) { code = e.status ?? 1; }
+      expect(code).not.toBe(0); // pre-fix: exit 0 with no push and no remote-head check
+      // The timeout was logged, and the commit is still NOT on origin.
+      const log = join(process.env.HOME!, '.gbrain', 'brain-push.log');
+      expect(readFileSync(log, 'utf-8')).toContain('lock-timeout main');
+      expect(originHead(bare)).not.toBe(head);
+    } finally {
+      holder.kill('SIGKILL');
+    }
+  }, 60_000);
+
+  test('template parity: helper renders lock-timeout rc 1, hook keeps rc 0, bodies otherwise identical', () => {
+    const helper = readFileSync(join(work, 'scripts', 'brain-commit-push.sh'), 'utf-8');
+    const hook = readFileSync(join(work, '.git', 'hooks', 'post-commit'), 'utf-8');
+    // The helper (synchronous guarantee) fails loudly on lock timeout...
+    expect(helper).toMatch(/lock-timeout \$_branch" >>"\$_log"; return 1; \}/);
+    // ...while the hook (detached best-effort) keeps the coalescing skip.
+    expect(hook).toMatch(/lock-timeout \$_branch" >>"\$_log"; return 0; \}/);
+    // D7 stays intact: apart from that one return code, the rendered
+    // brain_push bodies are byte-identical (one template, one knob).
+    const body = (s: string): string => {
+      const m = s.match(/brain_push\(\) \{[\s\S]*?\n\}/);
+      return (m ? m[0] : '').replace(/return [01]; \}/, 'return RC; }');
+    };
+    expect(body(helper).length).toBeGreaterThan(0);
+    expect(body(helper)).toBe(body(hook));
+  });
 });

@@ -22,7 +22,7 @@ import type { SqlValue } from '../sql-query.ts';
 import { deriveResolutionTuple, finalizeScorecard } from '../takes-resolution.ts';
 import { normalizeWeightForStorage } from '../takes-fence.ts';
 import { buildTakeRows } from '../batch-rows.ts';
-import { takeRowToTake, takeHitRowToHit, tryParseEmbedding } from '../utils.ts';
+import { staleTakeRowToRow, takeRowToTake, takeHitRowToHit, tryParseEmbedding } from '../utils.ts';
 
 /** Narrow slice of PostgresEngine the takes operations use. */
 export interface PgTakesDeps {
@@ -420,26 +420,7 @@ export async function listStaleTakes(deps: PgTakesDeps): Promise<StaleTakeRow[]>
       ORDER BY t.id
       LIMIT 100000
     `;
-    // postgres.js returns BIGSERIAL/INT8 as bigint. The public engine contract
-    // is numeric and updateTakeEmbeddings validates Number ids; leaking the
-    // raw driver row makes every real Postgres backfill fail as "invalid
-    // take_id" even though PGLite succeeds.
-    return (rows as unknown as Array<Record<string, unknown>>).map((row) => {
-      const takeId = Number(row.take_id);
-      const rowNum = Number(row.row_num);
-      if (!Number.isSafeInteger(takeId) || takeId <= 0) {
-        throw new Error('invalid take_id: outside JavaScript safe integer range');
-      }
-      if (!Number.isSafeInteger(rowNum)) {
-        throw new Error('invalid row_num: outside JavaScript safe integer range');
-      }
-      return {
-        take_id: takeId,
-        page_slug: String(row.page_slug),
-        row_num: rowNum,
-        claim: String(row.claim),
-      };
-    });
+    return rows.map((row) => staleTakeRowToRow(row as Record<string, unknown>));
   }
 
 export async function updateTakeEmbeddings(

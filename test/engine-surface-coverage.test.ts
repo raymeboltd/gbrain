@@ -51,7 +51,7 @@ const INTERFACE_METHODS: readonly string[] = [
   'connect', 'disconnect', 'reconnect', 'initSchema', 'transaction', 'withReservedConnection',
   // Pages CRUD
   'getPage', 'putPage', 'findDuplicatePage', 'deletePage', 'deletePages', 'resolveSlugsByPaths',
-  'softDeletePage', 'restorePage', 'purgeDeletedPages', 'listPages', 'resolveSlugs', 'getAllSlugs',
+  'softDeletePage', 'softDeletePages', 'restorePage', 'purgeDeletedPages', 'listPages', 'resolveSlugs', 'getAllSlugs',
   'listAllPageRefs', 'listAllSources', 'updateSourceConfig', 'listPrefixSampledPages', 'listCorpusSample',
   // Search
   'searchKeyword', 'searchTitles', 'searchVector', 'getEmbeddingsByChunkIds',
@@ -63,7 +63,7 @@ const INTERFACE_METHODS: readonly string[] = [
   'countStalePagesForExtraction', 'listStalePagesForExtraction', 'markPagesExtractedBatch',
   // Links + graph
   'addLink', 'addLinksBatch', 'removeLink', 'getLinks', 'getBacklinks', 'listLinkSources',
-  'findByTitleFuzzy', 'traverseGraph', 'traversePaths', 'relationalFanout', 'getBacklinkCounts',
+  'findByTitleFuzzy', 'traverseGraph', 'traversePaths', 'traversePathsDetailed', 'relationalFanout', 'getBacklinkCounts',
   'getAdjacencyBoosts', 'getContentFlagsByPageIds', 'getUnverifiedExtractionPageIds',
   'getPageTimestamps', 'getEffectiveDates', 'getSalienceScores', 'findOrphanPages',
   // Tags
@@ -94,7 +94,7 @@ const INTERFACE_METHODS: readonly string[] = [
   // Stats + health + ingest log
   'getStats', 'getHealth', 'logIngest', 'getIngestLog',
   // Sync + aliases + narrow updates
-  'updateSlug', 'rewriteLinks', 'resolveSlugWithAlias', 'resolveAliases', 'setPageAliases',
+  'updateSlug', 'rewriteLinks', 'resolveSlugWithAlias', 'resolveSlugWithAliasDetailed', 'resolveAliases', 'setPageAliases',
   'refreshPageBody', 'updatePageContextualRetrievalState', 'migrateFactsToCanonical',
   // Config + migration + raw SQL
   'getConfig', 'setConfig', 'unsetConfig', 'listConfigKeys', 'runMigration',

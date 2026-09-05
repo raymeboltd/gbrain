@@ -19,7 +19,7 @@ import type { SqlValue } from '../sql-query.ts';
 import { deriveResolutionTuple, finalizeScorecard } from '../takes-resolution.ts';
 import { normalizeWeightForStorage } from '../takes-fence.ts';
 import { buildTakeRows } from '../batch-rows.ts';
-import { takeRowToTake, takeHitRowToHit } from '../utils.ts';
+import { staleTakeRowToRow, takeRowToTake, takeHitRowToHit } from '../utils.ts';
 
 /** Narrow slice of PGLiteEngine the takes operations use. */
 export interface PgliteTakesDeps {
@@ -407,24 +407,7 @@ export async function listStaleTakes(deps: PgliteTakesDeps): Promise<StaleTakeRo
        ORDER BY t.id
        LIMIT 100000`
     );
-    // Keep both engines on the same plain-number contract even if a PGLite
-    // driver version starts returning BIGINT columns as native bigint.
-    return (rows as Array<Record<string, unknown>>).map((row) => {
-      const takeId = Number(row.take_id);
-      const rowNum = Number(row.row_num);
-      if (!Number.isSafeInteger(takeId) || takeId <= 0) {
-        throw new Error('invalid take_id: outside JavaScript safe integer range');
-      }
-      if (!Number.isSafeInteger(rowNum)) {
-        throw new Error('invalid row_num: outside JavaScript safe integer range');
-      }
-      return {
-        take_id: takeId,
-        page_slug: String(row.page_slug),
-        row_num: rowNum,
-        claim: String(row.claim),
-      };
-    });
+    return rows.map((row) => staleTakeRowToRow(row as Record<string, unknown>));
   }
 
 export async function updateTakeEmbeddings(
