@@ -277,6 +277,9 @@ What hardening guarantees:
   `git config --local gbrain.durabilityReconcile merge`; the generated helper
   and hook then merge a remote advance before retrying the push. Any other
   value fails closed.
+  Existing merge or rebase operations refuse further work. A failed retry
+  preserves any conflict state for its owner to inspect and resolve; the helper
+  never automatically aborts a Git operation in a shared worktree.
 - **No silent staleness.** A 30-minute background pull keeps an idle session
   current. It runs DB-free, so it never contends with a live brain for the
   PGLite single-writer lock.

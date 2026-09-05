@@ -207,6 +207,30 @@ describe('brain-commit-push.sh (D13 guarantee)', () => {
     expect(git(work, 'ls-files', '-u')).toBe(unmergedBefore);
   });
 
+  test('failed merge retry preserves both commits and conflict state for owner resolution', () => {
+    rmSync(join(work, '.git', 'hooks', 'post-commit'));
+    git(work, 'config', 'gbrain.durabilityReconcile', 'merge');
+    const other = mkdtempSync(join(root, 'retry-conflict-'));
+    execFileSync('git', ['-c', 'protocol.file.allow=always', 'clone', '-q', bare, other], { stdio: 'ignore', env: process.env });
+    git(other, 'config', 'user.email', 'o@o.o'); git(other, 'config', 'user.name', 'other');
+    writeFileSync(join(other, 'README.md'), 'remote conflict\n');
+    git(other, 'add', 'README.md'); git(other, 'commit', '-qm', 'remote conflict');
+    git(other, 'push', '-q', 'origin', 'main');
+    const remote = originHead(bare);
+    writeFileSync(join(work, 'README.md'), 'local conflict\n');
+    let code = 0;
+    try {
+      execFileSync('bash', [join(work, 'scripts', 'brain-commit-push.sh'), 'local conflict', 'README.md'], {
+        cwd: work, stdio: ['ignore', 'pipe', 'pipe'], env: process.env,
+      });
+    } catch (e: any) { code = e.status ?? 1; }
+    expect(code).toBe(4);
+    expect(git(work, 'show', 'HEAD:README.md')).toBe('local conflict');
+    expect(git(work, 'rev-parse', 'MERGE_HEAD')).toBe(remote);
+    expect(git(work, 'ls-files', '-u')).toContain('README.md');
+    expect(originHead(bare)).toBe(remote);
+  });
+
   test('#2426 — commits a MODIFIED tracked file even when the remote advanced (commit before pull)', () => {
     // Pre-fix, the helper ran `git pull --rebase` BEFORE staging, so any dirty
     // tree (a modified/enriched page — exactly the write-through case) aborted

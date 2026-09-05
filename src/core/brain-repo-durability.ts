@@ -191,6 +191,7 @@ brain_push() {
     exec 9>"$_gd/gbrain-push.lock"
     flock -w "\${GBRAIN_PUSH_LOCK_WAIT_SECONDS:-30}" 9 || { echo "$(date -u +%FT%TZ) [push] lock-timeout $_branch" >>"$_log"; return ${lockTimeoutRc}; }
   fi
+  brain_repo_preflight || { echo "$(date -u +%FT%TZ) [push] rebase/merge appeared while waiting; refusing" >>"$_log"; return 1; }
   _confirm_remote_head() {
     _local_head="$(git rev-parse HEAD 2>/dev/null)" || return 1
     _remote_head="$(git ls-remote --exit-code origin "refs/heads/$_branch" 2>>"$_log" | awk 'NR == 1 { print $1 }')" || return 1
@@ -203,16 +204,14 @@ brain_push() {
     rebase) _pull_flag=--rebase ;;
     merge) _pull_flag=--no-rebase ;;
   esac
+  brain_repo_preflight || { echo "$(date -u +%FT%TZ) [push] rebase/merge appeared before retry; refusing" >>"$_log"; return 1; }
   echo "$(date -u +%FT%TZ) [push] rejected; $_strategy-pull $_branch" >>"$_log"
   if git pull "$_pull_flag" origin "$_branch" >>"$_log" 2>&1 && git push origin "HEAD:$_branch" >>"$_log" 2>&1 && _confirm_remote_head; then
     echo "$(date -u +%FT%TZ) [push] ok-after-$_strategy $_branch $(git rev-parse --short HEAD 2>/dev/null)" >>"$_log"; return 0
   fi
-  if [ "$_strategy" = rebase ] && { [ -d "$(git rev-parse --git-path rebase-merge)" ] || [ -d "$(git rev-parse --git-path rebase-apply)" ]; }; then
-    git rebase --abort >/dev/null 2>&1 || true
-  elif [ "$_strategy" = merge ] && [ -f "$(git rev-parse --git-path MERGE_HEAD)" ]; then
-    git merge --abort >/dev/null 2>&1 || true
-  fi
-  echo "$(date -u +%FT%TZ) [push] LOCAL-ONLY, NEEDS ATTENTION: $_branch @ $(git rev-parse --short HEAD 2>/dev/null) could not reach origin. Run: gbrain sources pull <id> && git push" >>"$_log"
+  # A concurrent writer need not hold our push lock. Preserve reconciliation
+  # state for its owner instead of guessing which operation may be aborted.
+  echo "$(date -u +%FT%TZ) [push] LOCAL-ONLY, NEEDS ATTENTION: $_branch @ $(git rev-parse --short HEAD 2>/dev/null) could not reach origin. Inspect git status and resolve any preserved reconciliation before retrying the helper." >>"$_log"
   return 1
 }`;
 }
