@@ -350,6 +350,8 @@ describe('BATCH_AUDIT_SITES typed enum + isBatchAuditSite guard (D10c codex)', (
       // #3961: atom-provenance edges banked after the completion-receipt flip.
       'cycle.extract_atoms.provenance',
       'mcp.put_page.autolink',
+      // Deterministic source-event projection batches use distinct audit lanes.
+      'source-event.links', 'source-event.timeline',
       'sync.import_file',
       'reindex.markdown', 'reindex.multimodal',
       'backfill.outer',
