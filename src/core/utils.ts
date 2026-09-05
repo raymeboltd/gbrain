@@ -575,10 +575,17 @@ export function takeHitRowToHit(row: Record<string, unknown>): TakeHit {
  * already return numbers; normalize both engines at their shared boundary.
  */
 export function staleTakeRowToRow(row: Record<string, unknown>): StaleTakeRow {
+  const safeInteger = (value: unknown, field: 'take_id' | 'row_num'): number => {
+    const normalized = Number(value);
+    if (!Number.isSafeInteger(normalized)) {
+      throw new Error(`invalid ${field}: outside JavaScript safe integer range`);
+    }
+    return normalized;
+  };
   return {
-    take_id: Number(row.take_id),
+    take_id: safeInteger(row.take_id, 'take_id'),
     page_slug: String(row.page_slug ?? ''),
-    row_num: Number(row.row_num),
+    row_num: safeInteger(row.row_num, 'row_num'),
     claim: String(row.claim),
   };
 }

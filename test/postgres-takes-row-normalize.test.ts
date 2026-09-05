@@ -36,4 +36,18 @@ describe('Postgres stale-take row normalization', () => {
       'invalid take_id: outside JavaScript safe integer range',
     );
   });
+
+  test('fails closed for an unsafe row number too', async () => {
+    const sql = async () => [{
+      take_id: 2n,
+      page_slug: 'projects/car',
+      row_num: BigInt(Number.MAX_SAFE_INTEGER) + 1n,
+      claim: 'Insurance documents are due tomorrow',
+    }];
+    const deps = { sql } as unknown as PgTakesDeps;
+
+    await expect(listStaleTakes(deps)).rejects.toThrow(
+      'invalid row_num: outside JavaScript safe integer range',
+    );
+  });
 });
