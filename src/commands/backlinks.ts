@@ -10,14 +10,15 @@
  *   gbrain check-backlinks fix --dry-run                  # preview fixes
  */
 
-import { readFileSync, readdirSync, statSync, lstatSync, existsSync } from 'fs';
-import { join, relative, basename } from 'path';
+import { readFileSync, readdirSync, lstatSync, existsSync } from 'fs';
+import { join, relative, basename, resolve, dirname, isAbsolute, sep } from 'path';
 import { extractEntityRefs as canonicalExtractEntityRefs } from '../core/link-extraction.ts';
 import { createProgress, startHeartbeat } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
 import { parseMarkdown, frontmatterBodyOffset, findTimelineSplitIndex } from '../core/markdown.ts';
 import { atomicWriteFileSync } from '../core/atomic-write.ts';
 import { withPageLock } from '../core/page-lock.ts';
+import { isPathContained } from '../core/path-confine.ts';
 
 export interface BacklinkGap {
   /** The page that mentions the entity */
@@ -90,48 +91,141 @@ export function buildBacklinkEntry(sourceTitle: string, sourcePath: string): str
   return `- Referenced in [${sourceTitle}](${linkPath})`;
 }
 
+/**
+ * Reject traversal and every symlink component before a backlinks read/write.
+ * `isPathContained` realpaths both sides; the lstat walk additionally rejects
+ * symlinks that happen to resolve back inside the brain.
+ */
+function isSafeExistingBrainFile(filePath: string, brainDir: string): boolean {
+  const root = resolve(brainDir);
+  const file = resolve(filePath);
+  const rel = relative(root, file);
+  if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return false;
+
+  let cursor = file;
+  while (true) {
+    try {
+      if (lstatSync(cursor).isSymbolicLink()) return false;
+    } catch {
+      return false;
+    }
+    if (cursor === root) break;
+    const parent = dirname(cursor);
+    if (parent === cursor) return false;
+    cursor = parent;
+  }
+  return isPathContained(file, root);
+}
+
+const PEOPLE_COMPANY_MARKDOWN_REF_RE = /\]\((?:\.\.\/)*(?:people|companies)\//;
+const PEOPLE_COMPANY_WIKILINK_RE = /\[\[(?:[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?:)?(?:people|companies)\//;
+
+function mayContainPeopleCompanyRef(content: string): boolean {
+  return PEOPLE_COMPANY_MARKDOWN_REF_RE.test(content) || PEOPLE_COMPANY_WIKILINK_RE.test(content);
+}
+
 /** Scan a brain directory for back-link gaps */
 export function findBacklinkGaps(brainDir: string): BacklinkGap[] {
   const gaps: BacklinkGap[] = [];
 
-  // Collect all markdown files
-  const allPages: { path: string; relPath: string; content: string }[] = [];
-  function walk(dir: string) {
+  // Walk lazily. The previous implementation retained the complete Markdown
+  // corpus plus extracted copies for the duration of the scan. On large brains
+  // that amplified an 0.82 GiB corpus into ~10 GiB RSS and starved the Minion
+  // lease-renewal loop. Only people/company pages can be backlink targets, so
+  // retain that small target index and stream every possible source page.
+  function* walk(dir: string): Generator<{ path: string; relPath: string }> {
     for (const entry of readdirSync(dir)) {
       if (entry.startsWith('.')) continue;
       const full = join(dir, entry);
-      if (lstatSync(full).isDirectory()) {
-        walk(full);
+      let stat;
+      try {
+        stat = lstatSync(full);
+      } catch {
+        continue;
+      }
+      if (stat.isSymbolicLink()) continue;
+      if (stat.isDirectory()) {
+        yield* walk(full);
       } else if (entry.endsWith('.md') && !entry.startsWith('_')) {
-        const relPath = relative(brainDir, full);
-        try {
-          allPages.push({ path: full, relPath, content: readFileSync(full, 'utf-8') });
-        } catch { /* skip unreadable */ }
+        yield { path: full, relPath: relative(brainDir, full) };
       }
     }
   }
-  walk(brainDir);
 
-  // Build a lookup of existing pages by directory/slug. #1776: extract each
-  // page's canonical refs ONCE here — they feed both the gap candidates
-  // (people/companies projection) and the backlink-credit slug set, so
-  // extension-less convention links ([Alice](../people/alice),
-  // [[people/alice]]) count as backlinks even though the legacy
-  // `<basename>.md` substring check can't see them.
-  const pagesBySlug = new Map<string, { path: string; content: string }>();
-  const refsByRelPath = new Map<string, { name: string; slug: string; dir: string }[]>();
-  const outgoingSlugsBySlug = new Map<string, Set<string>>();
-  for (const page of allPages) {
-    const slug = page.relPath.replace('.md', '');
-    pagesBySlug.set(slug, { path: page.path, content: page.content });
-    const canonical = canonicalExtractEntityRefs(page.content);
-    refsByRelPath.set(page.relPath, canonical);
-    outgoingSlugsBySlug.set(slug, new Set(canonical.map(r => r.slug)));
+  // #1776: index only target paths. Target contents are loaded through a
+  // bounded LRU below so a large people/companies directory cannot recreate
+  // the whole-corpus retention bug.
+  const targetPathsBySlug = new Map<string, string>();
+  for (const page of walk(brainDir)) {
+    const slug = page.relPath.replace(/\.md$/, '');
+    if (!slug.startsWith('people/') && !slug.startsWith('companies/')) continue;
+    if (!isSafeExistingBrainFile(page.path, brainDir)) continue;
+    targetPathsBySlug.set(slug, page.path);
   }
 
-  // For each page, check entity references
-  for (const page of allPages) {
-    const refs = projectPeopleCompaniesRefs(refsByRelPath.get(page.relPath) ?? []);
+  type TargetSnapshot = { content: string; outgoingSlugs: Set<string>; estimatedBytes: number };
+  const targetCache = new Map<string, TargetSnapshot>();
+  const targetCacheMaxBytes = 8 * 1024 * 1024;
+  let targetCacheBytes = 0;
+  let targetCacheEvictionsSinceGc = 0;
+
+  function loadTarget(slug: string): TargetSnapshot | undefined {
+    const cached = targetCache.get(slug);
+    if (cached) {
+      targetCache.delete(slug);
+      targetCache.set(slug, cached);
+      return cached;
+    }
+    const path = targetPathsBySlug.get(slug);
+    if (!path || !isSafeExistingBrainFile(path, brainDir)) return undefined;
+    try {
+      const content = readFileSync(path, 'utf-8');
+      if (!isSafeExistingBrainFile(path, brainDir)) return undefined;
+      const outgoingSlugs = new Set(canonicalExtractEntityRefs(content).map(r => r.slug));
+      const snapshot = {
+        content,
+        outgoingSlugs,
+        estimatedBytes: content.length * 2 + outgoingSlugs.size * 128,
+      };
+      if (snapshot.estimatedBytes <= targetCacheMaxBytes) {
+        while (targetCacheBytes + snapshot.estimatedBytes > targetCacheMaxBytes && targetCache.size > 0) {
+          const oldestSlug = targetCache.keys().next().value as string;
+          const oldest = targetCache.get(oldestSlug)!;
+          targetCache.delete(oldestSlug);
+          targetCacheBytes -= oldest.estimatedBytes;
+          targetCacheEvictionsSinceGc++;
+        }
+        targetCache.set(slug, snapshot);
+        targetCacheBytes += snapshot.estimatedBytes;
+        // Bun's allocator otherwise keeps evicted multi-MiB strings at its
+        // high-water mark until the scan ends. Only force a collection after
+        // sustained cache pressure; normal brains never enter this branch.
+        if (targetCacheEvictionsSinceGc >= 16) {
+          Bun.gc(false);
+          targetCacheEvictionsSinceGc = 0;
+        }
+      }
+      return snapshot;
+    } catch {
+      return undefined;
+    }
+  }
+
+  // For each page, check entity references, then release its content and all
+  // extraction intermediates before reading the next page.
+  for (const page of walk(brainDir)) {
+    if (!isSafeExistingBrainFile(page.path, brainDir)) continue;
+    let content: string;
+    try {
+      content = readFileSync(page.path, 'utf-8');
+    } catch {
+      continue;
+    }
+    // Canonical people/company refs always contain the directory segment.
+    // Avoid the extractor's full-size masking copies for raw/session pages
+    // that cannot possibly contribute a target candidate.
+    if (!mayContainPeopleCompanyRef(content)) continue;
+    const refs = projectPeopleCompaniesRefs(canonicalExtractEntityRefs(content));
     const sourceFilename = basename(page.relPath);
     const sourceSlug = page.relPath.replace(/\.md$/, '');
     // LOCAL PATCH (paolo, 2026-05-12): dedupe (source, target) pairs within
@@ -148,7 +242,7 @@ export function findBacklinkGaps(brainDir: string): BacklinkGap[] {
       const targetSlug = `${ref.dir}/${ref.slug}`;
       if (seen.has(targetSlug)) continue;
       seen.add(targetSlug);
-      const target = pagesBySlug.get(targetSlug);
+      const target = loadTarget(targetSlug);
       if (!target) continue; // target page doesn't exist
 
       // Check if the target already has a back-link to this source page.
@@ -157,12 +251,12 @@ export function findBacklinkGaps(brainDir: string): BacklinkGap[] {
       // outgoing refs containing the source slug (extension-less
       // convention links and wikilinks the substring check misses).
       if (hasBacklink(target.content, sourceFilename)) continue;
-      if (outgoingSlugsBySlug.get(targetSlug)?.has(sourceSlug)) continue;
+      if (target.outgoingSlugs.has(sourceSlug)) continue;
       gaps.push({
         sourcePage: page.relPath,
         targetPage: targetSlug + '.md',
         entityName: ref.name,
-        sourceTitle: extractPageTitle(page.content),
+        sourceTitle: extractPageTitle(content),
       });
     }
   }
@@ -269,11 +363,32 @@ export async function fixBacklinkGaps(
   for (const [targetPage, targetGaps] of byTarget) {
     const targetPath = join(brainDir, targetPage);
     if (!existsSync(targetPath)) continue;
+    if (!isSafeExistingBrainFile(targetPath, brainDir)) {
+      outcome.skipped.push({
+        page: targetPage,
+        reason: 'unsafe target path (traversal or symlink) — file left untouched',
+      });
+      continue;
+    }
 
     const lockKey = targetPage.replace(/\.md$/, '');
     try {
       await withPageLock(lockKey, async () => {
+        if (!isSafeExistingBrainFile(targetPath, brainDir)) {
+          outcome.skipped.push({
+            page: targetPage,
+            reason: 'unsafe target path after lock acquisition — file left untouched',
+          });
+          return;
+        }
         let content = readFileSync(targetPath, 'utf-8');
+        if (!isSafeExistingBrainFile(targetPath, brainDir)) {
+          outcome.skipped.push({
+            page: targetPage,
+            reason: 'target path changed while reading — file left untouched',
+          });
+          return;
+        }
 
         const preError = firstEditBlockingError(content, targetPath);
         if (preError) {
@@ -285,8 +400,16 @@ export async function fixBacklinkGaps(
         }
 
         const bodyStart = frontmatterBodyOffset(content);
+        const creditedSourceSlugs = new Set(canonicalExtractEntityRefs(content).map(ref => ref.slug));
         let inserted = 0;
         for (const gap of targetGaps) {
+          const sourceFilename = basename(gap.sourcePage);
+          const sourceSlug = gap.sourcePage.replace(/\.md$/, '');
+          // The scan and fix can be separated by minutes on a live brain.
+          // Re-check under the target lock so a concurrently-added backlink is
+          // never duplicated from a stale gap list.
+          if (hasBacklink(content, sourceFilename) || creditedSourceSlugs.has(sourceSlug)) continue;
+
           // Compute relative path from target to source
           const targetDir = targetPage.split('/').slice(0, -1);
           const depth = targetDir.length;
@@ -295,8 +418,11 @@ export async function fixBacklinkGaps(
 
           const entry = buildBacklinkEntry(gap.sourceTitle, relPath);
           content = insertBacklinkEntry(content, bodyStart, entry);
+          creditedSourceSlugs.add(sourceSlug);
           inserted++;
         }
+
+        if (inserted === 0) return;
 
         const postError = firstEditBlockingError(content, targetPath);
         if (postError) {
@@ -308,6 +434,13 @@ export async function fixBacklinkGaps(
         }
 
         if (!dryRun) {
+          if (!isSafeExistingBrainFile(targetPath, brainDir)) {
+            outcome.skipped.push({
+              page: targetPage,
+              reason: 'target path changed before write — file left untouched',
+            });
+            return;
+          }
           atomicWriteFileSync(targetPath, content, {
             verify: (onDisk) => {
               const diskError = firstEditBlockingError(onDisk, targetPath);
