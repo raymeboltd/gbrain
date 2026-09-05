@@ -13,10 +13,10 @@
  *   R1 — grep guard over the entire `src/core/eval-contradictions/`
  *        subtree and the `src/commands/eval-suspected-contradictions*.ts`
  *        files: no code path may UPDATE facts.valid_until.
- *   R8 — broader guard over all of `src/`: the only file that writes
- *        valid_until is `src/core/cycle/phases/consolidate.ts`. Any new
- *        write site fails this guard; the human adding it must explicitly
- *        amend the allow-list AND document the deliberate design change.
+ *   R8 — broader guard over all of `src/`: every valid_until writer must be
+ *        explicitly authorized below. Any new write site fails this guard;
+ *        the human adding it must amend the allow-list AND document the
+ *        deliberate design change.
  */
 
 import { test, expect, describe } from 'bun:test';
@@ -39,11 +39,17 @@ import { join } from 'node:path';
 //     and the contradiction probe still never mutates, so the
 //     auto-supersession.ts:4 invariant is preserved. Deliberate design
 //     change per the #2390 eng review (G1: ontology extends facts).
+//   - source-events/projector.ts — receipt-controlled correction lifecycle:
+//     the atomic fact swap expires facts from the superseded source revision
+//     and clears expiry only on the replacement revision being committed.
+//     This is deterministic source-of-record projection, not contradiction
+//     probe auto-supersession.
 const VALID_UNTIL_WRITE_ALLOWLIST: ReadonlySet<string> = new Set([
   'src/core/cycle/phases/consolidate.ts',
   'src/core/facts/forget.ts',
   'src/core/postgres-engine.ts',
   'src/core/pglite-engine.ts',
+  'src/core/source-events/projector.ts',
 ]);
 
 function walkTs(dir: string, acc: string[] = []): string[] {
@@ -125,7 +131,7 @@ describe('R1 — contradiction probe never writes valid_until', () => {
   });
 });
 
-describe('R8 — only the consolidate phase + engine insert layer may write valid_until', () => {
+describe('R8 — only explicitly authorized lifecycle writers may write valid_until', () => {
   test('every src/ TypeScript file that writes valid_until is on the allow-list', () => {
     const files = walkTs('src');
     const offenders: Array<{ file: string; hits: string[] }> = [];
