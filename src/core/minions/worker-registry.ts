@@ -152,11 +152,14 @@ function processStartMs(pid: number): number | null {
   try {
     const out = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
       encoding: 'utf8',
+      // ps emits no timezone. Pin its locale/zone and parse that explicit zone;
+      // Bun's test runner can use UTC while the child inherits the host zone.
+      env: { ...process.env, LC_ALL: 'C', TZ: 'UTC' },
       timeout: 2000,
       stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();
     if (!out) return null;
-    const t = Date.parse(out);
+    const t = Date.parse(`${out} UTC`);
     return Number.isNaN(t) ? null : t;
   } catch {
     return null;
