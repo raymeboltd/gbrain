@@ -167,6 +167,11 @@ const LEDGER: Record<string, string> = {
   entity_identity_link: 'test/entity-identity.test.ts',
   entity_identity_unlink: 'test/entity-identity.test.ts',
   entity_identity_list: 'test/entity-identity.test.ts',
+  // Downstream source-event ops: real handler dispatch, dry-run, review, and scope denial.
+  source_event_compiled_candidates: 'test/source-event-projector.serial.test.ts',
+  review_source_event_compiled_candidate: 'test/source-event-projector.serial.test.ts',
+  source_event_task_candidates: 'test/source-event-projector.serial.test.ts',
+  record_source_event_task_application: 'test/source-event-projector.serial.test.ts',
 };
 
 /**

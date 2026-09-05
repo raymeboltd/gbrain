@@ -43,6 +43,7 @@ describe('migrations v145-v148 source-event receipts and skew repair', () => {
   });
 
   test('fresh Postgres schema includes receipt metadata in the RLS seal', () => {
+    // test-reads-source-ok: pins the fresh Postgres DDL seal; PGLite migration behavior is exercised separately above and below.
     const schema = readFileSync(join(import.meta.dir, '../src/schema.sql'), 'utf8');
     expect(schema).toContain('ALTER TABLE source_event_receipts ENABLE ROW LEVEL SECURITY');
   });

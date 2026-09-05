@@ -84,8 +84,10 @@ describe('Autopilot source-event projection dispatch', () => {
   });
 
   test('Autopilot calls the projector dispatcher after producer dispatch', () => {
+    // test-reads-source-ok: pins the live Autopilot wiring without starting its long-running service; dispatcher behavior is exercised above.
     const source = readFileSync(join(import.meta.dir, '../src/commands/autopilot.ts'), 'utf8');
     expect(source).toMatch(/maybeDispatchSourceEventProjection/);
+    // test-reads-source-ok: pins worker registration without starting a worker or model job; projector behavior has its own suite.
     const jobs = readFileSync(join(import.meta.dir, '../src/commands/jobs.ts'), 'utf8');
     expect(jobs).toMatch(/worker\.register\('source-event-projection'/);
   });
