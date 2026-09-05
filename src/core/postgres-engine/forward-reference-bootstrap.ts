@@ -11,9 +11,9 @@
 //
 // Bootstrap state that SCHEMA_SQL forward-references but that older brains
 // don't have yet. Mirror of `PGLiteEngine#applyForwardReferenceBootstrap`
-// in shape and intent. Keep in sync with the PGLite version; covered by
-// `test/schema-bootstrap-coverage.test.ts` (PGLite side) and
-// `test/e2e/postgres-bootstrap.test.ts` (Postgres side).
+// in shape and intent — keep in sync, except where a forward reference is
+// blob-specific. Covered by the PGLite A2 check and the PostgreSQL schema-blob
+// CREATE-INDEX closure gate in test/schema-bootstrap-coverage.test.ts.
 
 import type postgres from 'postgres';
 
@@ -529,8 +529,11 @@ if (needsSourcesArchive) {
 }
 
 if (needsDreamVerdictExpiresAt) {
+  // Separate ADD from DEFAULT: adding with a default can stamp legacy rows,
+  // while SET DEFAULT protects writers racing the v143 backfill window.
   await conn.unsafe(`
     ALTER TABLE dream_verdicts ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
+    ALTER TABLE dream_verdicts ALTER COLUMN expires_at SET DEFAULT (now() + interval '30 days');
   `);
 }
 

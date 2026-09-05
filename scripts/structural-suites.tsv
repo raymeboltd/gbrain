@@ -25,6 +25,7 @@ test/autopilot-install.test.ts	autopilot wrapper script — key sourcing (#2608)
 test/autopilot-pause-marker.test.ts	pause marker fences minion job pickup	1	readFileSync
 test/autopilot-self-upgrade.test.ts	autopilot self-upgrade static-shape regressions	4	readFileSync
 test/autopilot-shutdown-engine-close.test.ts	autopilot.ts graceful engine shutdown (#1872)	6	readFileSync
+test/autopilot-source-event.test.ts	Autopilot source-event projection dispatch	8	readFileSync
 test/autopilot-supervisor-wiring.test.ts	autopilot.ts ↔ ChildWorkerSupervisor wiring	7	readFileSync
 test/backlinks-job-default.test.ts	backlinks Minion handler — empty payload defaults to check, not fix	3	readFileSync
 test/backup-cli.serial.test.ts	runBackupCli — PGLite lock fallback	3	readFileSync
@@ -199,6 +200,7 @@ test/migrations-v0_14_0.test.ts	Bug 5 + Bug 8 — v0_14_0 module shape	3	bun-fil
 test/migrations-v0_14_0.test.ts	Bug 5 — Phase B host-work entry dedup	2	readFileSync
 test/migrations-v0_14_0.test.ts	Bug 8 — max_stalled default bumped in schema files	3	bun-file
 test/migrations-v0_22_4.test.ts	v0.22.4 migration (B11)	9	readFileSync
+test/migrations-v143.serial.test.ts	migrations v145-v148 source-event receipts and skew repair	4	readFileSync
 test/model-pricing.test.ts	DRIFT GUARD — derived views stay equal to canonical (re-hardcode trip-wire)	4	readFileSync
 test/model-pricing.test.ts	no heavy import (cycle guard)	1	readFileSync
 test/models-doctor-embed.test.ts	models doctor — embedding reachability probe (v0.40.x)	3	readFileSync

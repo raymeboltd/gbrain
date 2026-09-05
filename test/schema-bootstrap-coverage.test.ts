@@ -38,6 +38,8 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 // snapshot-loaded engine would skip the bootstrap entirely.
 delete process.env.GBRAIN_PGLITE_SNAPSHOT;
 
+const POSTGRES_BOOTSTRAP_PATH = 'src/core/postgres-engine/forward-reference-bootstrap.ts';
+
 // Forward-reference targets that PGLITE_SCHEMA_SQL requires.
 // When you add a new one, extend this list AND the bootstrap.
 type ForwardReference =
@@ -1125,6 +1127,43 @@ test('Postgres bootstrap repairs the v143 Dream TTL forward reference before sch
   expect(normalized).toContain(
     'ALTER TABLE dream_verdicts ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;',
   );
+});
+
+const POSTGRES_INDEX_REF_EXEMPTIONS = new Set<string>();
+
+test('every CREATE INDEX column in the Postgres SCHEMA_SQL blob is covered by CREATE TABLE or the Postgres bootstrap (#4657 class closure)', async () => {
+  const { readFileSync } = await import('fs');
+  const { resolve: resolvePath } = await import('path');
+  const { SCHEMA_SQL } = await import('../src/core/schema-embedded.generated.ts');
+  const { extractAddedColumnsFromMigrations } = await import('./helpers/extract-added-columns.ts');
+  const bootstrapSrc = readFileSync(resolvePath(process.cwd(), POSTGRES_BOOTSTRAP_PATH), 'utf-8');
+  const tableColumns = parseBaseTableColumns(SCHEMA_SQL);
+  const indexRefs = parseIndexColumnReferences(SCHEMA_SQL);
+  const bootstrapAdds = parseAlterAddColumns(bootstrapSrc);
+  const bootstrapCreateTableCols = parseBaseTableColumns(bootstrapSrc);
+  const migrationAddedKeys = new Set(extractAddedColumnsFromMigrations().map(a => `${a.table}.${a.column}`));
+  const basePredicate = buildIndexRefCoveragePredicate(tableColumns, bootstrapAdds, migrationAddedKeys);
+  const covered = (table: string, column: string): boolean => {
+    if (POSTGRES_INDEX_REF_EXEMPTIONS.has(`${table}.${column}`) || basePredicate(table, column)) return true;
+    if (migrationAddedKeys.has(`${table}.${column}`)) return false;
+    return Boolean(bootstrapCreateTableCols.get(table)?.has(column));
+  };
+  expect(migrationAddedKeys.has('dream_verdicts.expires_at')).toBe(true);
+  expect(indexRefs.some(r => r.table === 'dream_verdicts' && r.column === 'expires_at')).toBe(true);
+  expect(bootstrapAdds).toContainEqual({ table: 'dream_verdicts', column: 'expires_at' });
+  const uncovered = indexRefs.filter(ref => !covered(ref.table, ref.column));
+  expect(uncovered).toEqual([]);
+}, 30000);
+
+test('postgres bootstrap carries the dream_verdicts.expires_at probe, ALTER, and race-safe default (#4657)', async () => {
+  const { readFileSync } = await import('fs');
+  const { resolve: resolvePath } = await import('path');
+  const normalized = readFileSync(resolvePath(process.cwd(), POSTGRES_BOOTSTRAP_PATH), 'utf-8').replace(/\s+/g, ' ');
+  expect(normalized).toContain('dream_verdicts_expires_at_exists');
+  expect(normalized).toContain('ALTER TABLE dream_verdicts ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;');
+  expect(normalized).toContain("ALTER TABLE dream_verdicts ALTER COLUMN expires_at SET DEFAULT (now() + interval '30 days');");
+  expect(normalized).toContain('&& !needsDreamVerdictExpiresAt');
+  expect(normalized).toContain('if (needsDreamVerdictExpiresAt)');
 });
 
 test('planted-bug: simulated unprovided column produces a clear failure message', async () => {
