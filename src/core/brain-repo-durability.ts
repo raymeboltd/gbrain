@@ -166,6 +166,15 @@ export function maintainPushLog(): void {
 // the lock wait — env-only, incident/test escape hatch.
 function renderPushRetry(lockTimeoutRc: 0 | 1): string {
   return `# --- gbrain durability push-retry (generated; one source of truth) ---
+brain_reconcile_policy() {
+  _policy="$(git config --get gbrain.durabilityReconcile 2>/dev/null || echo rebase)"
+  case "$_policy" in rebase|merge) printf '%s\n' "$_policy" ;; *) return 1 ;; esac
+}
+brain_repo_preflight() {
+  [ ! -d "$(git rev-parse --git-path rebase-merge)" ] &&
+  [ ! -d "$(git rev-parse --git-path rebase-apply)" ] &&
+  [ ! -f "$(git rev-parse --git-path MERGE_HEAD)" ]
+}
 brain_push() {
   _branch="$1"
   # CX2-8: GBRAIN_HOME is a PARENT dir (matches config.ts semantics — .gbrain appended)
@@ -174,6 +183,8 @@ brain_push() {
   # S3#10: the push log may capture remote errors — never group/other readable.
   [ -e "$_log" ] || { : >"$_log" 2>/dev/null && chmod 600 "$_log" 2>/dev/null; } || true
   _gd="$(git rev-parse --git-dir 2>/dev/null || echo .git)"
+  _strategy="$(brain_reconcile_policy)" || { echo "$(date -u +%FT%TZ) [push] invalid reconcile policy" >>"$_log"; return 1; }
+  brain_repo_preflight || { echo "$(date -u +%FT%TZ) [push] existing rebase/merge; refusing" >>"$_log"; return 1; }
   # Serialize concurrent pushes (commit bursts) so they coalesce instead of a
   # rebase-retry herd. No-op if flock is unavailable.
   if command -v flock >/dev/null 2>&1; then
@@ -188,17 +199,19 @@ brain_push() {
   if git push origin "HEAD:$_branch" >>"$_log" 2>&1 && _confirm_remote_head; then
     echo "$(date -u +%FT%TZ) [push] ok $_branch $(git rev-parse --short HEAD 2>/dev/null)" >>"$_log"; return 0
   fi
-  _strategy="$(git config --get gbrain.durabilityReconcile 2>/dev/null || echo rebase)"
   case "$_strategy" in
     rebase) _pull_flag=--rebase ;;
     merge) _pull_flag=--no-rebase ;;
-    *) echo "$(date -u +%FT%TZ) [push] invalid reconcile policy: $_strategy" >>"$_log"; return 1 ;;
   esac
   echo "$(date -u +%FT%TZ) [push] rejected; $_strategy-pull $_branch" >>"$_log"
   if git pull "$_pull_flag" origin "$_branch" >>"$_log" 2>&1 && git push origin "HEAD:$_branch" >>"$_log" 2>&1 && _confirm_remote_head; then
     echo "$(date -u +%FT%TZ) [push] ok-after-$_strategy $_branch $(git rev-parse --short HEAD 2>/dev/null)" >>"$_log"; return 0
   fi
-  git rebase --abort >/dev/null 2>&1 || true
+  if [ "$_strategy" = rebase ] && { [ -d "$(git rev-parse --git-path rebase-merge)" ] || [ -d "$(git rev-parse --git-path rebase-apply)" ]; }; then
+    git rebase --abort >/dev/null 2>&1 || true
+  elif [ "$_strategy" = merge ] && [ -f "$(git rev-parse --git-path MERGE_HEAD)" ]; then
+    git merge --abort >/dev/null 2>&1 || true
+  fi
   echo "$(date -u +%FT%TZ) [push] LOCAL-ONLY, NEEDS ATTENTION: $_branch @ $(git rev-parse --short HEAD 2>/dev/null) could not reach origin. Run: gbrain sources pull <id> && git push" >>"$_log"
   return 1
 }`;
@@ -250,6 +263,8 @@ _msg="\${1:?usage: brain-commit-push.sh <message> <path> [paths...]}"; shift || 
 if [ "$#" -eq 0 ]; then
   echo "refusing blind 'git add -A' — pass explicit path(s) to commit" >&2; exit 2
 fi
+brain_reconcile_policy >/dev/null || { echo "invalid gbrain.durabilityReconcile policy" >&2; exit 2; }
+brain_repo_preflight || { echo "existing rebase/merge operation; refusing" >&2; exit 2; }
 # COMMIT BEFORE PULL (#2426): the old order (fetch + pull --rebase, THEN stage)
 # aborted on any dirty tree — 'cannot pull with rebase: You have unstaged
 # changes' — so the helper could never commit a MODIFIED page (exactly the

@@ -166,6 +166,47 @@ describe('brain-commit-push.sh (D13 guarantee)', () => {
     expect(originHead(bare)).toBe(git(work, 'rev-parse', 'HEAD'));
   });
 
+  test('invalid reconcile policy refuses before commit or otherwise-successful push', () => {
+    rmSync(join(work, '.git', 'hooks', 'post-commit'));
+    git(work, 'config', 'gbrain.durabilityReconcile', 'invalid');
+    const before = git(work, 'rev-parse', 'HEAD');
+    const remoteBefore = originHead(bare);
+    writeFileSync(join(work, 'README.md'), 'must remain dirty\n');
+    let code = 0;
+    try {
+      execFileSync('bash', [join(work, 'scripts', 'brain-commit-push.sh'), 'must refuse', 'README.md'], {
+        cwd: work, stdio: ['ignore', 'pipe', 'pipe'], env: process.env,
+      });
+    } catch (e: any) { code = e.status ?? 1; }
+    expect(code).toBe(2);
+    expect(git(work, 'rev-parse', 'HEAD')).toBe(before);
+    expect(originHead(bare)).toBe(remoteBefore);
+    expect(git(work, 'status', '--porcelain', 'README.md')).toBe('M README.md');
+  });
+
+  test('existing merge conflict is preserved and refused before staging or push', () => {
+    rmSync(join(work, '.git', 'hooks', 'post-commit'));
+    git(work, 'checkout', '-qb', 'conflict-side');
+    writeFileSync(join(work, 'README.md'), 'side\n');
+    git(work, 'add', 'README.md'); git(work, 'commit', '-qm', 'side');
+    git(work, 'checkout', '-q', 'main');
+    writeFileSync(join(work, 'README.md'), 'main\n');
+    git(work, 'add', 'README.md'); git(work, 'commit', '-qm', 'main conflict');
+    try { git(work, 'merge', 'conflict-side'); } catch { /* expected conflict */ }
+    const mergeHead = join(work, '.git', 'MERGE_HEAD');
+    expect(existsSync(mergeHead)).toBe(true);
+    const unmergedBefore = git(work, 'ls-files', '-u');
+    let code = 0;
+    try {
+      execFileSync('bash', [join(work, 'scripts', 'brain-commit-push.sh'), 'must refuse', 'README.md'], {
+        cwd: work, stdio: ['ignore', 'pipe', 'pipe'], env: process.env,
+      });
+    } catch (e: any) { code = e.status ?? 1; }
+    expect(code).toBe(2);
+    expect(existsSync(mergeHead)).toBe(true);
+    expect(git(work, 'ls-files', '-u')).toBe(unmergedBefore);
+  });
+
   test('#2426 — commits a MODIFIED tracked file even when the remote advanced (commit before pull)', () => {
     // Pre-fix, the helper ran `git pull --rebase` BEFORE staging, so any dirty
     // tree (a modified/enriched page — exactly the write-through case) aborted
@@ -375,7 +416,10 @@ describe('#4682 — push-lock timeout is fail-loud for the helper only', () => {
     // brain_push bodies are byte-identical (one template, one knob).
     const body = (s: string): string => {
       const m = s.match(/brain_push\(\) \{[\s\S]*?\n\}/);
-      return (m ? m[0] : '').replace(/return [01]; \}/, 'return RC; }');
+      return (m ? m[0] : '').replace(
+        /(lock-timeout \$_branch" >>"\$_log"; return) [01]/,
+        '$1 RC',
+      );
     };
     expect(body(helper).length).toBeGreaterThan(0);
     expect(body(helper)).toBe(body(hook));
