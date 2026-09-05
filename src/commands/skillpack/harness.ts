@@ -83,6 +83,15 @@ export function referenceableBridgeSlugs(written: Record<string, unknown>): stri
   return Object.keys(written).filter(slug => slug !== '_shared').sort();
 }
 
+/** Use installed skills when present; a shared-only ledger has no skill closure. */
+export function selectDefaultReferenceSlugs(
+  written: Record<string, unknown> | undefined,
+  resolveFallback: () => string[],
+): string[] {
+  const slugs = written ? referenceableBridgeSlugs(written) : [];
+  return slugs.length > 0 ? slugs : resolveFallback();
+}
+
 const VALUE_FLAGS = new Set(['--harness', '--persona', '--skill', '--dest', '--scope', '--workspace']);
 const BOOL_FLAGS = new Set(['--stub', '--dry-run', '--json', '--all', '--apply-clean-hunks', '--help', '-h']);
 
@@ -529,13 +538,17 @@ export async function cmdReferenceHarness(args: string[]): Promise<void> {
   try {
     const state = loadBridgeState();
     const entry = findBridgeEntry(state, { harness: a.harness, dest });
-    const slugs = positional
-      ? [positional]
-      : a.skills.length > 0
-        ? a.skills
-        : entry && Object.keys(entry.written).length > 0
-          ? referenceableBridgeSlugs(entry.written)
-          : resolveSlugs(gbrainRoot, a).slugs;
+    let slugs: string[];
+    if (positional) {
+      slugs = [positional];
+    } else if (a.skills.length > 0) {
+      slugs = a.skills;
+    } else {
+      slugs = selectDefaultReferenceSlugs(
+        entry?.written,
+        () => resolveSlugs(gbrainRoot, a).slugs,
+      );
+    }
 
     if (a.applyCleanHunks) {
       if ((!positional && a.skills.length !== 1) || (positional && a.skills.length > 0) || slugs.length !== 1) {

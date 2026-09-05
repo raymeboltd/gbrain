@@ -19,7 +19,7 @@ import {
   runHarnessReference,
   runHarnessReferenceApply,
 } from '../src/core/skillpack/harness-bridge.ts';
-import { referenceableBridgeSlugs } from '../src/commands/skillpack/harness.ts';
+import { selectDefaultReferenceSlugs } from '../src/commands/skillpack/harness.ts';
 
 const cleanups: string[] = [];
 afterEach(() => {
@@ -72,8 +72,15 @@ const REF = (root: string, dest: string, statePath?: string) =>
   runHarnessReference({ gbrainRoot: root, destDir: dest, slugs: ['alpha'], harness: 'claude-code', statePath });
 
 describe('trichotomy', () => {
-  test('default bridge selection excludes the reserved shared ledger key', () => {
-    expect(referenceableBridgeSlugs({ alpha: {}, _shared: {} })).toEqual(['alpha']);
+  test('default bridge selection uses fallback only for missing or shared-only state', () => {
+    let fallbackCalls = 0;
+    const fallback = () => { fallbackCalls++; return ['persona-skill']; };
+
+    expect(selectDefaultReferenceSlugs(undefined, fallback)).toEqual(['persona-skill']);
+    expect(selectDefaultReferenceSlugs({ alpha: {} }, fallback)).toEqual(['alpha']);
+    expect(selectDefaultReferenceSlugs({ alpha: {}, _shared: {} }, fallback)).toEqual(['alpha']);
+    expect(selectDefaultReferenceSlugs({ _shared: {} }, fallback)).toEqual(['persona-skill']);
+    expect(fallbackCalls).toBe(2);
   });
 
   test('fresh full install → all identical', () => {
