@@ -11,7 +11,6 @@
 
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { mkdtempSync, rmSync, statSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   ensureIpcSecretForConfig,
@@ -33,7 +32,10 @@ const URL_B = 'postgresql://user:hunter2@db.example.com:5432/brain_b';
 let tmp: string;
 
 beforeEach(() => {
-  tmp = mkdtempSync(join(tmpdir(), 'gbrain-ipc-uniform-'));
+  // Unix-domain sockets have a small platform path limit. macOS tmpdir() is a
+  // long /var/folders path, which can make this fixture fail before it tests
+  // the config-keyed socket behavior. /tmp keeps the socket path portable.
+  tmp = mkdtempSync('/tmp/gbrain-ipc-uniform-');
 });
 
 afterEach(() => {
