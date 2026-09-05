@@ -12,6 +12,15 @@ import { TERMINAL_AUDIT_SOURCE, NON_EXTRACTABLE_AUDIT_SOURCE } from '../../src/c
 const RUN = hasDatabase();
 const d = RUN ? describe : describe.skip;
 
+async function databaseClock(): Promise<Date> {
+  const [row] = await getEngine().executeRaw<{ clock: Date | string }>(
+    'SELECT clock_timestamp() AS clock',
+  );
+  const clock = new Date(row.clock);
+  if (!Number.isFinite(clock.getTime())) throw new Error('Postgres returned an invalid clock timestamp');
+  return clock;
+}
+
 beforeAll(async () => { if (RUN) await setupDB(); });
 afterAll(async () => { if (RUN) await teardownDB(); });
 
@@ -71,7 +80,10 @@ d("Cross-session recall test (Postgres)", () => {
   // `source` (the writer), not on the fact TEXT.
   test('excludeAuditRows filters extraction audit checkpoint rows out of listFactsSince', async () => {
     const engine = getEngine();
-    const before = new Date();
+    // Keep the boundary in Postgres's clock domain. Under a tight insert,
+    // the client clock can lead clock_timestamp() by a fraction of 1 ms and
+    // exclude only the first row whose created_at falls below the cutoff.
+    const before = await databaseClock();
     await engine.insertFact(
       {
         fact: 'EXTRACTION_COMPLETE',
@@ -117,7 +129,7 @@ d("Cross-session recall test (Postgres)", () => {
   // matching on fact TEXT — which hid this legitimate content.
   test('excludeAuditRows only excludes audit-SOURCED rows — a real fact whose exact text matches an audit marker string survives (pg)', async () => {
     const engine = getEngine();
-    const before = new Date();
+    const before = await databaseClock();
     await engine.insertFact(
       {
         fact: 'EXTRACTION_COMPLETE',
