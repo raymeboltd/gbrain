@@ -19,6 +19,7 @@ import {
   runHarnessReference,
   runHarnessReferenceApply,
 } from '../src/core/skillpack/harness-bridge.ts';
+import { referenceableBridgeSlugs } from '../src/commands/skillpack/harness.ts';
 
 const cleanups: string[] = [];
 afterEach(() => {
@@ -71,12 +72,18 @@ const REF = (root: string, dest: string, statePath?: string) =>
   runHarnessReference({ gbrainRoot: root, destDir: dest, slugs: ['alpha'], harness: 'claude-code', statePath });
 
 describe('trichotomy', () => {
+  test('default bridge selection excludes the reserved shared ledger key', () => {
+    expect(referenceableBridgeSlugs({ alpha: {}, _shared: {} })).toEqual(['alpha']);
+  });
+
   test('fresh full install → all identical', () => {
     const root = fixtureRoot();
     const dest = tmp('gb-ref-dest-');
     const statePath = join(tmp('gb-ref-st-'), 's.json');
     install(root, dest, statePath, 'full');
-    expect(REF(root, dest, statePath).summary).toEqual({ identical: 2, differs: 0, missing: 0 });
+    const reference = REF(root, dest, statePath);
+    expect(reference.summary).toEqual({ identical: 2, differs: 0, missing: 0 });
+    expect(reference.files.map(file => file.relTarget)).toContain('_rules.md');
   });
 
   test('local edit → differs [local_edit] with a unified diff', () => {

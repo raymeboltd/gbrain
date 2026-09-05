@@ -78,6 +78,11 @@ interface HarnessArgs {
   positional: string[];
 }
 
+/** `_shared` records copied dependencies, not a manifest skill slug. */
+export function referenceableBridgeSlugs(written: Record<string, unknown>): string[] {
+  return Object.keys(written).filter(slug => slug !== '_shared').sort();
+}
+
 const VALUE_FLAGS = new Set(['--harness', '--persona', '--skill', '--dest', '--scope', '--workspace']);
 const BOOL_FLAGS = new Set(['--stub', '--dry-run', '--json', '--all', '--apply-clean-hunks', '--help', '-h']);
 
@@ -529,7 +534,7 @@ export async function cmdReferenceHarness(args: string[]): Promise<void> {
       : a.skills.length > 0
         ? a.skills
         : entry && Object.keys(entry.written).length > 0
-          ? Object.keys(entry.written).sort()
+          ? referenceableBridgeSlugs(entry.written)
           : resolveSlugs(gbrainRoot, a).slugs;
 
     if (a.applyCleanHunks) {
