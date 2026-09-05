@@ -242,7 +242,8 @@ describe('workspace-push finish() choke point', () => {
 
   test('a clean lock-skip never touches the cache (skip returns before finish)', async () => {
     seedWarnCache();
-    const lock = acquirePushLock(work);
+    // Match workspacePush's canonical Git root (macOS /var is a /private/var alias).
+    const lock = acquirePushLock(git(work, 'rev-parse', '--show-toplevel'));
     expect(lock.acquired).toBe(true);
     try {
       writeFileSync(join(work, 'note.md'), 'racing\n');
