@@ -465,3 +465,16 @@ test.skipIf(skip)('canonical reconciliation preserves fact identity and provenan
     await engine.disconnect();
   }
 });
+
+import { assertDuplicateFactIdentity } from '../helpers/fact-provenance-contract.ts';
+test.skipIf(skip)('duplicate claims retain distinct proven identities on Postgres', async () => {
+  assertSafeE2eDatabaseUrl(databaseUrl!);
+  const engine = new PostgresEngine();
+  await engine.connect({ database_url: databaseUrl! });
+  try {
+    await engine.initSchema();
+    await assertDuplicateFactIdentity(engine);
+  } finally {
+    await engine.disconnect();
+  }
+});
