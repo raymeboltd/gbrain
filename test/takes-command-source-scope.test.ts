@@ -19,6 +19,17 @@ function makeEngine(opts: { knownSources?: string[] } = {}) {
   const pageLookups: unknown[][] = [];
   const engine = {
     getConfig: async () => null,
+    getPage: async (slug: string, scope: { sourceId?: string } = {}) => {
+      const sourceId = scope.sourceId ?? 'default';
+      pageLookups.push([slug, sourceId]);
+      if (slug !== 'shared/page' || !['dept', 'default'].includes(sourceId)) return null;
+      return {
+        id: sourceId === 'dept' ? 22 : 11, slug, source_id: sourceId,
+        type: 'note', title: 'Shared page', frontmatter: {},
+        compiled_truth: `Canonical body for ${sourceId}`, timeline: '',
+      };
+    },
+    getTags: async () => [],
     executeRaw: async (sql: string, params: unknown[] = []) => {
       if (sql.includes('FROM sources WHERE id = $1')) {
         // Default (no `knownSources` override): every id "exists", matching
@@ -91,6 +102,8 @@ describe('gbrain takes CLI source scoping', () => {
     const written = join(brainDir, '.sources', 'dept', 'shared/page.md');
     expect(existsSync(written)).toBe(true);
     expect(readFileSync(written, 'utf-8')).toContain('Dept-scoped claim');
+    expect(readFileSync(written, 'utf-8')).toContain('Canonical body for dept');
+    expect(readFileSync(written, 'utf-8')).not.toContain('Canonical body for default');
   });
 
   test('add with no source configuration at all still resolves cleanly (no regression)', async () => {
@@ -339,8 +352,8 @@ describe('gbrain takes add — page validated before markdown is written', () =>
     tmpRoots.push(brainDir, home);
     const { engine, added } = makeEngine();
 
-    // makeEngine returns [] for any slug other than shared/page, so getPageId
-    // takes its not-found path and exits 1.
+    // makeEngine returns null for any slug other than shared/page, so the
+    // canonical page read takes its not-found path and exits 1.
     const errs: string[] = [];
     const errSpy = spyOn(console, 'error').mockImplementation((...a: unknown[]) => { errs.push(a.join(' ')); });
     const exitSpy = spyOn(process, 'exit').mockImplementation(((code?: number) => {
