@@ -156,3 +156,20 @@ export async function invalidateStaleSignatureEmbeddingsGuarded(
   );
   return (rows as unknown[]).length;
 }
+
+/** Facts and takes lack per-vector model stamps. A model change invalidates
+ * their old coordinates even when dimensions match. Call before config advances;
+ * current DB state, not a stale plan, makes resumed applies preserve new vectors.
+ * Only derived columns change; semantic fields and provenance stay intact. */
+export async function invalidateFactAndTakeEmbeddings(
+  engine: BrainEngine, fallbackFromModel: string, toModel: string,
+): Promise<void> {
+  const currentModel = await engine.getConfig('embedding_model') ?? fallbackFromModel;
+  if (currentModel === toModel) return;
+  await engine.transaction(async (tx) => {
+    for (const table of ['facts', 'takes']) {
+      await tx.executeRaw(`UPDATE ${table} SET embedding = NULL, embedded_at = NULL
+        WHERE embedding IS NOT NULL OR embedded_at IS NOT NULL`);
+    }
+  });
+}

@@ -54,8 +54,8 @@ plane, which the provider pipeline reads), or by editing
 
 **Pick `--dim` = your brain's current column width when the target supports
 it.** A different width triggers the destructive schema transition (column +
-index rebuild across all three dim-pinned tables); the same width skips it
-entirely. `gbrain doctor` (check `provider_sunset`, for providers with an
+index rebuild across all four dim-pinned tables); the same width skips that rebuild, but a
+model change still clears old-space fact/take vectors and the query cache. `gbrain doctor` (check `provider_sunset`, for providers with an
 announced shutdown) prints target-aware paste-ready commands — the Voyage
 command at its valid 1024 width, plus an OpenAI keep-width alternative with
 your actual width filled in when that width is valid there — reading the real
@@ -124,14 +124,15 @@ ingestion — not just new content.
    completed migration.
 5. **Apply.** When the target width differs from the actual column width,
    runs the atomic schema transition owned by `embedding-migration.ts`,
-   in one transaction. It rebuilds **all three dim-pinned text-embedding-space
-   columns** — `content_chunks.embedding`, `query_cache.embedding`, and
-   `facts.embedding` — at the new width, preserving each column's type
-   (`vector` vs `halfvec`) and recreating its HNSW index. Missing any of the
-   three leaves it silently broken: a narrow `query_cache.embedding` makes
+   in one transaction. It rebuilds **all four dim-pinned text-embedding-space
+   columns** — `content_chunks.embedding`, `query_cache.embedding`,
+   `facts.embedding`, and `takes.embedding` — at the new width, preserving dependent column types
+   (`vector` vs `halfvec`) and recreating its HNSW index. Leaving a dependent column at its old width breaks its consumer: a narrow `query_cache.embedding` makes
    every cache write and read fail *by design* (the cache swallows errors so
    it can never break search) for a permanent 0% hit rate, and a narrow
-   `facts.embedding` fails every per-fact embed write. The image/multimodal
+   `facts.embedding` fails per-fact writes, while `takes.embedding` fails
+   Think vector retrieval and take embedding writes. A stranded dependent
+   column is repaired independently when page chunks already have the target width. The image/multimodal
    columns ARE deliberately untouched — they use separate models whose
    dimensions are independent of the text embedding model.
    Writes `embedding_model` + `embedding_dimensions` to BOTH config planes
@@ -145,9 +146,12 @@ ingestion — not just new content.
 
 ## What the rebuild deletes
 
-The dimension change **deletes every stored embedding vector** in the brain —
-they are in the old model's space and unusable. They are not recoverable:
-going back to the previous provider means paying for a second full re-embed.
+The dimension change clears vectors in the four text-space columns above;
+image/multimodal vectors are untouched. A same-width model change also clears
+fact/take vectors and their derived embedding timestamps before config advances,
+while preserving IDs, semantic fields, provenance and other timestamps.
+Restore a verified pre-migration database/vector backup for exact rollback;
+without one, returning to the old model requires regenerating its vectors.
 `content_chunks` vectors are rebuilt by the re-embed pass, the query cache
 refills on the next query. Existing facts retain their IDs and provenance during
 fence reconciliation, so unchanged facts need an explicit NULL-vector backfill:
@@ -177,6 +181,13 @@ local server implementations cannot proxy requests elsewhere.
 
 **Say to your agent:** *"Restore missing fact embeddings after migration — run
 `gbrain embed --facts --stale --source <source-id>` for the authorized source."*
+
+After page migration, `gbrain takes embed` regenerates active NULL take vectors
+through the configured embedding gateway. Page migration completion alone does
+not certify that the separate fact and take backlogs have been drained.
+
+**Say to your agent:** *"Restore missing take embeddings after migration — run
+`gbrain takes embed` with the configured embedding provider."*
 
 ## Resume after a kill
 
