@@ -44,12 +44,18 @@ import { join } from 'node:path';
 //     and clears expiry only on the replacement revision being committed.
 //     This is deterministic source-of-record projection, not contradiction
 //     probe auto-supersession.
+//   - facts/reconcile-retained.ts — caller-requested canonical fence replay:
+//     matching claim/source identities retain their DB IDs while valid_until
+//     follows the represented fence lifecycle state. This is the same
+//     authoritative import formerly expressed by delete + insert; it neither
+//     infers supersession nor lets the contradiction probe auto-apply changes.
 const VALID_UNTIL_WRITE_ALLOWLIST: ReadonlySet<string> = new Set([
   'src/core/cycle/phases/consolidate.ts',
   'src/core/facts/forget.ts',
   'src/core/postgres-engine.ts',
   'src/core/pglite-engine.ts',
   'src/core/source-events/projector.ts',
+  'src/core/facts/reconcile-retained.ts',
 ]);
 
 function walkTs(dir: string, acc: string[] = []): string[] {
