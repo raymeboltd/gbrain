@@ -34,14 +34,18 @@ do, `think` falls back to keyword-only takes retrieval and
 
 ## Facts (hot memory — `facts` table)
 
-Personal knowledge from the brain owner's conversations. Real-time capture.
+Personal knowledge captured from conversations and attributed source evidence.
 
-- **Source:** Extracted per-turn from conversation by the facts hook (Haiku)
-- **Scope:** Single-user — only the brain owner's stated knowledge
+- **Source:** Conversation hooks and canonical fact writers, including the
+  default-off source-event projection lane for approved sources
+- **Scope:** Preserve the speaker and source attribution. Source-event evidence
+  is not automatically the brain owner's belief; conversation extraction keeps
+  user messages distinct from assistant context and explicit tool evidence
 - **Kinds:** `event`, `preference`, `commitment`, `belief`, `fact`, `idea`
   (`idea` is extractor/DB-only — the frozen `remember` verb enum stays at five,
   per `docs/protocol/MEMORY_VERBS_v1.md`)
-- **Lifecycle:** Hot storage, real-time. Captured as conversations happen.
+- **Lifecycle:** Hot storage. Conversation capture and approved source-event
+  projection both retain provenance for later correction and retraction.
 - **Bridge:** Dream cycle `consolidate` phase promotes hot facts → cold takes nightly
 
 **Example facts:**
@@ -59,9 +63,10 @@ beliefs (a partner's assessment of a company, an investor's view on markets, a
 founder's revenue claims). These are NOT the brain owner's personal facts.
 
 **Never dump facts into the takes table without transformation.** Facts are
-scoped to what the owner said in conversation. They become takes only through
-the dream cycle's consolidate phase, which adds proper attribution, deduplication,
-and temporal reasoning.
+attributed to their original conversation or source evidence. Promoting them
+through the dream cycle's consolidate phase adds holder attribution,
+deduplication and temporal reasoning; it must not turn a source's statement into
+an assertion by the owner.
 
 ## The Bridge
 
