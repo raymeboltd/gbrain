@@ -2,6 +2,46 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.48.3.0] - 2026-09-06
+
+**Source evidence and retained facts survive synchronization and missing mirrors.**
+
+This fork release combines upstream 0.48.2.0 with the retained source-event,
+source-isolation and recovery changes. It keeps immutable source evidence
+separate from maintained knowledge and prevents later synchronization from
+silently discarding fact provenance or replacing a page with only its takes.
+
+### Fixed
+
+- Adding a take to a database page whose Markdown mirror is missing now
+  initializes the mirror from the complete source-scoped page and tags.
+- Replaying canonical fact fences retains matching fact IDs, source-session
+  attribution, creation time, embeddings and database-only typed enrichment.
+  Ambiguous duplicate identities refuse reconciliation instead of choosing one.
+- Fact reconciliation defers while an unsynchronized source-event projection is
+  pending, and checks the page and fact snapshot again under the projection lock.
+- Conversation normalization preserves native speaker roles, quoted/code
+  evidence and provider timestamps without treating assistant text as user intent.
+  Reviewed projection changes retain raw evidence and use revisioned recovery.
+- Backlink repairs remain bounded and confined to their owned source paths.
+  Worker process-age checks use explicit UTC, and durability retries preserve
+  reconciliation ownership and unrelated shared history.
+
+### Compatibility and recovery
+
+The upstream facts `idea` constraint change runs at schema migration 149 in
+this fork, preserving its existing source-event migration identities. Existing
+embeddings and provider configuration are unchanged. Markdown synchronization
+cannot reconstruct database-only source events or audit history; preserve a
+verified database backup alongside the source files.
+
+### To take advantage of v0.48.3.0
+
+Update the client and service from this same release, apply the native schema
+migration, and verify source-scoped reads and synchronization. Existing pages
+that already lost their body require a separately reviewed recovery from
+preserved history; installing the writer fix does not silently rewrite them.
+
 ## [0.48.2.0] - 2026-09-02
 
 **Your search reranker now runs on Voyage, and every surface tells you whether it is actually running.**
