@@ -97,14 +97,19 @@ export const E2E_TEST_MAP: Record<string, string[]> = {
     "test/e2e/minions-shell-pglite.test.ts",
     "test/e2e/worker-abort-recovery.test.ts",
   ],
+  "src/core/fact-embedding-backfill.ts": ["test/e2e/fact-embedding-backfill.test.ts"],
   "src/commands/embed.ts": [
+    "test/e2e/fact-embedding-backfill.test.ts",
     "test/e2e/multi-source-bug-class.test.ts",
     // #3391: the NULL-signature stale predicates differ per engine.
     "test/e2e/migrate-embeddings-postgres.test.ts",
   ],
   // #3390: runSchemaTransition's DDL path + the stale predicates behave
   // differently on real pgvector than on PGLite.
-  "src/core/embedding-migration.ts": ["test/e2e/migrate-embeddings-postgres.test.ts"],
+  "src/core/embedding-migration.ts": [
+    "test/e2e/migrate-embeddings-postgres.test.ts",
+    "test/e2e/takes-vector-migration-postgres.test.ts",
+  ],
   "src/core/retrieval-upgrade-planner.ts": ["test/e2e/migrate-embeddings-postgres.test.ts"],
   "src/commands/extract.ts": ["test/e2e/multi-source-bug-class.test.ts"],
   "src/commands/migrate-engine.ts": [
