@@ -51,7 +51,7 @@ import {
   type ParseResult,
 } from './takes-fence.ts';
 import { withPageLock } from './page-lock.ts';
-import { resolvePageFilePath, resolveSourceLocalFilePath } from './markdown.ts';
+import { resolvePageFilePath, resolveSourceLocalFilePath, serializePageToMarkdown } from './markdown.ts';
 import { sanitizeRecordedSourcePath, recordedPathFromFileUri } from './write-through.ts';
 import { isWriteTargetContained, msysToNativePath } from './path-confine.ts';
 import { atomicWriteFileSync } from './atomic-write.ts';
@@ -456,14 +456,21 @@ export async function addTakeToPage(
     // Resolve the page BEFORE touching the markdown (the historical CLI
     // ordering): failing after a fence write would leave a take on disk the
     // DB never saw until the next reconcile.
-    const pageId = await getPageId(target.engine, target.slug, target.sourceId);
-    // add is the one mutate that may CREATE the page file + fence (first take
-    // on a page) — readPageBody's existence refusal applies to row-targeting
-    // mutates, not appends; the page itself was verified in the DB above.
+    const sourceId = target.sourceId ?? 'default';
+    const page = await target.engine.getPage(target.slug, { sourceId });
+    if (!page) {
+      throw new TakesWriteError('page_not_found', `Page not found in brain: ${target.slug} (source=${sourceId}).`);
+    }
+    const pageId = page.id;
+    // DB-born atoms/concepts can lack a filesystem mirror. Seed the WHOLE
+    // canonical page, not an empty body: the next sync imports this file as
+    // authoritative and would otherwise erase body and provenance (and permit type re-inference).
     const { path, writeRoot } = await resolveTakesFilePath(
       target.engine, target.brainDir, target.slug, target.sourceId,
     );
-    const body = existsSync(path) ? readFileSync(path, 'utf-8') : '';
+    const body = existsSync(path)
+      ? readFileSync(path, 'utf-8')
+      : serializePageToMarkdown(page, await target.engine.getTags(target.slug, { sourceId }));
     // F1: guard only fires when a fence ALREADY exists (an empty/fence-less body
     // parses to zero warnings) — a whole-fence re-render must not delete rows
     // this version couldn't parse.

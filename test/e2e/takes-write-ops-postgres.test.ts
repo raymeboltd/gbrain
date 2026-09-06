@@ -40,6 +40,8 @@ import { dispatchToolCall } from '../../src/mcp/dispatch.ts';
 import { TAKES_FENCE_BEGIN, TAKES_FENCE_END } from '../../src/core/takes-fence.ts';
 import { acquirePageLock } from '../../src/core/page-lock.ts';
 
+import { assertMissingTakeMirrorRoundTrip } from '../helpers/take-mirror-contract.ts';
+
 const RUN = hasDatabase();
 const d = RUN ? describe : describe.skip;
 
@@ -376,4 +378,11 @@ d('takes_supersede closes the old row and links the new one', () => {
     expect(md).toContain('~~Will hit 10M ARR by Q4~~');
     expect(md).toContain('| 2 | Will hit 8M ARR by Q4 (revised) |');
   });
+});
+
+
+test.skipIf(!RUN)('DB-only atom preserves full page through missing take mirror and re-import', async () => {
+  const engine = getEngine();
+  await assertMissingTakeMirrorRoundTrip(engine);
+  await assertMissingTakeMirrorRoundTrip(engine, false);
 });
