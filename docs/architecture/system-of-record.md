@@ -73,7 +73,6 @@ chunker + embedder rebuild these on import.
 |---|---|---|
 | `pages` | The markdown file as a whole | One row per file; `compiled_truth` + `frontmatter` come from parse |
 | `content_chunks` | `pages.compiled_truth` after chunker strip | Re-chunked on content_hash change; embedded via configured model |
-| `page_versions` | Each `pages` UPDATE | Audit history; rebuildable in principle but not in practice |
 
 ### DB-only by design (named exceptions)
 
@@ -94,6 +93,7 @@ the repo. The architectural rule still holds — these aren't
 | `op_checkpoint_paths` | Sync-resume checkpoint. Append-only progress banking; a completed sync makes it irrelevant. |
 | `config` (some keys) | Site-local routing config (e.g. `sync.repo_path`). |
 | `source_event_receipts` | Operational stage/idempotency ledger. User knowledge is in the private source-event artifact and entity facts fences. |
+| `page_versions` | Historical page-update audit snapshots. Current Markdown cannot reconstruct previous versions; preserve a DB snapshot when this history is needed. |
 
 A new derived table that holds user-knowledge MUST land FS-first.
 If you're tempted to add one as "DB-only for now," the structural
