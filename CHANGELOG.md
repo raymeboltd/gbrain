@@ -2,6 +2,17 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.48.4.0] - 2026-09-06
+
+**Preserve fact identity and keep text embeddings compatible during repair.**
+
+- Add `gbrain embed --facts --stale --source <id>` with dry-run, background jobs and bounded batches. `--local-only` refuses non-local embedding routes.
+- Resume from durable NULL-vector state while preserving fact IDs, provenance, typed fields and timestamps. Source, model, dimension and row checks prevent stale results after concurrent changes.
+- Preserve distinct duplicate facts when their complete row and context mapping is unambiguous. Partial or ambiguous duplicate edits refuse reconciliation before mutation.
+- Include takes in text-vector dimension migrations, and clear derived fact and take vectors when the embedding model changes at the same width. A resumed migration preserves vectors already generated for the target model.
+- Native PGLite and Postgres contracts cover source isolation, reconciliation identity, bounded backfill, vector migration and recovery after interrupted configuration updates.
+- Installing this release does not automatically change the embedding provider or stored vector dimensions.
+
 ## [0.48.3.0] - 2026-09-06
 
 **Source evidence and retained facts survive synchronization and missing mirrors.**
