@@ -70,6 +70,7 @@ import {
 } from './phantom-redirect.ts';
 import { embed, isAvailable } from '../ai/gateway.ts';
 import { isAborted } from '../abort-check.ts';
+import { tryAcquireDbLock } from '../db-lock.ts';
 
 interface ExistingPageFact {
   // v0.46 (#3014) — the row's own fact id. Read so the supersession-drift
@@ -79,6 +80,7 @@ interface ExistingPageFact {
   fact: string;
   source: string | null;
   row_num: number | string | null;
+  context: string | null;
   // v0.46 (#3014) — supersession columns, read so a struck row whose
   // fence says "superseded" but whose DB columns are still NULL counts as
   // drifted and re-heals through the wipe+reinsert fallback.
@@ -133,7 +135,10 @@ async function listExistingFactsForPage(
   sourceId: string,
 ): Promise<ExistingPageFact[]> {
   return engine.executeRaw<ExistingPageFact>(
-    `SELECT id, fact, source, row_num, superseded_by, expired_at
+    `SELECT id, fact, source, row_num, context, superseded_by, expired_at,
+            kind, visibility, notability, confidence, valid_from, valid_until,
+            claim_metric, claim_value, claim_unit, claim_period, event_type,
+            source_session, created_at
        FROM facts
       WHERE source_id = $1
         AND source_markdown_slug = $2
@@ -142,6 +147,69 @@ async function listExistingFactsForPage(
       ORDER BY row_num ASC, id ASC`,
     [sourceId, slug],
   );
+}
+
+// Include markers in the DB mirror before pages.compiled_truth catches up.
+async function pendingIndexedOrCanonicalRuns(
+  engine: BrainEngine, sourceId: string, slug: string,
+  parsedFacts: ReturnType<typeof parseFactsFence>['facts'],
+): Promise<string[]> {
+  const indexedPending = await engine.executeRaw<{ context: string; fact: string; source: string | null; row_num: number }>(
+    `SELECT context,fact,source,row_num FROM facts WHERE source_id=$1 AND source_markdown_slug=$2
+    AND context LIKE '%source-event-pending:%'`,
+    [sourceId, slug],
+  );
+  // A finalized/retracted canonical fence can clear a marker before its DB
+  // mirror is reconciled. Its exact row/content/source is authority to clear
+  // that stale DB marker; a missing or changed row is not such proof.
+  const unfinalizedIndexed = indexedPending.filter((indexed) => !parsedFacts.some((row) =>
+    row.rowNum === Number(indexed.row_num)
+    && factContentKey(row.claim, row.source) === factContentKey(indexed.fact, indexed.source)
+    && sourceEventPendingRunIds([row]).length === 0));
+  return sourceEventPendingRunIds([...parsedFacts, ...unfinalizedIndexed]);
+}
+
+function factSnapshotJson(_key: string, value: unknown): unknown {
+  return typeof value === 'bigint' ? value.toString() : value;
+}
+
+/** Short mutation window shared with the projector; parsing/embedding stay outside.
+ * Re-read both snapshots AFTER acquiring the lock: a completed projection during
+ * embedding must not be reconciled against the old page body or old row set.
+ */
+async function guardedFactReconcile<T>(
+  engine: BrainEngine,
+  sourceId: string,
+  slug: string,
+  page: { id: number; compiled_truth: string; timeline: string; effective_date?: Date | string | null },
+  existing: ExistingPageFact[],
+  warnings: string[],
+  mutate: () => Promise<T>,
+): Promise<T | undefined> {
+  const lock = await tryAcquireDbLock(engine, `gbrain-source-event-projection:${sourceId}`, 20);
+  if (!lock) {
+    warnings.push(`${slug}: SOURCE_EVENT_FACT_COMMIT_PENDING: source projection is active; deferring reconciliation.`);
+    return undefined;
+  }
+  try {
+    const current = await engine.getPage(slug, { sourceId });
+    // Recheck the COMPLETE marker set under the lock, including expired
+    // legacy rows excluded from the ordinary reconciliation snapshot.
+    if (current && (await pendingIndexedOrCanonicalRuns(engine, sourceId, slug, parseFactsFence(current.compiled_truth).facts)).length > 0) {
+      warnings.push(`${slug}: SOURCE_EVENT_FACT_COMMIT_PENDING: pending facts appeared before commit; deferring reconciliation.`);
+      return undefined;
+    }
+    const currentFacts = await listExistingFactsForPage(engine, slug, sourceId);
+    if (!current || current.id !== page.id || current.compiled_truth !== page.compiled_truth || current.timeline !== page.timeline
+        || String(current.effective_date ?? '') !== String(page.effective_date ?? '')
+        || JSON.stringify(currentFacts, factSnapshotJson) !== JSON.stringify(existing, factSnapshotJson)) {
+      warnings.push(`${slug}: SOURCE_EVENT_FACT_RECONCILE_DRIFT: page or facts changed before commit; deferring reconciliation.`);
+      return undefined;
+    }
+    return await mutate();
+  } finally {
+    await lock.release();
+  }
 }
 
 export interface ExtractFactsOpts {
@@ -515,7 +583,7 @@ export async function runExtractFacts(
       continue;
     }
 
-    const pendingSourceEventRuns = sourceEventPendingRunIds(parsed.facts);
+    const pendingSourceEventRuns = await pendingIndexedOrCanonicalRuns(engine, sourceId, slug, parsed.facts);
     if (pendingSourceEventRuns.length > 0) {
       const receipts = await engine.executeRaw<{ run_id: string; projection_state: string }>(
         `SELECT run_id,projection_state FROM source_event_receipts
@@ -565,11 +633,12 @@ export async function runExtractFacts(
         // them — so they MUST survive this reconcile. #2646: soft-expired
         // legacy rows (forget_fact's record of the forget) likewise
         // survive via preserveExpiredLegacy.
-        const deleted = await engine.deleteFactsForPage(slug, sourceId, {
-          excludeSourcePrefixes: ['cli:'],
-          preserveExpiredLegacy: true,
-        });
-        result.factsDeleted += deleted.deleted;
+        const deleted = await guardedFactReconcile(engine, sourceId, slug, page, existing, result.warnings,
+          () => engine.deleteFactsForPage(slug, sourceId, {
+            excludeSourcePrefixes: ['cli:'],
+            preserveExpiredLegacy: true,
+          }));
+        if (deleted) result.factsDeleted += deleted.deleted;
       }
       continue;
     }
@@ -701,11 +770,13 @@ export async function runExtractFacts(
 
     if (toInsert.length === 0) continue;
 
-    const inserted = await engine.insertFacts( // gbrain-allow-direct-insert: extract_facts cycle phase reconciles fence → DB
-      toInsert,
-      { source_id: sourceId },
-      deleteForPageFirst ? { deleteForPageFirst } : undefined,
-    );
+    const inserted = await guardedFactReconcile(engine, sourceId, slug, page, existing, result.warnings,
+      () => engine.insertFacts( // gbrain-allow-direct-insert: extract_facts cycle phase reconciles fence → DB
+        toInsert,
+        { source_id: sourceId },
+        deleteForPageFirst ? { deleteForPageFirst } : undefined,
+      ));
+    if (!inserted) continue;
     result.factsInserted += inserted.inserted;
     result.factsUpdated += inserted.updated ?? 0;
     // Reconciliation ran inside insertFacts' transaction;

@@ -39,6 +39,7 @@ afterAll(async () => engine.disconnect());
 
 beforeEach(async () => {
   await engine.executeRaw('DELETE FROM source_event_receipts');
+  await engine.executeRaw('DELETE FROM facts');
   await engine.executeRaw('DELETE FROM timeline_entries');
   await engine.executeRaw('DELETE FROM links');
   await engine.executeRaw('DELETE FROM pages');

@@ -11,6 +11,9 @@ import { chunkText } from '../src/core/chunkers/recursive.ts';
 import { writePageThrough, _resetWriteThroughCacheForTest } from '../src/core/write-through.ts';
 import { operationsByName } from '../src/core/operations.ts';
 import { writeSingleFact } from '../src/core/facts/write-single.ts';
+import { tryAcquireDbLock } from '../src/core/db-lock.ts';
+import { renderFactsTable } from '../src/core/facts-fence.ts';
+import { writeFactsToFence } from '../src/core/facts/fence-write.ts';
 import { loadSourceEventArtifact } from '../src/core/source-events/artifact.ts';
 import {
   listCompiledTruthCandidates,
@@ -107,6 +110,106 @@ async function seedKnownTargets(): Promise<void> {
 }
 
 describe('source-event projector', () => {
+  test('reconcile preserves an unsynced pending fence during projection and after a crash', async () => {
+    await seedKnownTargets();
+    await engine.executeRaw("UPDATE sources SET local_path=$1 WHERE id='default'", [brainDir]);
+    const runFacts: NonNullable<SourceEventProjectorDeps['runFacts']> = async (factsEngine, _input, _targets, run) => {
+      const written = await writeFactsToFence(factsEngine, {
+        sourceId: 'default', localPath: brainDir, slug: 'projects/porsche', resolutionSource: 'exact_page',
+      }, [{ fact: 'Delivery Friday', kind: 'fact', notability: 'medium', source: 'source-event',
+        context: 'raw/gmail/msg-123', visibility: 'private', confidence: 1, embedding: null,
+        sessionId: run.factSessionId, pendingRunId: run.runId }]);
+      expect(fs.readFileSync(path.join(brainDir, 'projects/porsche.md'), 'utf8')).toContain('source-event-pending:');
+      expect((await engine.getPage('projects/porsche', { sourceId: 'default' }))?.compiled_truth).not.toContain('source-event-pending:');
+      const pending = await runExtractFacts(factsEngine, { sourceId: 'default', slugs: ['projects/porsche'] });
+      expect(pending.warnings.some((warning) => warning.includes('SOURCE_EVENT_FACT_COMMIT_PENDING'))).toBe(true);
+      expect(pending.factsInserted + pending.factsDeleted).toBe(0);
+      expect(await engine.executeRaw('SELECT id FROM facts WHERE id=ANY($1::int[])', [written.ids])).toHaveLength(written.ids.length);
+      return { inserted: written.inserted, duplicate: 0, superseded: 0, factIds: written.ids, stage: 'applied' };
+    };
+    expect((await projectSourceEvent(engine, input(), { runFacts })).status).toBe('applied');
+    // A crash releases the source lock; marker-bearing indexed rows must still
+    // protect the newer canonical fence while pages.compiled_truth is stale.
+    const crashed = await writeFactsToFence(engine, {
+      sourceId: 'default', localPath: brainDir, slug: 'projects/porsche', resolutionSource: 'exact_page',
+    }, [{ fact: 'Awaiting interrupted projection', kind: 'fact', notability: 'medium', source: 'source-event',
+      context: 'raw/gmail/msg-123', visibility: 'private', confidence: 1, embedding: null,
+      sessionId: 'source-event:crashed-fixture', pendingRunId: 'crashed-fixture' }]);
+    const afterCrash = await runExtractFacts(engine, { sourceId: 'default', slugs: ['projects/porsche'] });
+    expect(afterCrash.warnings.some((warning) => warning.includes('SOURCE_EVENT_FACT_COMMIT_PENDING'))).toBe(true);
+    expect(afterCrash.factsInserted + afterCrash.factsDeleted).toBe(0);
+    expect(await engine.executeRaw('SELECT id FROM facts WHERE id=ANY($1::int[])', [crashed.ids])).toHaveLength(crashed.ids.length);
+  });
+
+  test('source lock contention preserves rows without blocking reconciliation in another source', async () => {
+    await seedKnownTargets();
+    await engine.executeRaw("INSERT INTO sources(id,name) VALUES ('unrelated','unrelated') ON CONFLICT DO NOTHING");
+    for (const sourceId of ['default', 'unrelated']) {
+      await engine.putPage('projects/lock-example', { title: 'Lock Example', type: 'project', compiled_truth: 'Fence intentionally absent.' }, { sourceId });
+      await engine.insertFacts([{ fact: 'Existing row', source: 'fence:reconcile', source_markdown_slug: 'projects/lock-example', row_num: 1 }], { source_id: sourceId });
+    }
+    const lock = await tryAcquireDbLock(engine, 'gbrain-source-event-projection:default', 20);
+    expect(lock).not.toBeNull();
+    try {
+      const blocked = await runExtractFacts(engine, { sourceId: 'default', slugs: ['projects/lock-example'] });
+      expect(blocked.warnings.some((warning) => warning.includes('SOURCE_EVENT_FACT_COMMIT_PENDING'))).toBe(true);
+      expect(blocked.factsDeleted).toBe(0);
+      expect(await engine.executeRaw("SELECT 1 FROM facts WHERE source_id='default'")).toHaveLength(1);
+      expect((await runExtractFacts(engine, { sourceId: 'unrelated', slugs: ['projects/lock-example'] })).factsDeleted).toBe(1);
+    } finally { await lock!.release(); }
+    expect((await runExtractFacts(engine, { sourceId: 'default', slugs: ['projects/lock-example'] })).factsDeleted).toBe(1);
+  });
+
+  test('page correction between parse and mutation defers the stale write and releases the source lock', async () => {
+    await seedKnownTargets();
+    const slug = 'projects/porsche';
+    const body = renderFactsTable([{ rowNum: 1, claim: 'Delivery Friday', kind: 'fact', confidence: 1, visibility: 'private', notability: 'medium', active: true }]);
+    await engine.putPage(slug, { title: 'Porsche Project', type: 'project', compiled_truth: body });
+    const getPage = engine.getPage;
+    let raced = false;
+    engine.getPage = async (...args) => {
+      const page = await getPage.apply(engine, args);
+      if (args[0] === slug && page && !raced) {
+        raced = true;
+        await engine.putPage(slug, { title: page.title, type: page.type, compiled_truth: body.replace('Delivery Friday', 'Delivery Monday') });
+      }
+      return page;
+    };
+    try {
+      const deferred = await runExtractFacts(engine, { sourceId: 'default', slugs: [slug] });
+      expect(deferred.warnings.some((warning) => warning.includes('SOURCE_EVENT_FACT_RECONCILE_DRIFT'))).toBe(true);
+      expect(deferred.factsInserted + deferred.factsDeleted).toBe(0);
+    } finally { engine.getPage = getPage; }
+    const next = await runExtractFacts(engine, { sourceId: 'default', slugs: [slug] });
+    expect(next.factsInserted).toBe(1);
+    expect(await engine.executeRaw('SELECT fact FROM facts')).toEqual([{ fact: 'Delivery Monday' }]);
+    expect(await engine.executeRaw("SELECT 1 FROM gbrain_cycle_locks WHERE id='gbrain-source-event-projection:default'")).toHaveLength(0);
+  });
+
+  test('indexed pending metadata arriving after the first snapshot defers deletion', async () => {
+    await seedKnownTargets();
+    await engine.insertFacts([{ fact: 'Concurrent row', source: 'fence:reconcile', source_markdown_slug: 'projects/porsche', row_num: 1 }], { source_id: 'default' });
+    const executeRaw = engine.executeRaw;
+    let raced = false;
+    engine.executeRaw = (async (...args: Parameters<typeof engine.executeRaw>) => {
+      const rows = await executeRaw.apply(engine, args);
+      if (!raced && args[0].includes('SELECT id, fact, source, row_num, context')) {
+        raced = true;
+        await executeRaw.call(engine, "INSERT INTO facts(fact,source,source_id,source_markdown_slug,row_num,expired_at,context) VALUES ('Late legacy pending row','source-event','default','projects/porsche',NULL,now(),'source-event-pending:late-fixture')");
+      }
+      return rows;
+    }) as typeof engine.executeRaw;
+    try {
+      const deferred = await runExtractFacts(engine, { sourceId: 'default', slugs: ['projects/porsche'] });
+      expect(deferred.warnings.some((warning) => warning.includes('SOURCE_EVENT_FACT_COMMIT_PENDING'))).toBe(true);
+      expect(deferred.factsDeleted).toBe(0);
+    } finally { engine.executeRaw = executeRaw; }
+    expect(await engine.executeRaw('SELECT 1 FROM facts')).toHaveLength(2);
+    const next = await runExtractFacts(engine, { sourceId: 'default', slugs: ['projects/porsche'] });
+    expect(next.warnings.some((warning) => warning.includes('SOURCE_EVENT_FACT_COMMIT_PENDING'))).toBe(true);
+    expect(next.factsDeleted).toBe(0);
+  });
+
   test('malformed private compiled-truth markers fail closed', () => {
     const malformed = 'Human prose\n<!-- gbrain:source-event-updates:begin -->\nprivate update';
     expect(() => replaceCompiledTruthBlock(malformed, [])).toThrow(/malformed owned block/);
