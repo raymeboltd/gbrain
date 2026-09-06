@@ -2,6 +2,12 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.48.6.0] - 2026-09-06
+
+### Changed
+
+- 0.48.6.0: source-event projection receipts are typed `source-event` (was `note`); dream-cycle summary pages carry `subtype: dream-cycle-summary`.
+
 ## [0.48.5.0] - 2026-09-06
 
 ### Fixed

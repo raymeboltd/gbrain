@@ -3034,6 +3034,7 @@ async function writeSummaryPage(
       // doctor raw_provenance check quiet.
       raw_trace_exempt: true,
       raw_trace_exempt_reason: 'deterministic dream-cycle index; raw traces live on listed pages',
+      subtype: 'dream-cycle-summary',
     } as Record<string, unknown>,
     body,
     '',

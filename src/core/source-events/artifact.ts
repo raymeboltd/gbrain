@@ -71,7 +71,7 @@ export function renderSourceEventArtifact(artifact: SourceEventArtifact): string
     : '- None';
   const json = JSON.stringify(artifact, null, 2);
   return `---
-type: note
+type: source-event
 title: ${yamlString(`Source event ${artifact.event_id.slice(0, 12)}`)}
 visibility: private
 source_event_artifact: true
