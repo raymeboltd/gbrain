@@ -2213,6 +2213,10 @@ export async function registerBuiltinHandlers(
     // only emits coarse job-start / job-done lines; per-page detail lives
     // in the DB. Per Codex review #20.
     const embedResult = await runEmbedCore(engine, {
+      facts: job.data.facts === true,
+      ...(job.data.facts === true ? { signal: job.signal } : {}),
+      localOnly: job.data.localOnly === true,
+      onFactProgress: async (facts) => { await job.updateProgress({ phase: 'embed.facts', ...facts }); },
       slug: typeof job.data.slug === 'string' ? job.data.slug : undefined,
       slugs: Array.isArray(job.data.slugs) ? (job.data.slugs as string[]) : undefined,
       all: !!job.data.all,
@@ -2252,11 +2256,15 @@ export async function registerBuiltinHandlers(
     // #4599 (X6): a stall-watchdog abort is an error RESULT from core; the
     // handler layer converts it to a FAILED JOB (throw) — never process.exit.
     assertEmbedNotStalled(embedResult);
+    if (embedResult.facts?.status === 'partial') {
+      throw new Error(`Fact embedding partial: ${embedResult.facts.embedded} committed, ${embedResult.facts.remaining} eligible NULL facts remain; see job progress and retry`);
+    }
     // Report what happened, not a constant. `embedded: true` claimed a dry run
     // had embedded, which is the same lie in miniature: `gbrain jobs get`
     // showed it. `embedded` stays the key it always was and stays truthy on a
     // real run (it is now the count, 0 on a dry run).
     return {
+      ...(embedResult.facts ? { facts: embedResult.facts } : {}),
       embedded: embedResult.embedded,
       dry_run: !!embedResult.dryRun,
       would_embed: embedResult.would_embed,

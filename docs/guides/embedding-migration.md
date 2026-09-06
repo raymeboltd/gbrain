@@ -149,8 +149,34 @@ The dimension change **deletes every stored embedding vector** in the brain —
 they are in the old model's space and unusable. They are not recoverable:
 going back to the previous provider means paying for a second full re-embed.
 `content_chunks` vectors are rebuilt by the re-embed pass, the query cache
-refills on the next query, and fact embeddings are rewritten on their next
-write (or a `gbrain extract` pass).
+refills on the next query. Existing facts retain their IDs and provenance during
+fence reconciliation, so unchanged facts need an explicit NULL-vector backfill:
+
+```bash
+gbrain embed --facts --stale --source <source-id> --dry-run
+gbrain embed --facts --stale --source <source-id> --background
+```
+
+Repeat for each authorized source. `--facts` repairs only active facts with NULL
+vectors, skipping pending source-event rows and existing vectors. Active means
+`expired_at IS NULL`; historical `valid_until` does not exclude a retained fact. It requires
+matching persisted model/dimensions and no active migration; run it after the
+page-vector migration completes. The source must be explicit and active.
+`--batch-size` accepts 1–100 (default 32). `--local-only` additionally requires a
+native Ollama, llama-server, or LM Studio provider resolved to a loopback endpoint;
+it refuses hosted providers or remote endpoint overrides before embedding.
+
+Each write compares the complete non-vector fact row and current model bindings;
+a concurrent correction or migration leaves the vector NULL for retry. Successful
+batches survive failure. Background execution uses the existing `embed` job's
+progress and result; partial runs fail the job with progress preserved. A crash
+can leave progress behind committed vectors, so retry scans the actual NULL
+cursor and never trusts a stale progress count. The command does not replace
+existing vectors, reconstruct deleted provenance, or promise that arbitrary
+local server implementations cannot proxy requests elsewhere.
+
+**Say to your agent:** *"Restore missing fact embeddings after migration — run
+`gbrain embed --facts --stale --source <source-id>` for the authorized source."*
 
 ## Resume after a kill
 

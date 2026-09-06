@@ -117,6 +117,10 @@ function noteEmbedQuarantineFailure(key: string, slug: string): void {
   }
 }
 export interface EmbedOpts {
+  /** Repair active NULL fact vectors instead of page chunks. Requires stale + sourceId. */
+  facts?: boolean;
+  localOnly?: boolean;
+  onFactProgress?: (result: import('../core/fact-embedding-backfill.ts').FactEmbeddingResult) => Promise<void>;
   /** Embed ALL pages (every chunk). */
   all?: boolean;
   /** Embed only stale chunks (missing embedding). */
@@ -242,6 +246,7 @@ export interface EmbedOpts {
  * `skipped` counts chunks that already had embeddings (nothing to do).
  */
 export interface EmbedResult {
+  facts?: import('../core/fact-embedding-backfill.ts').FactEmbeddingResult;
   /** Chunks newly embedded in this run (0 in dryRun). */
   embedded: number;
   /** Chunks with pre-existing embeddings, skipped. */
@@ -395,6 +400,21 @@ async function preflightDimMismatch(engine: BrainEngine, dryRun: boolean): Promi
 }
 
 export async function runEmbedCore(engine: BrainEngine, opts: EmbedOpts): Promise<EmbedResult> {
+  if (opts.facts) {
+    if (!opts.stale || opts.all || opts.slug || opts.slugs || !opts.sourceId) {
+      throw new Error('Fact embedding requires --facts --stale --source <id>; page selectors are not supported');
+    }
+    if (!opts.dryRun) assertEmbeddingEnabled(loadConfig());
+    const { runFactEmbeddingBackfill } = await import('../core/fact-embedding-backfill.ts');
+    const facts = await runFactEmbeddingBackfill(engine, { sourceId: opts.sourceId,
+      dryRun: opts.dryRun, batchSize: opts.batchSize, localOnly: opts.localOnly,
+      signal: opts.signal, onProgress: opts.onFactProgress });
+    return { facts, embedded: facts.embedded, skipped: facts.conflicted,
+      would_embed: opts.dryRun ? facts.remaining : 0, total_chunks: 0,
+      pages_processed: 0, failures: facts.failed + (facts.status === 'partial' ? 1 : 0),
+      failure_samples: facts.errors, dryRun: !!opts.dryRun, chunkless_pages_healed: 0 };
+  }
+
   // v0.37.10.0 T7 (D9): refuse cleanly when init persisted the deferred-setup
   // sentinel. Skipped in dryRun mode so plan-mode introspection still works.
   if (!opts.dryRun) {
@@ -827,6 +847,15 @@ export function isKeylessStaleRefusal(args: string[], embeddingDisabled: boolean
 }
 
 export async function runEmbed(engine: BrainEngine, args: string[]): Promise<EmbedResult | undefined> {
+  if (args.includes('--facts')) {
+    const source = args[args.indexOf('--source') + 1];
+    if (!args.includes('--stale') || !args.includes('--source') || !source || source.startsWith('--')
+        || args.includes('--all') || args.includes('--slugs')) {
+      throw new Error('Use embed --facts --stale --source <id>');
+    }
+  } else if (args.includes('--local-only')) {
+    throw new Error('--local-only is supported with --facts');
+  }
   // Keyless clean refusal — see isKeylessStaleRefusal. Checked BEFORE the
   // background block so we never queue a job that can only fail. stderr only;
   // stdout stays empty like every other embed outcome (embed has no JSON
@@ -860,6 +889,8 @@ export async function runEmbed(engine: BrainEngine, args: string[]): Promise<Emb
         const prI = cleanArgs.indexOf('--priority');
         return {
           all: cleanArgs.includes('--all'),
+          facts: cleanArgs.includes('--facts'),
+          localOnly: cleanArgs.includes('--local-only'),
           stale: cleanArgs.includes('--stale'),
           dryRun: cleanArgs.includes('--dry-run'),
           slugs: slugsI >= 0 ? cleanArgs.slice(slugsI + 1).filter(a => !a.startsWith('--')) : undefined,
@@ -910,11 +941,14 @@ export async function runEmbed(engine: BrainEngine, args: string[]): Promise<Emb
   } else {
     const slug = args.find(a => !a.startsWith('--'));
     if (!slug) {
-      serr('Usage: gbrain embed [<slug>|--all|--stale|--slugs s1 s2 ...] [--dry-run] [--batch-size N] [--priority recent] [--catch-up] [--include-null-signature]');
+      serr('Usage: gbrain embed [<slug>|--all|--stale|--slugs s1 s2 ...] [--dry-run] [--batch-size N] [--priority recent] [--catch-up] [--include-null-signature] [--facts --source <id> --local-only]');
       process.exit(1);
     }
     opts = { slug, dryRun, sourceId, batchSize, priority, catchUp };
   }
+
+  opts.facts = args.includes('--facts');
+  opts.localOnly = args.includes('--local-only');
 
   // CLI path: wire a reporter so --progress-json / --quiet / TTY rendering
   // all work. Minion handlers call runEmbedCore directly with their own
@@ -932,6 +966,7 @@ export async function runEmbed(engine: BrainEngine, args: string[]): Promise<Emb
   try {
     const result = await runEmbedCore(engine, opts);
     if (progressStarted) progress.finish();
+    if (result.facts) serr(`[embed.facts] ${result.facts.status}: ${result.facts.embedded} embedded, ${result.facts.remaining} eligible NULL facts remaining in ${result.facts.source_id} (${result.facts.model}, ${result.facts.dimensions} dimensions)`);
     // #3037: loud end-of-run summary so failures are visible even when the
     // per-page stderr lines scrolled away. cli.ts turns failures>0 into a
     // non-zero exit verdict.

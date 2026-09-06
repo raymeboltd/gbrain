@@ -769,3 +769,15 @@ permission to run them — see the "run without asking" rule above.
 
 Never leave `gbrain-test-pg` running. If you find a stale one from a previous run,
 stop and remove it before starting a new one.
+
+### Fact vector backfill
+
+`test/fact-embedding-backfill.test.ts` and `test/e2e/fact-embedding-backfill.test.ts`
+share `test/helpers/fact-embedding-contract.ts`. Synthetic transports prove full
+non-vector metadata retention, source/expired/pending exclusions, correction and
+model races, lock contention, partial failures and NULL-cursor retry, dry runs,
+BIGSERIAL IDs above the JavaScript safe-integer boundary, historical validity,
+and refusal of hosted or remote endpoints with `--local-only`.
+`test/fact-embedding-entrypoints.serial.test.ts` exercises the native CLI dry-run
+and embed job partial-progress/failure/retry path. These tests do not prove
+real model quality or throughput.
