@@ -2028,7 +2028,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // #774: a rename whose destination LEFT the scope is the same class — the
   // old page's backing file is gone from this source's slice of the repo.
   const renamedToUnsyncable = manifest.renamed
-    .filter(r => inScope(r.from) && isSyncable(r.from, syncOpts) &&
+    .filter(r => !excluded(r.from) && !excluded(r.to) && inScope(r.from) && isSyncable(r.from, syncOpts) &&
       !(inScope(r.to) && isSyncable(r.to, syncOpts)) &&
       // A rename onto a NON-poison malformed destination (`foo.md` →
       // `notes [draft].md`) keeps the old row: the content still exists on
@@ -2047,22 +2047,22 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       // exactly what a delete event is supposed to remove — filtering them
       // out here would orphan those rows (searchable forever). Mirror of the
       // metafile carve-out, in the opposite direction.
-      ...manifest.deleted.filter(p => inScope(p) &&
+      ...manifest.deleted.filter(p => inScope(p) && !excluded(p) &&
         (isSyncable(p, syncOpts) || unsyncableReason(p, syncOpts) === 'malformed-path')),
       ...renamedToUnsyncable,
     ]),
-    renamed: manifest.renamed.filter(r => inScope(r.to) && !excluded(r.to) && isSyncable(r.to, syncOpts)),
+    // Excluded endpoint: defer the whole rename, not destination-only import. Bookmark replay must be explicit.
+    renamed: manifest.renamed.filter(r => !excluded(r.from) && inScope(r.to) && !excluded(r.to) && isSyncable(r.to, syncOpts)),
   };
-
   // Surface malformed-filename skips: they were silently dropped from the
   // `filtered` manifest above, and a skip nobody can see reads as "synced".
   // Rename DESTINATIONS count too (the rename lane keeps the old row for
   // non-poison destinations, but the new name still can't import).
   const malformedSkipped = unique([
     ...[...manifest.added, ...manifest.modified]
-      .filter(p => inScope(p) && unsyncableReason(p, syncOpts) === 'malformed-path'),
+      .filter(p => inScope(p) && !excluded(p) && unsyncableReason(p, syncOpts) === 'malformed-path'),
     ...manifest.renamed
-      .filter(r => inScope(r.to) && unsyncableReason(r.to, syncOpts) === 'malformed-path')
+      .filter(r => !excluded(r.from) && inScope(r.to) && !excluded(r.to) && unsyncableReason(r.to, syncOpts) === 'malformed-path')
       .map(r => r.to),
   ]);
 
@@ -2178,7 +2178,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // delete the page. That's the same pre-fix behavior — removing the
   // page requires `gbrain pages purge-deleted` or a direct MCP delete.
   // Filed as v0.42+ follow-up for a `gbrain pages remove <slug>` surface.
-  const unsyncableModified = manifest.modified.filter(p => inScope(p) && !isSyncable(p, syncOpts));
+  const unsyncableModified = manifest.modified.filter(p => inScope(p) && !excluded(p) && !isSyncable(p, syncOpts));
   // v0.18.0+ multi-source: scope getPage + deletePage to opts.sourceId so
   // unsyncable cleanup in source A doesn't accidentally sweep same-slug
   // pages in sources B/C/D.
