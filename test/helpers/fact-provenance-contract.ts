@@ -79,3 +79,70 @@ export async function assertFactProvenanceRoundTrip(engine: BrainEngine) {
     await engine.executeRaw('DELETE FROM sources WHERE id=$1', [sourceId]);
   }
 }
+
+/** Duplicate fence claims retain distinct event identities only with an exact bijection. */
+export async function assertDuplicateFactIdentity(engine: BrainEngine) {
+  const sourceId = 'duplicate-fact-fixture';
+  const slug = 'projects/duplicate-fixture';
+  await engine.executeRaw('INSERT INTO sources(id,name) VALUES($1,$1)', [sourceId]);
+  const rows = [1, 2].map(row_num => ({
+    fact: 'Repeated fixture claim', source: 'source-event', row_num,
+    source_markdown_slug: slug, context: `raw/fixture-${row_num}`,
+    source_session: `fixture-session-${row_num}`, claim_metric: 'count', claim_value: row_num,
+  }));
+  const read = () => engine.executeRaw('SELECT * FROM facts WHERE source_id=$1 ORDER BY id', [sourceId]);
+  const reconcile = (input: typeof rows) => engine.insertFacts(input, {source_id: sourceId}, {deleteForPageFirst: {slug}});
+  try {
+    await engine.insertFacts(rows, {source_id: sourceId});
+    await engine.executeRaw("UPDATE facts SET created_at='2020-01-02T03:04:05Z' WHERE source_id=$1", [sourceId]);
+    const column = await engine.executeRaw<{ type: string }>("SELECT format_type(atttypid,atttypmod) AS type FROM pg_attribute WHERE attrelid='facts'::regclass AND attname='embedding'");
+    const width = Number(column[0].type.match(/\((\d+)\)/)![1]);
+    await engine.executeRaw(`UPDATE facts SET embedding=$1::${column[0].type},embedded_at='2020-02-03T00:00:00Z' WHERE source_id=$2`, ['[' + Array(width).fill('0.25').join(',') + ']', sourceId]);
+    const initial = await read();
+    await engine.executeRaw(`INSERT INTO source_event_receipts(source_id,event_id,revision_id,event_key,artifact_slug,source_kind,source_key,source_uri,source_slug,content_hash,processor_version,observed_at,event_date,status,target_results)
+      VALUES($1,'duplicate-event','r1','duplicate-event',$2,'fixture','key','fixture://local',$2,'hash','fixture',now(),now(),'applied',jsonb_build_array(jsonb_build_object('fact_ids',jsonb_build_array($3::bigint,$4::bigint))))`, [sourceId, slug, Number(initial[0].id), Number(initial[1].id)]);
+    const receipts = () => engine.executeRaw('SELECT * FROM source_event_receipts WHERE source_id=$1', [sourceId]);
+    const receiptBefore = await receipts();
+    const result = await reconcile([...rows].reverse());
+    expect(result.updated).toBe(2);
+    expect(result.inserted).toBe(0);
+    expect(result.deleted).toBe(0);
+    expect(await read()).toEqual(initial);
+    expect(await receipts()).toEqual(receiptBefore);
+    // Another source may carry the same slug / claim / coordinate.
+    await engine.insertFacts([{...rows[0], source_session:'other-source'}], {source_id:'default'});
+    const other = await engine.executeRaw('SELECT * FROM facts WHERE source_id=$1 AND source_markdown_slug=$2', ['default',slug]);
+    // Count mismatch, claim edits, context edits, coordinate swaps and duplicate
+    // inputs cannot prove a complete original-ID mapping. All fail atomically.
+    const candidates = [
+      [rows[0]],
+      rows.map((r,i) => i ? {...r,fact:'Changed claim'} : r),
+      rows.map((r,i) => i ? {...r,context:'changed context'} : r),
+      rows.map(r => ({...r,row_num:3-r.row_num})),
+      [rows[0], rows[0]],
+      rows.map(r => ({...r,fact:'Different replacement'})),
+    ];
+    for (const candidate of candidates) {
+      await expect(reconcile(candidate)).rejects.toThrow('FACT_RECONCILE_AMBIGUOUS_IDENTITY');
+      expect(await read()).toEqual(initial);
+      expect(await receipts()).toEqual(receiptBefore);
+    }
+    expect(await engine.executeRaw('SELECT * FROM facts WHERE source_id=$1 AND source_markdown_slug=$2', ['default',slug])).toEqual(other);
+    // Distinct retained row IDs must also drive supersession's second pass.
+    const replacement = {...rows[0], row_num:3, fact:'Superseding fixture claim'};
+    const superseded = rows.map(r => ({...r, expired_at:new Date('2026-01-01'), superseded_by_row:3}));
+    await reconcile([...superseded, replacement]);
+    const final = await read();
+    const replacementId = final.find(r => r.fact===replacement.fact)!.id;
+    for (const old of initial) {
+      const retained = final.find(r => r.id===old.id)!;
+      expect(retained.superseded_by).toBe(replacementId);
+      for (const field of ['source_session','created_at','embedding','embedded_at','claim_value']) expect(retained[field]).toEqual(old[field]);
+    }
+    expect(await receipts()).toEqual(receiptBefore);
+  } finally {
+    await engine.executeRaw('DELETE FROM source_event_receipts WHERE source_id=$1',[sourceId]);
+    await engine.executeRaw('DELETE FROM facts WHERE source_id=$1 OR (source_id=$2 AND source_markdown_slug=$3)',[sourceId,'default',slug]);
+    await engine.executeRaw('DELETE FROM sources WHERE id=$1',[sourceId]);
+  }
+}

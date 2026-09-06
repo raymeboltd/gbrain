@@ -1,4 +1,4 @@
-import { reconcileRetainedFacts, retainedFactKey } from '../facts/reconcile-retained.ts';
+import { reconcileRetainedFacts } from '../facts/reconcile-retained.ts';
 /**
  * v0.31: Hot memory — facts table operations, peeled out of PostgresEngine
  * (containment sprint C15). Free functions over a NARROW deps surface — the
@@ -161,7 +161,7 @@ export async function insertFacts(
             async (query, params) => Array.from(await tx.unsafe(query, params as never[])) as Array<Record<string, unknown>>,
             rows, ctx.source_id, del,
           )
-        : { retained: new Map<string, number>(), deleted: 0 };
+        : { retained: new Map<(typeof rows)[number], number>(), deleted: 0 };
       deleted = reconciliation.deleted;
       updated = reconciliation.retained.size;
       const out: number[] = [];
@@ -172,7 +172,7 @@ export async function insertFacts(
       const rowIds: Array<number | null> = [];
       for (const input of rows) {
         const retainedId = input.source_markdown_slug === del?.slug
-          ? reconciliation.retained.get(retainedFactKey(input.fact, input.source)) : undefined;
+          ? reconciliation.retained.get(input) : undefined;
         if (retainedId !== undefined) {
           rowIds.push(retainedId);
           continue;

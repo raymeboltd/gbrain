@@ -10,42 +10,64 @@ export const retainedFactKey = (fact: string, source: string | null | undefined)
 export async function reconcileRetainedFacts(
   query: Query, rows: FenceInput[], sourceId: string,
   del: { slug: string; excludeSourcePrefixes?: string[]; preserveExpiredLegacy?: boolean },
-): Promise<{ retained: Map<string, number>; deleted: number }> {
+): Promise<{ retained: Map<FenceInput, number>; deleted: number }> {
   const existing = await query(
-    `SELECT id,fact,source FROM facts WHERE source_id=$1 AND source_markdown_slug=$2
+    `SELECT id,fact,source,row_num,context FROM facts WHERE source_id=$1 AND source_markdown_slug=$2
        AND NOT (COALESCE(source,'') LIKE ANY($3::text[]))
        AND NOT ($4::boolean AND row_num IS NULL AND expired_at IS NOT NULL)
        ORDER BY id FOR UPDATE`,
     [sourceId, del.slug, (del.excludeSourcePrefixes ?? []).map(p => `${p}%`), del.preserveExpiredLegacy ?? false],
   );
-  const desired = new Map(rows.filter(r => r.source_markdown_slug === del.slug).map(r => [retainedFactKey(r.fact, r.source), r]));
-  // A duplicate can own a source-event artifact or another fact's FK.
-  // Picking either ID silently severs the other's provenance. Fail closed
-  // before touching coordinates; explicit identity repair must resolve it.
-  const seen = new Set<string>();
+  const desired = new Map<string, FenceInput[]>();
+  for (const row of rows.filter(r => r.source_markdown_slug === del.slug)) {
+    const key = retainedFactKey(row.fact, row.source);
+    desired.set(key, [...(desired.get(key) ?? []), row]);
+  }
+  const groups = new Map<string, typeof existing>();
   for (const old of existing) {
     const key = retainedFactKey(String(old.fact), old.source as string | null);
-    if (desired.has(key) && seen.has(key)) {
-      throw new Error(`FACT_RECONCILE_AMBIGUOUS_IDENTITY: ${sourceId}/${del.slug} has duplicate claim/source IDs; existing facts preserved`);
-    }
-    seen.add(key);
+    groups.set(key, [...(groups.get(key) ?? []), old]);
   }
-  const retained = new Map<string, number>();
+  // Validate every identity before any deletion or coordinate update. Unique
+  // claims can be renumbered. Duplicates require a complete exact coordinate /
+  // context bijection; a partial match must never discard another event's ID.
+  const retained = new Map<FenceInput, number>();
+  const coordinate = (row: { row_num?: unknown; context?: unknown }) =>
+    JSON.stringify([row.row_num ?? null, row.context ?? null]);
+  const ambiguous = () => new Error(
+    `FACT_RECONCILE_AMBIGUOUS_IDENTITY: ${sourceId}/${del.slug} has no complete duplicate identity bijection; existing facts preserved`,
+  );
+  for (const [key, oldRows] of groups) {
+    const inputs = desired.get(key) ?? [];
+    if (oldRows.length <= 1 && inputs.length <= 1) {
+      if (inputs[0]) retained.set(inputs[0], Number(oldRows[0].id));
+      continue;
+    }
+    if (oldRows.length !== inputs.length) throw ambiguous();
+    const byCoordinate = new Map(oldRows.map(old => [coordinate(old), old]));
+    if (byCoordinate.size !== oldRows.length) throw ambiguous();
+    for (const input of inputs) {
+      const key = coordinate(input);
+      const old = byCoordinate.get(key);
+      if (!old || input.row_num == null) throw ambiguous();
+      retained.set(input, Number(old.id));
+      byCoordinate.delete(key);
+    }
+    if (byCoordinate.size) throw ambiguous();
+  }
+  const retainedIds = new Set(retained.values());
   let deleted = 0;
   for (const old of existing) {
-    const key = retainedFactKey(String(old.fact), old.source as string | null);
     const id = Number(old.id);
-    if (!desired.has(key)) {
+    if (!retainedIds.has(id)) {
       await query('DELETE FROM facts WHERE id=$1 AND source_id=$2 RETURNING id', [id, sourceId]);
       deleted++;
     } else {
-      retained.set(key, id);
       // Free the partial-unique row coordinate before any row swaps.
       await query('UPDATE facts SET row_num=NULL WHERE id=$1 AND source_id=$2 RETURNING id', [id, sourceId]);
     }
   }
-  for (const [key, id] of retained) {
-    const row = desired.get(key)!;
+  for (const [row, id] of retained) {
     await query(
       `UPDATE facts SET row_num=$3, kind=$4, visibility=$5, notability=$6,
          context=$7, valid_from=COALESCE($8::timestamptz,valid_from), valid_until=$9,

@@ -1384,3 +1384,8 @@ import { assertFactProvenanceRoundTrip } from './helpers/fact-provenance-contrac
 test('canonical reconciliation preserves fact identity and provenance on PGLite', async () => {
   await assertFactProvenanceRoundTrip(engine);
 });
+
+import { assertDuplicateFactIdentity } from './helpers/fact-provenance-contract.ts';
+test('duplicate claims retain distinct proven identities and refuse ambiguous changes', async () => {
+  await assertDuplicateFactIdentity(engine);
+});
