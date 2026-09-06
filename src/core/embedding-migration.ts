@@ -5,16 +5,12 @@
  * any configured provider — the ONE forward path off a sunsetting provider
  * (the retired ze-switch is a refusal/redirect shim that points here).
  *
- * This module is the v0.47 SURVIVOR: the migration primitives live HERE
- * (runSchemaTransition, transitionDimPinnedColumn, detectEnvOverride and the
- * env gates, marker read/write, verifyMigrationComplete, readMigrationStatus,
- * verifySearchRoundTrip, reranker plan/apply, the canonical resume-command
- * renderer); retrieval-upgrade-planner.ts re-imports them for back-compat and
- * is deleted in the ZE removal wave.
+ * Shared migration primitives live here; retrieval-upgrade-planner.ts
+ * re-exports them for legacy callers.
  *
  * What it owns:
  *   - schema transition per dim-pinned column (content_chunks / facts /
- *     query_cache repaired independently), HNSW policy via vector-index.ts
+ *     query_cache / takes), HNSW policy via vector-index.ts
  *   - staleness + resume: guarded stale-signature invalidation
  *     (embedding-invalidation.ts — embed_skip pages retained, #4306) widened
  *     with `includeNullSignature: true` (#3391), false-target-stamp clearing
@@ -44,6 +40,7 @@ import { lookupEmbeddingPrice, estimateCostFromChars } from './embedding-pricing
 import { readContentChunksEmbeddingDim } from './embedding-dim-check.ts';
 import {
   invalidateStaleSignatureEmbeddingsGuarded,
+  invalidateFactAndTakeEmbeddings,
   countFalseStampedChunks,
   clearFalseStampedSignatures,
 } from './embedding-invalidation.ts';
@@ -304,11 +301,8 @@ export async function runSchemaTransition(engine: BrainEngine, targetDim: number
  * WHERE clause + opclass, and the opclass must match the column TYPE
  * (vector_cosine_ops vs halfvec_cosine_ops).
  *
- * Deliberately OMITTED: `takes.embedding` — the live takes search path
- * (`searchTakes`, both engines) is trigram-based, not vector, so that column
- * has no read path this migration could break; its own stale lane
- * (`active AND embedding IS NULL`) covers regeneration if a vector consumer
- * lands later.
+ * Takes participate in the same text space: Think gathers them through
+ * searchTakesVector. Their active/NULL stale lane regenerates cleared vectors.
  */
 export const TEXT_EMBEDDING_DIM_PINNED_TABLES: ReadonlyArray<{
   table: string;
@@ -322,6 +316,14 @@ export const TEXT_EMBEDDING_DIM_PINNED_TABLES: ReadonlyArray<{
       `CREATE INDEX IF NOT EXISTS idx_query_cache_embedding_hnsw
          ON query_cache USING hnsw (embedding ${opclass})
          WHERE embedding IS NOT NULL`,
+  },
+  {
+    table: 'takes',
+    index: 'idx_takes_embedding_hnsw',
+    indexSql: (opclass) =>
+      `CREATE INDEX IF NOT EXISTS idx_takes_embedding_hnsw
+         ON takes USING hnsw (embedding ${opclass})
+         WHERE active AND embedding IS NOT NULL`,
   },
   {
     table: 'facts',
@@ -341,8 +343,8 @@ export const TEXT_EMBEDDING_DIM_PINNED_TABLES: ReadonlyArray<{
  *
  * Dropping the column discards the stored vectors, which is correct: they are
  * in the OLD embedding space and unusable after the swap. query_cache is a
- * cache (refills on the next query); facts re-embed on their next write /
- * `gbrain extract` pass.
+ * cache (refills on the next query); active facts/takes use their explicit
+ * NULL-vector backfill commands.
  */
 async function transitionDimPinnedColumn(
   tx: { executeRaw: <T = unknown>(sql: string, params?: unknown[]) => Promise<T[]> },
@@ -370,6 +372,9 @@ async function transitionDimPinnedColumn(
   await tx.executeRaw(`DROP INDEX IF EXISTS ${indexName}`);
   await tx.executeRaw(`ALTER TABLE ${table} DROP COLUMN IF EXISTS embedding`);
   await tx.executeRaw(`ALTER TABLE ${table} ADD COLUMN embedding ${columnType}(${targetDim})`);
+  if (table === 'takes' || table === 'facts') {
+    await tx.executeRaw(`UPDATE ${table} SET embedded_at = NULL WHERE embedded_at IS NOT NULL`);
+  }
   // HNSW has a per-type dimension ceiling; above it pgvector refuses the
   // index and exact scans remain the (correct, slower) path. Mirrors the
   // same guard in migrate.ts's original DDL.
@@ -1162,7 +1167,7 @@ export async function verifyMigrationComplete(
  * invalidation (#3391: includeNullSignature), and query-cache purge.
  *
  * Ordering makes every step idempotent under a crash + re-run:
- *   state marker → schema → config → invalidate → cache purge.
+ *   state marker → schema → invalidate → config → cache purge.
  * A crash anywhere leaves the state marker set; the re-run re-executes the
  * remaining steps (schema transition no-ops when the column is already at
  * the target width via the actual-width probe; invalidation matches nothing
@@ -1224,7 +1229,7 @@ export async function applyEmbeddingMigration(
 
     // 2. Schema work — probe again (the plan may be stale after a resume) and
     //    repair each dim-pinned column INDEPENDENTLY (round-2 #9): a brain
-    //    whose chunks column is already at target but whose facts/query_cache
+    //    whose chunks column is already at target but whose dependent columns
     //    stayed narrow gets those repaired without a full destructive rebuild.
     let schemaTransitioned = false;
     const pinnedRepaired: string[] = [];
@@ -1270,6 +1275,8 @@ export async function applyEmbeddingMigration(
       signature: migrationSignature(plan.to_model, plan.to_dims),
       includeNullSignature: true,
     });
+
+    await invalidateFactAndTakeEmbeddings(engine, plan.from_model, plan.to_model);
 
     // 4. DB-plane config (doctor's embedding_width_consistency reads these).
     await engine.setConfig('embedding_model', plan.to_model);
