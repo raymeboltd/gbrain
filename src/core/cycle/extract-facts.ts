@@ -174,6 +174,7 @@ export interface ExtractFactsResult {
   pagesWithFacts: number;
   factsInserted: number;
   factsDeleted: number;
+  factsUpdated: number;
   legacyRowsPending: number;
   guardTriggered: boolean;
   warnings: string[];
@@ -283,6 +284,7 @@ export async function runExtractFacts(
     pagesWithFacts: 0,
     factsInserted: 0,
     factsDeleted: 0,
+    factsUpdated: 0,
     legacyRowsPending: 0,
     guardTriggered: false,
     warnings: [],
@@ -458,7 +460,7 @@ export async function runExtractFacts(
   // ── Reconcile each page ───────────────────────────────────────
   for (const slug of slugs) {
     // #1972: bail at the top of the per-page loop on abort. Each page is an
-    // independent delete-then-insert commit, so breaking leaves a consistent
+    // independent atomic reconciliation, so breaking leaves a consistent
     // partial state; the receipt/rollup below still runs with partial counts.
     if (isAborted(opts.signal)) break;
     result.pagesScanned += 1;
@@ -548,7 +550,7 @@ export async function runExtractFacts(
     // #1781 — reconcile instead of unconditional wipe-and-reinsert. Compare
     // the fence's canonical (claim, source) row set against the page's
     // fence-owned DB rows: no-op when already in sync, insert only missing
-    // keys when possible, wipe/reinsert only when stale rows need cleanup.
+    // keys when possible, reconcile retained identities when existing rows drift.
     const existing = await listExistingFactsForPage(engine, slug, sourceId);
     const existingKeys = new Set(existing.map(f => factContentKey(f.fact, f.source)));
     const desiredByKey = new Map(extracted.map(f => [factContentKey(f.fact, f.source), f]));
@@ -582,7 +584,7 @@ export async function runExtractFacts(
     // otherwise inactive) but whose DB columns are still NULL has an
     // identical content key + row_num, so the checks above miss it. Treat
     // a mismatch between the fence-desired supersession/expiry state and
-    // the DB columns as drift so the wipe+reinsert fallback re-heals the
+    // the DB columns as drift so the atomic reconciliation re-heals the
     // row (transports superseded_by + expired_at that a pre-fix cycle
     // dropped).
     //
@@ -643,21 +645,19 @@ export async function runExtractFacts(
     }
 
     let toInsert = extracted.filter(f => !existingKeys.has(factContentKey(f.fact, f.source)));
-    // v0.46 (#3014) — when old DB rows must be removed, defer the wipe into
-    // insertFacts' own transaction (deleteForPageFirst) rather than calling
-    // deleteFactsForPage here. A standalone delete self-commits, so a
-    // failing insert afterward left the page permanently emptied; running
-    // the delete as the first statement of the insert transaction makes the
-    // reconcile atomic — a failed insert rolls the delete back. Same delete
-    // scoping as before: legacy NULL-source_markdown_slug rows, `cli:`-origin
-    // conversation facts (#1928), and soft-expired legacy rows (#2646)
-    // survive.
+    // Reconcile within insertFacts' transaction: retain IDs and provenance
+    // for matching claims, remove stale keys, insert new claims, and resolve
+    // supersession references only after all row coordinates are assigned.
+    // Legacy/cli/soft-expired exclusions still apply. Any failure rolls all
+    // retained-row updates and deletions back with the insert.
     let deleteForPageFirst: { slug: string; excludeSourcePrefixes: string[]; preserveExpiredLegacy: boolean } | undefined;
     if (hasStaleExisting || hasDuplicateExisting || hasRowNumDrift || hasSupersessionDrift) {
       deleteForPageFirst = { slug, excludeSourcePrefixes: ['cli:'], preserveExpiredLegacy: true };
       toInsert = extracted;
     }
 
+    // Retained claims keep their existing embedding and incur no provider call.
+    const factsToEmbed = toInsert.filter(f => !existingKeys.has(factContentKey(f.fact, f.source)));
     // v0.35.4 (D-CDX-3) — batch-embed before insert. Without this,
     // cycle-inserted facts land with `embedding = NULL`, which breaks
     // consolidate's cosine clustering AND the drift_score formula in
@@ -665,18 +665,18 @@ export async function runExtractFacts(
     // unavailable (no API key configured), facts still insert with
     // NULL embeddings — drift_score gracefully returns null and
     // clustering falls back to recency.
-    if (toInsert.length > 0) {
+    if (factsToEmbed.length > 0) {
       if (isAvailable('embedding')) {
         try {
-          const texts = toInsert.map(e => e.fact);
+          const texts = factsToEmbed.map(e => e.fact);
           // #1972: forward the abort signal so a cancelled cycle's in-flight
           // batch embed (a network call) is itself abortable, not just the loop.
           const embeddings = await embed(texts, { abortSignal: opts.signal });
           // Defensive: embed should return one vector per input; if the
           // gateway returns a partial array (provider partial-batch retry
           // returning fewer than requested), only fill what we have.
-          for (let i = 0; i < toInsert.length && i < embeddings.length; i++) {
-            toInsert[i].embedding = embeddings[i];
+          for (let i = 0; i < factsToEmbed.length && i < embeddings.length; i++) {
+            factsToEmbed[i].embedding = embeddings[i];
           }
         } catch (err) {
           // Embedding failure is non-fatal — facts still get inserted, just
@@ -694,7 +694,7 @@ export async function runExtractFacts(
         // NULL-embedding rows with a clean green 'ok', hiding the degraded
         // consolidate/drift_score behavior until someone diffed the DB.
         result.warnings.push(
-          `${slug}: embedding gateway unavailable — ${toInsert.length} fact(s) inserted with NULL embedding (won't cluster in consolidate until re-embedded)`,
+          `${slug}: embedding gateway unavailable — ${factsToEmbed.length} fact(s) inserted with NULL embedding (won't cluster in consolidate until re-embedded)`,
         );
       }
     }
@@ -707,7 +707,8 @@ export async function runExtractFacts(
       deleteForPageFirst ? { deleteForPageFirst } : undefined,
     );
     result.factsInserted += inserted.inserted;
-    // v0.46 (#3014) — the wipe (when needed) ran inside insertFacts' txn;
+    result.factsUpdated += inserted.updated ?? 0;
+    // Reconciliation ran inside insertFacts' transaction;
     // count it here from the atomic result rather than a separate delete.
     result.factsDeleted += inserted.deleted;
     // v0.46 (#3014) — surface unresolvable `superseded by #N` references
@@ -720,8 +721,8 @@ export async function runExtractFacts(
 
   // v0.42 Wave B3: receipt + rollup. extract_facts is deterministic
   // (fence reconcile, no LLM cost); receipt only when facts were
-  // actually inserted; rollup always fires.
-  if (!opts.dryRun && result.factsInserted > 0) {
+  // actually changed; rollup always fires.
+  if (!opts.dryRun && result.factsInserted + result.factsUpdated + result.factsDeleted > 0) {
     const runId = `efacts-${Date.now().toString(36)}-${sourceId.slice(0, 4)}`;
     try {
       await writeReceipt(engine, {
@@ -730,10 +731,10 @@ export async function runExtractFacts(
         run_id: runId,
         round: 'single',
         extracted_at: new Date().toISOString(),
-        total_rows: result.factsInserted,
+        total_rows: result.factsInserted + result.factsUpdated,
         cost_usd: 0,
         summary:
-          `Reconciled ${result.factsInserted} facts (and deleted ${result.factsDeleted}) ` +
+          `Reconciled ${result.factsInserted} new and ${result.factsUpdated} existing facts (and deleted ${result.factsDeleted}) ` +
           `across ${result.pagesScanned} scanned pages.`,
       });
     } catch (err) {

@@ -1218,8 +1218,9 @@ describe('runExtractFacts — v0.46 (#3014) supersession transport + heal', () =
     expect(drifted.expired_at).toBeNull();
 
     const healRun = await runExtractFacts(engine, { slugs: ['people/deal'] });
-    // Drift detected → wipe+reinsert re-transports the columns.
-    expect(healRun.factsInserted).toBeGreaterThan(0);
+    // Drift heals in place, preserving provenance and identity.
+    expect(healRun.factsUpdated).toBe(2);
+    expect(healRun.factsInserted).toBe(0);
 
     const healed = (await readSupersessionCols()).find(x => x.row_num === 1)!;
     expect(healed.superseded_by).not.toBeNull();
@@ -1308,7 +1309,8 @@ describe('runExtractFacts — v0.46 (#3014) supersession transport + heal', () =
 | 2 | New claim | fact | 1.0 | world | high | 2026-07-01 |  | call |  |`,
     ));
     const r = await runExtractFacts(engine, { slugs: ['people/deal'] });
-    expect(r.factsInserted).toBeGreaterThan(0);
+    expect(r.factsUpdated).toBe(2);
+    expect(r.factsInserted).toBe(0);
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const ids = await (engine as any).db.query(
@@ -1376,4 +1378,9 @@ describe('runExtractFacts — v0.46 (#3014) supersession transport + heal', () =
     expect(second.warnings.filter(w => w.includes('superseded'))).toEqual([]);
     expect(await readIds()).toEqual(idsAfterFirst);
   });
+});
+
+import { assertFactProvenanceRoundTrip } from './helpers/fact-provenance-contract.ts';
+test('canonical reconciliation preserves fact identity and provenance on PGLite', async () => {
+  await assertFactProvenanceRoundTrip(engine);
 });

@@ -4603,7 +4603,7 @@ export class PostgresEngine implements BrainEngine {
     rows: Array<NewFact & { row_num: number; source_markdown_slug: string; superseded_by_row?: number }>,
     ctx: { source_id: string },
     opts?: { deleteForPageFirst?: { slug: string; excludeSourcePrefixes?: string[]; preserveExpiredLegacy?: boolean } },
-  ): Promise<{ inserted: number; ids: number[]; warnings: string[]; deleted: number }> {
+  ): Promise<{ inserted: number; ids: number[]; warnings: string[]; deleted: number; updated?: number }> {
     return factsImpl.insertFacts(this.factsDeps, rows, ctx, opts);
   }
 

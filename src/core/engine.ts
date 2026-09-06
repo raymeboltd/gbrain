@@ -2068,22 +2068,20 @@ export interface BrainEngine {
    * `warnings` entry — never an FK to a guessed id (resolver:
    * `src/core/facts/supersede-resolve.ts`).
    *
-   * v0.46 (#3014): `opts.deleteForPageFirst` makes the wipe-then-reinsert
-   * reconcile atomic. When set, the page's fence-owned rows are DELETEd as
-   * the first statement of the SAME transaction that inserts `rows`, so a
-   * failing insert rolls the delete back and the page is never left
-   * emptied. (A standalone `deleteFactsForPage` call before `insertFacts`
-   * self-commits, so an insert throw would permanently lose the page's
-   * facts.) `slug` / `excludeSourcePrefixes` / `preserveExpiredLegacy`
-   * mirror `deleteFactsForPage`; the deleted count is returned as
-   * `deleted`. Callers that omit it get the standalone insert
-   * (deleted: 0), unchanged.
+   * `opts.deleteForPageFirst` reconciles fence-owned rows atomically.
+   * Surviving (claim, source) keys update in place, preserving their IDs,
+   * source_session, created_at, embeddings and DB-only enrichment. Only
+   * stale rows are deleted; ambiguous duplicate IDs fail closed. A failing
+   * insert rolls the entire reconcile back. Scoping options mirror
+   * deleteFactsForPage. `deleted` and optional `updated` report physical
+   * row counts; `ids` contains only newly inserted IDs. Omit the option
+   * for standalone insert behavior.
    */
   insertFacts(
     rows: Array<NewFact & { row_num: number; source_markdown_slug: string; superseded_by_row?: number }>,
     ctx: { source_id: string },
     opts?: { deleteForPageFirst?: { slug: string; excludeSourcePrefixes?: string[]; preserveExpiredLegacy?: boolean } },
-  ): Promise<{ inserted: number; ids: number[]; warnings: string[]; deleted: number }>;
+  ): Promise<{ inserted: number; ids: number[]; warnings: string[]; deleted: number; updated?: number }>;
 
   /**
    * v0.32.2: hard-delete every fact row scoped to a single fence page.

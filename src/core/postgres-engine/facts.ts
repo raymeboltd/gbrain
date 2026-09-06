@@ -1,3 +1,4 @@
+import { reconcileRetainedFacts, retainedFactKey } from '../facts/reconcile-retained.ts';
 /**
  * v0.31: Hot memory — facts table operations, peeled out of PostgresEngine
  * (containment sprint C15). Free functions over a NARROW deps surface — the
@@ -133,7 +134,7 @@ export async function insertFacts(
     rows: Array<NewFact & { row_num: number; source_markdown_slug: string; superseded_by_row?: number }>,
     ctx: { source_id: string },
     opts?: { deleteForPageFirst?: { slug: string; excludeSourcePrefixes?: string[]; preserveExpiredLegacy?: boolean } },
-  ): Promise<{ inserted: number; ids: number[]; warnings: string[]; deleted: number }> {
+  ): Promise<{ inserted: number; ids: number[]; warnings: string[]; deleted: number; updated?: number }> {
     if (rows.length === 0) return { inserted: 0, ids: [], warnings: [], deleted: 0 };
 
     const sql = deps.sql;
@@ -145,6 +146,7 @@ export async function insertFacts(
     // v0.46 (#3014): captured inside the transaction below when
     // deleteForPageFirst runs; stays 0 for the standalone insert path.
     let deleted = 0;
+    let updated = 0;
     // Single transaction so the v51 partial UNIQUE index can roll back
     // the whole batch on constraint violation. Per-row INSERTs (not
     // multi-row VALUES) keep the embedding-vs-no-embedding branching
@@ -153,37 +155,15 @@ export async function insertFacts(
     // stamped inline here, and `superseded by #N` references are resolved
     // to `facts.superseded_by` in a second pass below (same transaction).
     const ids = await sql.begin(async (tx) => {
-      // v0.46 (#3014) — atomic reconcile: wipe the page's fence-owned rows
-      // as the FIRST statement of this transaction so a failing insert
-      // below rolls the delete back too. Inlined (not a deleteFactsForPage
-      // call) so it shares this transaction — deleteFactsForPage runs on
-      // the pool (`deps.sql`), a separate self-committing transaction,
-      // which is exactly the split this fix removes. Scoping mirrors it
-      // exactly (#1928 excludeSourcePrefixes + #2646 preserveExpiredLegacy).
       const del = opts?.deleteForPageFirst;
-      if (del) {
-        const expiredLegacyFilter = del.preserveExpiredLegacy
-          ? tx`AND NOT (row_num IS NULL AND expired_at IS NOT NULL)`
-          : tx``;
-        const prefixes = del.excludeSourcePrefixes;
-        if (prefixes && prefixes.length > 0) {
-          const patterns = prefixes.map(p => `${p}%`);
-          const r = await tx`
-            DELETE FROM facts
-            WHERE source_id = ${ctx.source_id}
-              AND source_markdown_slug = ${del.slug}
-              AND NOT (COALESCE(source, '') LIKE ANY(${patterns}))
-              ${expiredLegacyFilter}
-          `;
-          deleted = r.count ?? 0;
-        } else {
-          const r = await tx`
-            DELETE FROM facts
-            WHERE source_id = ${ctx.source_id} AND source_markdown_slug = ${del.slug} ${expiredLegacyFilter}
-          `;
-          deleted = r.count ?? 0;
-        }
-      }
+      const reconciliation = del
+        ? await reconcileRetainedFacts(
+            async (query, params) => Array.from(await tx.unsafe(query, params as never[])) as Array<Record<string, unknown>>,
+            rows, ctx.source_id, del,
+          )
+        : { retained: new Map<string, number>(), deleted: 0 };
+      deleted = reconciliation.deleted;
+      updated = reconciliation.retained.size;
       const out: number[] = [];
       // Per-input inserted id, aligned to `rows` (null when the v51
       // ON CONFLICT DO NOTHING skipped the row) — the second pass below
@@ -191,6 +171,12 @@ export async function insertFacts(
       // every later UPDATE onto the wrong fact.
       const rowIds: Array<number | null> = [];
       for (const input of rows) {
+        const retainedId = input.source_markdown_slug === del?.slug
+          ? reconciliation.retained.get(retainedFactKey(input.fact, input.source)) : undefined;
+        if (retainedId !== undefined) {
+          rowIds.push(retainedId);
+          continue;
+        }
         const validFrom = input.valid_from ?? new Date();
         const validUntil = input.valid_until ?? null;
         const expiredAt = input.expired_at ?? null;
@@ -273,7 +259,7 @@ export async function insertFacts(
       }
       return out;
     });
-    return { inserted: ids.length, ids, warnings, deleted };
+    return { inserted: ids.length, ids, warnings, deleted, ...(updated ? { updated } : {}) };
   }
 
 export async function deleteFactsForPage(

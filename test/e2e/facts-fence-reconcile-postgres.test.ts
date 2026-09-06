@@ -19,10 +19,12 @@ describe.skipIf(skip)('facts-fence escaped-pipe reconciliation on Postgres', () 
     assertSafeE2eDatabaseUrl(databaseUrl!);
     await engine.connect({ database_url: databaseUrl! });
     await engine.initSchema();
+    await engine.deleteFactsForPage(slug, 'default');
   });
 
   afterAll(async () => {
     if (engine) {
+      await engine.deleteFactsForPage(slug, 'default');
       await engine.executeRaw('DELETE FROM pages WHERE slug = $1', [slug]);
       await engine.disconnect();
     }
@@ -449,4 +451,17 @@ describe.skipIf(skip)('facts supersession visibility on Postgres — ontology + 
     const excluded = await engine.listSupersessions('default', { since: new Date('2026-09-01T00:00:00Z') });
     expect(excluded.some(s => s.fact.includes('founder') && s.entity_slug === SARAH)).toBe(false);
   }, 30_000);
+});
+
+import { assertFactProvenanceRoundTrip } from '../helpers/fact-provenance-contract.ts';
+test.skipIf(skip)('canonical reconciliation preserves fact identity and provenance on Postgres', async () => {
+  assertSafeE2eDatabaseUrl(databaseUrl!);
+  const engine = new PostgresEngine();
+  await engine.connect({ database_url: databaseUrl! });
+  try {
+    await engine.initSchema();
+    await assertFactProvenanceRoundTrip(engine);
+  } finally {
+    await engine.disconnect();
+  }
 });

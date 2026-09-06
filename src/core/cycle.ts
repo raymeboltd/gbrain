@@ -1522,13 +1522,13 @@ async function runPhaseExtractFacts(
       phase: 'extract_facts',
       status: result.warnings.length > 0 ? 'warn' : 'ok',
       duration_ms: 0,
-      summary: `${result.factsInserted} fact(s) reconciled across ${result.pagesScanned} page(s)${phantomSummary}` +
+      summary: `${result.factsInserted + result.factsUpdated} fact(s) reconciled across ${result.pagesScanned} page(s)${phantomSummary}` +
         (result.warnings.length > 0 ? ` (${result.warnings.length} warning(s))` : ''),
       details: {
         pagesScanned: result.pagesScanned,
         pagesWithFacts: result.pagesWithFacts,
         factsInserted: result.factsInserted,
-        factsDeleted: result.factsDeleted,
+        factsDeleted: result.factsDeleted, factsUpdated: result.factsUpdated,
         warnings: result.warnings.slice(0, 5),
         // v0.35.5: phantom counters surfaced so extractTotals() can lift
         // them to CycleReport.totals and the daily report makes the
