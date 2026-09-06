@@ -71,7 +71,13 @@ export async function assertFactProvenanceRoundTrip(engine: BrainEngine) {
     await engine.insertFacts([{fact:'Claim 3',source:'source-event',source_session:'source-event:newer-owner',
       row_num:7,source_markdown_slug:slug}], {source_id:sourceId});
     const ambiguous = await read();
-    await expect(runExtractFacts(engine,{sourceId,slugs:[slug]})).rejects.toThrow('FACT_RECONCILE_AMBIGUOUS_IDENTITY');
+    // Per-page fault isolation (0.48.5.0): the ambiguous page's reconcile
+    // throw is now caught at runExtractFacts' per-page call site and
+    // recorded (pagesFailed + a warning) instead of propagating — the call
+    // resolves, and the page's rows are left unchanged either way.
+    const ambiguousResult = await runExtractFacts(engine,{sourceId,slugs:[slug]});
+    expect(ambiguousResult.pagesFailed).toBe(1);
+    expect(ambiguousResult.warnings.some(w => w.includes('FACT_RECONCILE_AMBIGUOUS_IDENTITY'))).toBe(true);
     expect(await read()).toEqual(ambiguous);
   } finally {
     await engine.executeRaw('DELETE FROM facts WHERE source_id=$1', [sourceId]);

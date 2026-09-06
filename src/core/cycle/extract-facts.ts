@@ -243,6 +243,12 @@ export interface ExtractFactsResult {
   factsInserted: number;
   factsDeleted: number;
   factsUpdated: number;
+  /**
+   * Pages whose atomic reconcile threw and were skipped. The page's existing
+   * facts are unchanged (the reconcile validates every identity before it
+   * mutates anything); the warning names the page and the error.
+   */
+  pagesFailed: number;
   legacyRowsPending: number;
   guardTriggered: boolean;
   warnings: string[];
@@ -353,6 +359,7 @@ export async function runExtractFacts(
     factsInserted: 0,
     factsDeleted: 0,
     factsUpdated: 0,
+    pagesFailed: 0,
     legacyRowsPending: 0,
     guardTriggered: false,
     warnings: [],
@@ -770,12 +777,31 @@ export async function runExtractFacts(
 
     if (toInsert.length === 0) continue;
 
-    const inserted = await guardedFactReconcile(engine, sourceId, slug, page, existing, result.warnings,
-      () => engine.insertFacts( // gbrain-allow-direct-insert: extract_facts cycle phase reconciles fence → DB
-        toInsert,
-        { source_id: sourceId },
-        deleteForPageFirst ? { deleteForPageFirst } : undefined,
-      ));
+    // Per-page fault isolation. Each page is an independent atomic
+    // reconciliation (insertFacts wraps the whole thing in one transaction),
+    // so one page's failure says nothing about the next page's. Pre-fix, a
+    // throw from reconcileRetainedFacts — FACT_RECONCILE_AMBIGUOUS_IDENTITY on
+    // a page whose DB rows carry duplicate (claim, source) keys, which the
+    // fence side can never match because dedupeFactsByContentKey caps the
+    // desired set at one row per key — propagated out of this loop and killed
+    // the whole source walk at the first such page. The reconcile validates
+    // every identity BEFORE issuing any statement, so the failing page's facts
+    // are preserved; the correct blast radius is that one page.
+    let inserted: Awaited<ReturnType<typeof engine.insertFacts>> | undefined;
+    try {
+      inserted = await guardedFactReconcile(engine, sourceId, slug, page, existing, result.warnings,
+        () => engine.insertFacts( // gbrain-allow-direct-insert: extract_facts cycle phase reconciles fence → DB
+          toInsert,
+          { source_id: sourceId },
+          deleteForPageFirst ? { deleteForPageFirst } : undefined,
+        ));
+    } catch (err) {
+      result.pagesFailed += 1;
+      result.warnings.push(
+        `${slug}: fact reconcile failed, page left unchanged — ${err instanceof Error ? err.message : String(err)}`,
+      );
+      continue;
+    }
     if (!inserted) continue;
     result.factsInserted += inserted.inserted;
     result.factsUpdated += inserted.updated ?? 0;

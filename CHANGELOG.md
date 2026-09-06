@@ -2,6 +2,12 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.48.5.0] - 2026-09-06
+
+### Fixed
+
+- extract_facts: per-page fault isolation — a page whose fence-owned DB rows carry duplicate (claim, source) keys made reconcileRetainedFacts throw FACT_RECONCILE_AMBIGUOUS_IDENTITY and abort the whole source walk (83 of 529 fence pages on the production brain); the page is now skipped with a warning and `pagesFailed` is reported in phase details. The phase report's warning cap is also raised from 5 to 100 so a fault set this size is actually visible in the cycle report. No behavior change on the non-throwing path.
+
 ## [0.48.4.0] - 2026-09-06
 
 **Preserve fact identity and keep text embeddings compatible during repair.**

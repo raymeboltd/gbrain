@@ -1527,9 +1527,13 @@ async function runPhaseExtractFacts(
       details: {
         pagesScanned: result.pagesScanned,
         pagesWithFacts: result.pagesWithFacts,
+        pagesFailed: result.pagesFailed,
         factsInserted: result.factsInserted,
         factsDeleted: result.factsDeleted, factsUpdated: result.factsUpdated,
-        warnings: result.warnings.slice(0, 5),
+        // 0.48.5.0: raised from 5 — a per-page fault-isolation run (83 of 529
+        // fence pages on the production brain) needs the report to actually
+        // show the failure set, not just the first 5 pages of it.
+        warnings: result.warnings.slice(0, 100),
         // v0.35.5: phantom counters surfaced so extractTotals() can lift
         // them to CycleReport.totals and the daily report makes the
         // cleanup visible.

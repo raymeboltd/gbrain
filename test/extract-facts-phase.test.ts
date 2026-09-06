@@ -1344,12 +1344,16 @@ describe('runExtractFacts — v0.46 (#3014) supersession transport + heal', () =
 
     // Make the insert throw. Pre-fix, the separate-commit delete had already
     // emptied the page by the time this threw; now no delete runs outside
-    // insertFacts, so the rows survive.
+    // insertFacts, so the rows survive. Since 0.48.5.0, runExtractFacts also
+    // isolates the throw to this one page (pagesFailed + a warning) instead
+    // of rejecting the whole call.
     const original = engine.insertFacts.bind(engine);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (engine as any).insertFacts = async () => { throw new Error('simulated insert failure'); };
     try {
-      await expect(runExtractFacts(engine, { slugs: ['people/deal'] })).rejects.toThrow('simulated insert failure');
+      const result = await runExtractFacts(engine, { slugs: ['people/deal'] });
+      expect(result.pagesFailed).toBe(1);
+      expect(result.warnings.some(w => w.includes('simulated insert failure'))).toBe(true);
     } finally {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (engine as any).insertFacts = original;
