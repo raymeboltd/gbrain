@@ -5,6 +5,8 @@ import { SOURCE_EVENT_PROCESSOR_VERSION, projectSourceEvent, retractSourceEvent 
 import { parseSourceEventArtifact } from '../../source-events/artifact.ts';
 import { assertSourceEventAdmission, readSourceEventPolicy } from '../../source-events/policy.ts';
 import { fetchSource } from '../../sources-load.ts';
+import type { TranscriptFormat } from '../../transcripts/types.ts';
+import { parseConversation } from '../../conversation-parser/parse.ts';
 
 const SUPPORTED_SOURCE_EVENT_TYPES = [
   'message',
@@ -27,7 +29,7 @@ const IMMUTABLE_IDENTITY_FIELDS = [
   'thread_id', 'capture_id', 'revision_id', 'conversation_id',
 ] as const;
 
-interface CandidateRow {
+export interface CandidateRow {
   slug: string;
   type: string;
   compiled_truth: string;
@@ -37,6 +39,12 @@ interface CandidateRow {
   effective_date: Date | string | null;
   effective_date_source: string | null;
   frontmatter: Record<string, unknown> | string;
+}
+
+export interface SourceEventConversationNormalization {
+  content: string;
+  method: 'not_conversation' | 'conversation_parser' | 'observer_primary_session' | 'conversation_parse_failed';
+  parseDisposition: 'not_applicable' | 'parsed' | 'withheld';
 }
 
 interface RetractionCandidate {
@@ -276,7 +284,55 @@ function sourceIdentity(row: CandidateRow): { sourceKey: string; sourceUri: stri
   };
 }
 
-function timestamp(row: CandidateRow): { occurredAt: string; attested: boolean } {
+// The native transcript adapters define the supported source-time contract.
+// Record exhaustiveness makes newly supported formats an explicit review here.
+const CONVERSATION_TIME_PROVIDERS: Record<TranscriptFormat, true> = {
+  'claude-code': true, codex: true, openclaw: true, hermes: true,
+  grok: true, chatgpt: true, 'claude-export': true,
+};
+
+function recognizedConversationProvider(meta: Record<string, unknown>): boolean {
+  const transcript = meta.transcript_import;
+  const harness = transcript && typeof transcript === 'object' ? (transcript as Record<string, unknown>).harness : undefined;
+  const provider = [harness, meta.provider, meta.source_tool, meta.network]
+    .find((value) => typeof value === 'string' && value.trim());
+  return typeof provider === 'string' && Object.hasOwn(CONVERSATION_TIME_PROVIDERS, provider.trim());
+}
+
+function strictIsoTimestamp(value: unknown): Date | null {
+  if (typeof value !== 'string') return null;
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/.exec(value.trim());
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  if (month < 1 || month > 12 || day < 1 || day > daysInMonth
+      || hour > 23 || minute > 59 || second > 59) return null;
+  if (match[7] !== 'Z') {
+    const [offsetHour, offsetMinute] = match[7].slice(1).split(':').map(Number);
+    if (offsetHour! > 23 || offsetMinute! > 59) return null;
+  }
+  const parsed = new Date(value.trim());
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+export function sourceEventTimestamp(
+  row: CandidateRow,
+  hasStableProviderIdentity = sourceIdentity(row) !== null,
+): { occurredAt: string; attested: boolean; source: 'started_at' | 'effective_date' | 'updated_at' } {
+  const meta = metadata(row);
+  const explicitEffectiveDate = row.effective_date !== null
+    && ['event_date', 'date', 'published'].includes(row.effective_date_source ?? '');
+  const startedAt = row.type === 'conversation' && hasStableProviderIdentity && recognizedConversationProvider(meta) && !explicitEffectiveDate
+    ? strictIsoTimestamp(meta.started_at)
+    : null;
+  if (startedAt) {
+    return { occurredAt: startedAt.toISOString(), attested: true, source: 'started_at' };
+  }
   const raw = row.effective_date ?? row.updated_at;
   const value = raw instanceof Date ? raw : new Date(raw);
   if (Number.isNaN(value.getTime())) throw new Error(`source-event-projection: invalid timestamp for ${row.slug}`);
@@ -285,12 +341,155 @@ function timestamp(row: CandidateRow): { occurredAt: string; attested: boolean }
     // Filename dates are useful ordering hints, not provider/source
     // attestations. Only an explicit dated frontmatter source can authorize
     // compiled-truth or task application.
-    attested: row.effective_date !== null
-      && ['event_date', 'date', 'published'].includes(row.effective_date_source ?? ''),
+    attested: explicitEffectiveDate,
+    source: row.effective_date !== null ? 'effective_date' : 'updated_at',
   };
 }
 
-export function makeSourceEventProjectionHandler(engine: BrainEngine) {
+// The parser is deliberately permissive. Shield literal Markdown before parsing
+// so examples cannot become speaker boundaries; restore bytes only after roles
+// have been assigned. Tokens cannot collide with source-authored text.
+function protectLiteralLines(body: string): { content: string; restore: (value: string) => string } {
+  let prefix = 'GBRAIN_LITERAL_';
+  while (body.includes(prefix)) prefix += '_';
+  const literals: string[] = [];
+  let fence: { marker: string; length: number } | null = null;
+  const content = body.split('\n').map((line) => {
+    const match = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    const protectedLine = fence !== null || match !== null || /^\s*>/.test(line)
+      || /^(?: {4}|\t)/.test(line);
+    if (match) {
+      if (fence === null) fence = { marker: match[1]![0]!, length: match[1]!.length };
+      else if (match[1]![0] === fence.marker && match[1]!.length >= fence.length && !match[2]!.trim()) fence = null;
+    }
+    if (!protectedLine) return line;
+    const token = `${prefix}${literals.length}_END`;
+    literals.push(line);
+    return token;
+  }).join('\n');
+  return { content, restore: (value) => value.replace(
+    new RegExp(`${prefix}(\\d+)_END`, 'g'), (_, index) => literals[Number(index)]!,
+  ) };
+}
+
+function tagged(role: string, speaker: string, text: string): string {
+  return `<source-message role=${JSON.stringify(role)} speaker=${JSON.stringify(speaker)}>` +
+    `\n${text.trim().replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}\n</source-message>`;
+}
+
+function extractTag(body: string, tag: string): string[] {
+  const escaped = tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return [...body.matchAll(new RegExp(`<${escaped}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${escaped}>`, 'gi'))]
+    .map((match) => match[1]!.trim()).filter(Boolean);
+}
+
+function splitExplicitToolEvidence(body: string): { conversation: string; tools: string[] } {
+  const lines = body.split('\n');
+  const conversation: string[] = [];
+  const tools: string[] = [];
+  let tool: string[] | null = null;
+  let fenced = false;
+  const toolHeading = /^(?:\*\*(tool(?:[- ]result)?):\*\*|#{2,3}\s+(tool(?:[- ]result)?)\s*:?)\s*(.*)$/i;
+  const roleHeading = /^(?:\*\*(?:You|ChatGPT|User|Assistant|Human|System):\*\*|#{2,3}\s+(?:User|Assistant|Human|System)\s*:?)\s*/i;
+  for (const line of lines) {
+    if (/^\s*(```|~~~)/.test(line)) fenced = !fenced;
+    const match = !fenced ? toolHeading.exec(line) : null;
+    if (match) {
+      if (tool) tools.push(tool.join('\n').trim());
+      tool = [`kind: ${(match[1] ?? match[2])!.toLowerCase().replace(' ', '-')}`, match[3] ?? ''];
+      continue;
+    }
+    if (tool && !fenced && roleHeading.test(line)) {
+      tools.push(tool.join('\n').trim());
+      tool = null;
+    }
+    if (tool) tool.push(line);
+    else conversation.push(line);
+  }
+  if (tool) tools.push(tool.join('\n').trim());
+  return { conversation: conversation.join('\n'), tools: tools.filter(Boolean) };
+}
+
+function isObserverConversation(meta: Record<string, unknown>): boolean {
+  const workspace = typeof meta.workspace === 'string' ? meta.workspace : '';
+  const sourcePath = typeof meta.source_path === 'string' ? meta.source_path : '';
+  return /(?:^|\/)claude\/mem\/observer(?:\/|$)/i.test(`${workspace}/${sourcePath}`);
+}
+
+/** Deterministic, provider-scoped fact-extraction view. The raw page is never changed. */
+export function normalizeSourceEventConversation(
+  row: CandidateRow,
+  rawContent: string,
+  hasStableProviderIdentity = sourceIdentity(row) !== null,
+): SourceEventConversationNormalization {
+  if (row.type !== 'conversation' || !hasStableProviderIdentity) {
+    return { content: rawContent, method: 'not_conversation', parseDisposition: 'not_applicable' };
+  }
+  const meta = metadata(row);
+  const protectedText = protectLiteralLines(rawContent);
+  const parsed = parseConversation(protectedText.content, {
+    fallbackDate: sourceEventTimestamp(row, true).occurredAt,
+    noPolish: true,
+    noFallback: true,
+  });
+  if (parsed.phase === 'no_match' || parsed.messages.length === 0) {
+    return {
+      content: '[source-event normalization=conversation_parse_failed disposition=withheld]\n' +
+        'Raw conversation remains in its source page; it was withheld from fact extraction.',
+      method: 'conversation_parse_failed',
+      parseDisposition: 'withheld',
+    };
+  }
+
+  if (isObserverConversation(meta)) {
+    const evidence: string[] = [];
+    for (const message of parsed.messages.filter((item) => /^(?:user|human|you)$/i.test(item.speaker))) {
+      for (const observed of extractTag(message.text, 'observed_from_primary_session')) {
+        for (const request of extractTag(observed, 'user_request')) {
+          evidence.push(tagged('primary-user', 'observed-primary-user', protectedText.restore(request)));
+        }
+        for (const tag of ['what_happened', 'parameters', 'outcome'] as const) {
+          for (const value of extractTag(observed, tag)) {
+            evidence.push(tagged('tool-evidence', tag, protectedText.restore(value)));
+          }
+        }
+      }
+    }
+    if (evidence.length === 0) {
+      return {
+        content: '[source-event normalization=observer_primary_session disposition=withheld]\n' +
+          'No primary-session evidence was found; observer text was withheld from fact extraction.',
+        method: 'observer_primary_session', parseDisposition: 'withheld',
+      };
+    }
+    return {
+      content: '[source-event normalization=observer_primary_session disposition=parsed]\n' + evidence.join('\n\n'),
+      method: 'observer_primary_session', parseDisposition: 'parsed',
+    };
+  }
+
+  const split = splitExplicitToolEvidence(protectedText.content);
+  const messages = parseConversation(split.conversation, {
+    fallbackDate: sourceEventTimestamp(row, true).occurredAt,
+    noPolish: true,
+    noFallback: true,
+  }).messages;
+  const rendered = messages.map((message) => tagged(
+    /^(?:user|human|you)$/i.test(message.speaker) ? 'user' : 'assistant-context',
+    message.speaker,
+    protectedText.restore(message.text),
+  ));
+  rendered.push(...split.tools.map((tool) => tagged('tool-evidence', 'tool', protectedText.restore(tool))));
+  return {
+    content: '[source-event normalization=conversation_parser disposition=parsed]\n' + rendered.join('\n\n'),
+    method: 'conversation_parser', parseDisposition: 'parsed',
+  };
+}
+
+export function makeSourceEventProjectionHandler(
+  engine: BrainEngine,
+  deps: { project?: typeof projectSourceEvent } = {},
+) {
   return async function sourceEventProjectionHandler(job: MinionJobContext): Promise<unknown> {
     const { sourceId, limit } = parseParams(job.data);
     const source = await fetchSource(engine, sourceId);
@@ -380,8 +579,9 @@ export function makeSourceEventProjectionHandler(engine: BrainEngine) {
           continue;
         }
         try {
-          const sourceTime = timestamp(row);
-          const receipt = await projectSourceEvent(engine, {
+          const sourceTime = sourceEventTimestamp(row, true);
+          const normalized = normalizeSourceEventConversation(row, content, true);
+          const receipt = await (deps.project ?? projectSourceEvent)(engine, {
             sourceId,
             sourceKind: row.type,
             sourceKey: identity.sourceKey,
@@ -392,6 +592,11 @@ export function makeSourceEventProjectionHandler(engine: BrainEngine) {
             occurredAt: sourceTime.occurredAt,
             occurredAtAttested: sourceTime.attested,
             content,
+            factsContent: normalized.content,
+            normalization: {
+              method: normalized.method,
+              parseDisposition: normalized.parseDisposition,
+            },
           }, { sourceLockHeld: true });
           if (receipt.status === 'applied') applied++;
           else if (receipt.status === 'partial') partial++;

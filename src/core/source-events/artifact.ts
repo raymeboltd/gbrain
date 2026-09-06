@@ -15,6 +15,7 @@ export interface SourceEventRevisionRecord {
   content_hash: string;
   occurred_at: string;
   occurred_at_attested?: boolean;
+  normalization?: { method: string; parse_disposition: string };
   state: SourceEventRevisionState;
   targets: string[];
   fact_ids: number[];

@@ -127,7 +127,7 @@ describe('source-event projector', () => {
     const a = sourceEventKey(input());
     const b = sourceEventKey(input());
     const otherSource = sourceEventKey(input({ sourceId: 'other' }));
-    const otherVersion = sourceEventKey(input({ processorVersion: 'source-event-v5' }));
+    const otherVersion = sourceEventKey(input({ processorVersion: 'source-event-v6' }));
     const otherItem = sourceEventKey(input({ sourceKey: 'msg-456' }));
     const otherUri = sourceEventKey(input({ sourceUri: 'gmail://message/msg-else' }));
     const otherSlug = sourceEventKey(input({ sourceSlug: 'raw/gmail/msg-else' }));
@@ -795,6 +795,60 @@ describe('source-event projector', () => {
     expect(artifact).toContain('"reason": "source_correction"');
   });
 
+  test('withheld conversation evidence produces review without invoking extraction or writing an artifact', async () => {
+    await seedKnownTargets();
+    let calls = 0;
+    const receipt = await projectSourceEvent(engine, input({
+      factsContent: 'withheld', normalization: { method: 'conversation_parse_failed', parseDisposition: 'withheld' },
+    }), { runFacts: async () => { calls++; throw new Error('must not run'); } });
+    expect(receipt.status).toBe('review');
+    expect(receipt.errors).toContainEqual({ code: 'conversation_evidence_withheld', detail: 'conversation_parse_failed' });
+    expect(calls).toBe(0);
+    expect(fs.existsSync(path.join(brainDir, `${receipt.artifactSlug}.md`))).toBe(false);
+    expect(await engine.executeRaw('SELECT 1 FROM facts')).toHaveLength(0);
+  });
+
+  test('normalization upgrade replaces flattened facts with a new revision while preserving raw identity', async () => {
+    await seedKnownTargets();
+    await engine.executeRaw("UPDATE sources SET local_path=$1 WHERE id='default'", [brainDir]);
+    let calls = 0;
+    const runFacts: NonNullable<SourceEventProjectorDeps['runFacts']> = async (factsEngine, sourceInput, _targets, run) => {
+      calls++;
+      const written = await writeSingleFact(factsEngine, sourceInput.sourceId, {
+        fact: sourceInput.factsContent ? 'The user asked to verify delivery' : 'The user guarantees delivery',
+        provenance: `source-event:${sourceInput.sourceKey}`, sessionId: run.factSessionId,
+        kind: 'event', entity: 'projects/porsche', visibility: 'private', pendingRunId: run.runId,
+      });
+      return { inserted: 1, duplicate: 0, superseded: 0, factIds: [written.id], stage: 'applied' as const };
+    };
+    const first = await projectSourceEvent(engine, input({ processorVersion: 'source-event-v4' }), { runFacts });
+    const corrected = input({ factsContent: 'User asked to verify delivery.',
+      normalization: { method: 'conversation_parser', parseDisposition: 'parsed' } });
+    const second = await projectSourceEvent(engine, corrected, { runFacts });
+    expect(calls).toBe(2);
+    expect(second.eventId).toBe(first.eventId);
+    expect(second.revisionId).not.toBe(first.revisionId);
+    expect((await projectSourceEvent(engine, corrected, { runFacts })).replayed).toBe(true);
+    expect(calls).toBe(2);
+    const active = await engine.executeRaw<{ fact: string }>('SELECT fact FROM facts WHERE expired_at IS NULL');
+    expect(active).toEqual([{ fact: 'The user asked to verify delivery' }]);
+    const artifact = await loadSourceEventArtifact(engine, 'default', first.artifactSlug);
+    expect(artifact?.revisions).toHaveLength(2);
+    expect(artifact?.revisions.every((revision) => revision.content_hash === corrected.contentHash)).toBe(true);
+    expect(sourceEventRevisionId(first.eventId, { ...corrected, occurredAtAttested: true }))
+      .not.toBe(sourceEventRevisionId(first.eventId, { ...corrected, occurredAtAttested: false }));
+    const withheld = await projectSourceEvent(engine, { ...corrected,
+      factsContent: 'withheld', normalization: { method: 'conversation_parse_failed', parseDisposition: 'withheld' },
+    }, { runFacts });
+    expect(withheld.status).toBe('review');
+    expect(calls).toBe(2);
+    expect(await engine.executeRaw('SELECT 1 FROM facts WHERE expired_at IS NULL')).toHaveLength(0);
+    expect(await engine.executeRaw('SELECT 1 FROM facts WHERE expired_at IS NOT NULL')).toHaveLength(2);
+    expect((await loadSourceEventArtifact(engine, 'default', first.artifactSlug))?.state).toBe('retracted');
+    expect((await engine.getPage(corrected.sourceSlug, { sourceId: 'default' }))?.compiled_truth).toBe(corrected.content);
+
+  });
+
   test('processor-only upgrade reuses facts and reconciles one stable artifact', async () => {
     await seedKnownTargets();
     await engine.executeRaw("UPDATE sources SET local_path=$1 WHERE id='default'", [brainDir]);
@@ -809,7 +863,7 @@ describe('source-event projector', () => {
       return { inserted: 1, duplicate: 0, superseded: 0, factIds: [written.id], stage: 'applied' as const };
     };
     const first = await projectSourceEvent(engine, input(), { runFacts });
-    const second = await projectSourceEvent(engine, input({ processorVersion: 'source-event-v5' }), { runFacts });
+    const second = await projectSourceEvent(engine, input({ processorVersion: 'source-event-v6' }), { runFacts });
     expect(calls).toBe(1);
     expect(second.eventId).toBe(first.eventId);
     expect(second.revisionId).toBe(first.revisionId);
@@ -817,7 +871,7 @@ describe('source-event projector', () => {
     expect(await engine.executeRaw('SELECT 1 FROM facts WHERE expired_at IS NULL')).toHaveLength(1);
     const artifact = fs.readFileSync(path.join(brainDir, `${first.artifactSlug}.md`), 'utf8');
     expect(artifact.match(/"revision_id":/g)?.length).toBe(1);
-    expect(artifact).toContain('"processor_version": "source-event-v5"');
+    expect(artifact).toContain('"processor_version": "source-event-v6"');
   });
 
   test('private artifact is visible locally but cannot leak through remote page or backlink reads', async () => {

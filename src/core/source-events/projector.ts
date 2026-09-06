@@ -26,6 +26,9 @@ export interface SourceEventProjectionInput {
   occurredAt: string;
   /** True only when occurredAt came from provider/source metadata, never ingest updated_at. */
   occurredAtAttested?: boolean;
+  /** Optional deterministic extraction view; content remains the immutable raw/hash input. */
+  factsContent?: string;
+  normalization?: { method: string; parseDisposition: string };
   content: string;
 }
 
@@ -70,7 +73,11 @@ export interface SourceEventProjectorDeps {
   sourceLockHeld?: boolean;
 }
 
-export const SOURCE_EVENT_PROCESSOR_VERSION = 'source-event-v4';
+export const SOURCE_EVENT_PROCESSOR_VERSION = 'source-event-v5';
+
+export function sourceEventFactExtractionContent(input: SourceEventProjectionInput): string {
+  return input.factsContent ?? input.content;
+}
 export const MAX_SOURCE_EVENT_CONTENT_BYTES = 256 * 1024;
 export const MAX_SOURCE_EVENT_TARGETS = 25;
 
@@ -116,9 +123,18 @@ export function sourceEventId(input: Pick<SourceEventProjectionInput, 'sourceId'
 /** Content or timestamp correction creates a new immutable revision. */
 export function sourceEventRevisionId(
   eventId: string,
-  input: Pick<SourceEventProjectionInput, 'contentHash' | 'occurredAt'>,
+  input: Pick<SourceEventProjectionInput, 'contentHash' | 'occurredAt' | 'factsContent' | 'normalization' | 'occurredAtAttested'>,
 ): string {
-  return digest([eventId, required(input.contentHash, 'contentHash'), required(input.occurredAt, 'occurredAt')]);
+  const parts = [eventId, required(input.contentHash, 'contentHash'), required(input.occurredAt, 'occurredAt')];
+  // A changed extraction view must replace old flattened facts even when the
+  // immutable provider bytes and timestamp are unchanged. Ordinary processor
+  // upgrades without a changed view still reuse their facts.
+  if (input.normalization && input.normalization.method !== 'not_conversation') {
+    parts.push(input.normalization.method, input.normalization.parseDisposition,
+      String(input.occurredAtAttested === true),
+      digest([input.factsContent ?? '']));
+  }
+  return digest(parts);
 }
 
 /** One processor run over one immutable source revision. */
@@ -194,7 +210,7 @@ async function defaultFactsRunner(
   runId: string,
 ): Promise<SourceEventFactsOutcome> {
   const result = await runFactsBackstop(
-    { slug: input.sourceSlug, type: input.sourceKind, compiled_truth: input.content, frontmatter: {} },
+    { slug: input.sourceSlug, type: input.sourceKind, compiled_truth: sourceEventFactExtractionContent(input), frontmatter: {} },
     {
       engine,
       sourceId: input.sourceId,
@@ -669,6 +685,18 @@ async function projectSourceEventUnderSourceLock(
       status: 'review', targetResults: [], candidates: 0, resolved: 0, links: 0, facts: 0,
       skipped: 1, errors: [{ code: 'content_too_large', detail: String(bytes) }],
     });
+    if (normalized.normalization?.parseDisposition === 'withheld') {
+      // A newly strict parser can withhold an event whose old flattened facts
+      // are already active. Preserve history but withdraw those projections
+      // through the canonical reversible retraction path before review.
+      await retractSourceEvent(engine, {
+        sourceId, eventId, artifactSlug, reason: 'conversation evidence withheld pending review',
+      });
+      return finalizeReceipt(engine, sourceId, eventKey, {
+        status: 'review', targetResults: [], candidates: 0, resolved: 0, links: 0, facts: 0,
+        skipped: 1, errors: [{ code: 'conversation_evidence_withheld', detail: normalized.normalization.method }],
+      });
+    }
     const ambiguity = await findAmbiguousIdentity(engine, sourceId, content);
     if (ambiguity.length > 0) return finalizeReceipt(engine, sourceId, eventKey, {
       status: 'review', targetResults: [], candidates: ambiguity.length, resolved: 0, links: 0, facts: 0,
@@ -783,6 +811,10 @@ async function projectSourceEventUnderSourceLock(
       content_hash: contentHash,
       occurred_at: occurredAt,
       occurred_at_attested: normalized.occurredAtAttested === true,
+      normalization: normalized.normalization ? {
+        method: normalized.normalization.method,
+        parse_disposition: normalized.normalization.parseDisposition,
+      } : undefined,
       state: 'pending',
       targets,
       fact_ids: [],
@@ -800,6 +832,10 @@ async function projectSourceEventUnderSourceLock(
       revision.content_hash = contentHash;
       revision.occurred_at = occurredAt;
       revision.occurred_at_attested = normalized.occurredAtAttested === true;
+      revision.normalization = normalized.normalization ? {
+        method: normalized.normalization.method,
+        parse_disposition: normalized.normalization.parseDisposition,
+      } : undefined;
       revision.state = 'pending';
       revision.targets = targets;
       revision.fact_ids = [];
