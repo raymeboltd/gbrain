@@ -19,6 +19,14 @@
 
 import { describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+// Hermetic home: the operator's real ~/.gbrain may be a thin-client config
+// (remote MCP), whose doctor envelope carries the remote check registry, not
+// these local checks. Reproduced 2026-09-07 on a thin-client laptop.
+const HERMETIC_HOME = mkdtempSync(join(tmpdir(), 'gbrain-doctor-v0_41_16-'));
 
 interface DoctorCheck {
   name: string;
@@ -40,6 +48,7 @@ function runDoctor(): DoctorEnvelope {
       cwd: process.cwd(),
       encoding: 'utf8',
       timeout: 60000,
+      env: { ...process.env, GBRAIN_HOME: HERMETIC_HOME },
     },
   );
   if (result.error) throw result.error;

@@ -239,6 +239,17 @@ export const E2E_TEST_MAP: Record<string, string[]> = {
   "src/commands/doctor.ts": ["test/e2e/doctor-progress.test.ts"],
   // Doctor check modules peeled from doctor.ts feed the same e2e surface.
   "src/commands/doctor/**": ["test/e2e/doctor-progress.test.ts"],
+  // Facts-fence reconcile (extract_facts cycle phase) + the identity-safe
+  // retained-row reconcile feed the Postgres fence-reconcile e2e and the
+  // per-page fault-isolation e2e (0.48.5.0).
+  "src/core/cycle/extract-facts.ts": [
+    "test/e2e/facts-fence-reconcile-postgres.test.ts",
+    "test/e2e/extract-facts-ambiguous-identity-isolation.test.ts",
+  ],
+  "src/core/facts/reconcile-retained.ts": [
+    "test/e2e/facts-fence-reconcile-postgres.test.ts",
+    "test/e2e/extract-facts-ambiguous-identity-isolation.test.ts",
+  ],
   // Knowledge graph layer feeds graph-quality.
   "src/core/link-extraction.ts": ["test/e2e/graph-quality.test.ts"],
   // v0.38 ingestion substrate. POST /ingest lives inside serve-http.ts
