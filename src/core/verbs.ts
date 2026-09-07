@@ -63,7 +63,7 @@ const remember: Operation = {
     'provenance is REQUIRED (free text, e.g. "conversation 2026-06-12", "user said in chat", "import: notes.md"). ' +
     'Set `entity` whenever the fact is about a specific person/company/project — entity-scoped recall will not find it otherwise. ' +
     'ttl accepts duration shorthand ("30d", "12h") or an absolute ISO 8601 timestamp; ISO-8601 durations like "P30D" are rejected with a fix. ' +
-    'visibility defaults to "world" (readable by every agent connected to this brain; pass "private" for local-CLI-only facts). ' +
+    'visibility defaults to "world" (readable by every agent connected to this brain; pass "private" for local-CLI-only facts), or to "private" when the brain config `facts.default_visibility` is private. ' +
     'Response: branch on `status` (inserted|duplicate|superseded), never on `status_text` (human rendering only). ' +
     'On duplicate, `id` is the EXISTING fact\'s id. For bulk extraction from a raw transcript use extract_facts instead.',
   params: {
@@ -93,7 +93,7 @@ const remember: Operation = {
       type: 'string',
       enum: ['world', 'private'],
       description:
-        'world (default): readable by every agent connected to this brain — required for the remote remember→recall round-trip. private: local CLI reads only.',
+        'world (default unless `facts.default_visibility` is private): readable by every agent connected to this brain — required for the remote remember→recall round-trip. private: local CLI reads only.',
     },
   },
   mutating: true,
@@ -133,7 +133,13 @@ const remember: Operation = {
         `Use one of: ${FACT_KINDS.join(' | ')}.`,
       );
     }
-    const visibility = typeof p.visibility === 'string' ? p.visibility : 'world';
+    // Explicit caller value > `facts.default_visibility` when it says private > the v1 protocol default (world).
+    // Only an explicit `private` opt-in narrows the default: an unset/invalid key keeps the frozen v1 contract.
+    const { FACTS_DEFAULT_VISIBILITY_KEY } = await import('./facts/visibility.ts');
+    const configured = typeof p.visibility === 'string' ? null
+      : await ctx.engine.getConfig(FACTS_DEFAULT_VISIBILITY_KEY).catch(() => null);
+    const visibility = typeof p.visibility === 'string' ? p.visibility
+      : configured?.trim().toLowerCase() === 'private' ? 'private' : 'world';
     if (visibility !== 'world' && visibility !== 'private') {
       throw verbError(
         'invalid_params',

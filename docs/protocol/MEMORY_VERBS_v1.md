@@ -159,6 +159,8 @@ Save ONE fact with mandatory attribution.
 - `visibility`: `world` (DEFAULT — readable by every agent connected to this
   brain; required for the remote remember→recall round-trip) \| `private`
   (local CLI reads only). The init quickstart carries the consent line.
+  When the caller omits it and the brain config `facts.default_visibility`
+  is `private`, the write lands `private`; any other value keeps `world`.
 
 Response: `{ id, status, status_text, entity_slug, valid_until,
 protocol_version }` (+ `degraded_dedup: true` when no embedding provider —

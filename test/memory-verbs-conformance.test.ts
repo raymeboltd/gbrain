@@ -268,6 +268,20 @@ describe('remember — contract behavior', () => {
     expect(texts).toContain('world-visible round-trip fact');
     expect(texts).not.toContain('PRIVATE-SENTINEL');
   });
+  it('remember honours facts.default_visibility=private when the caller omits visibility', async () => {
+    await engine.setConfig('facts.default_visibility', 'private');
+    try {
+      const { body } = await callRemote('remember', {
+        fact: 'CONFIG-DEFAULT-SENTINEL fact', provenance: 'test', entity: 'people/config-default-test',
+      });
+      const rows = await engine.executeRaw<{ visibility: string }>(
+        'SELECT visibility FROM facts WHERE id = $1', [body.id],
+      );
+      expect(rows.map((r) => r.visibility)).toEqual(['private']);
+    } finally {
+      await engine.unsetConfig('facts.default_visibility');
+    }
+  });
 });
 
 describe('entity — card, arms, zero LLM', () => {

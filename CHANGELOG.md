@@ -2,6 +2,14 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.48.8.0] - 2026-09-07
+
+### Fixed
+
+- **`remember` honours `facts.default_visibility=private`.** The memory write verb used to land every fact as `world` whenever the caller omitted `visibility`, regardless of the brain's configured default. It now resolves explicit caller value > `facts.default_visibility` when set to `private` > the frozen v1 default (`world`), so an unset key keeps the remote remember→recall round-trip contract. One conformance test pins it.
+
+**To take advantage of v0.48.8.0:** nothing to run. Brains with `facts.default_visibility=private` (`gbrain config set facts.default_visibility private`) now get private writes from `remember`; brains left at `world` or unset are unchanged. **Say to your agent:** *"remember that I prefer morning meetings"* — the fact lands with your brain's configured default visibility.
+
 ## [0.48.7.0] - 2026-09-07
 
 ### Fixed
