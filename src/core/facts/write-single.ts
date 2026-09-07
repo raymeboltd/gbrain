@@ -200,6 +200,9 @@ export async function writeSingleFact(
     }
     if (!result.stubGuardBlocked && !result.legacyFallback && !result.targetUnresolvable) {
       const newId = result.ids[0];
+      if (newId === undefined) {
+        throw new Error(`facts fence row for ${resolvedSlug} has no DB row — run extract_facts to reconcile the page`);
+      }
       if (supersedeId !== null && newId !== undefined) {
         await expireSuperseded(engine, supersedeId, newId);
         return {
@@ -212,7 +215,7 @@ export async function writeSingleFact(
       }
       return {
         id: newId,
-        status: 'inserted',
+        status: result.duplicate ? 'duplicate' : 'inserted',
         entity_slug: resolvedSlug,
         valid_until: validUntil,
         degraded_dedup: degradedDedup,

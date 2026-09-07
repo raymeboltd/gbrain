@@ -11,7 +11,7 @@ import {
   type SourceEventRevisionRecord,
 } from './artifact.ts';
 import { assertSourceEventAdmission, readSourceEventPolicy } from './policy.ts';
-import { prepareSourceEventFactFence } from './fact-commit.ts';
+import { pendingMarker, prepareSourceEventFactFence } from './fact-commit.ts';
 import { candidateIdentity, reconcileCompiledTruthForTargets } from './compiled-projection.ts';
 import { tryAcquireDbLock } from '../db-lock.ts';
 
@@ -375,6 +375,31 @@ async function factsForSession(
     [sourceId, sourceSession],
   );
   return rows.map((row) => Number(row.id));
+}
+
+const ABORT_ROLLBACK_REASON = 'source event projection aborted before pending facts were hidden';
+
+/** Decision D5 (2026-09-07): the fence strike wins. Of the ids a facts runner
+ * hands back, `staged` are rows this run owns (its session, its pending
+ * marker, or a row its own aborted attempt rolled back — the same runId is
+ * reused on retry) and `activatable` adds rows already active. A struck row
+ * adopted from the fence (fence-write keeps one row per key) is neither, so
+ * it never enters the pending set and is never re-activated. */
+async function classifyRunFactIds(
+  engine: BrainEngine, sourceId: string, runId: string, factSessionId: string, factIds: number[],
+): Promise<{ activatable: number[]; staged: Set<number> }> {
+  const ids = [...new Set(factIds.map(Number))];
+  if (ids.length === 0) return { activatable: ids, staged: new Set() };
+  const rows = await engine.executeRaw<{ id: number; staged: boolean; active: boolean }>(
+    `SELECT id,
+            (context LIKE $4 OR (source_session=$3 AND (expired_at IS NULL OR context LIKE $5))) AS staged,
+            (expired_at IS NULL) AS active
+       FROM facts WHERE source_id=$1 AND id=ANY($2::bigint[])`,
+    [sourceId, ids, factSessionId, `%${pendingMarker(runId)}%`, `%forgotten: ${ABORT_ROLLBACK_REASON}%`],
+  );
+  const staged = new Set(rows.filter((row) => row.staged).map((row) => Number(row.id)));
+  const activatable = new Set(rows.filter((row) => row.staged || row.active).map((row) => Number(row.id)));
+  return { activatable: ids.filter((id) => activatable.has(id)), staged };
 }
 
 function factSwapSets(pendingFactIds: number[], priorFactIds: number[]) {
@@ -865,8 +890,11 @@ async function projectSourceEventUnderSourceLock(
       facts = deps.runFacts
         ? await deps.runFacts(engine, normalized, targets, { runId, factSessionId })
         : await defaultFactsRunner(engine, normalized, targets, factSessionId, runId);
-      revision.fact_ids = [...new Set(facts.factIds.map(Number))];
-      precommitFactIds = revision.fact_ids.filter((factId) => !protectedFactIds.has(factId));
+      // D5 + adoption: only rows this run staged may be rolled back on abort;
+      // adopted rows belong to other events (or the protected prior revision).
+      const classified = await classifyRunFactIds(engine, sourceId, runId, factSessionId, facts.factIds);
+      revision.fact_ids = classified.activatable;
+      precommitFactIds = revision.fact_ids.filter((factId) => classified.staged.has(factId) && !protectedFactIds.has(factId));
       await assertCanonicalFactOutcome(engine, sourceId, targets, revision.fact_ids);
       revision.facts_stage = facts.stage;
       const candidates = await buildReviewCandidates(
@@ -960,7 +988,7 @@ async function projectSourceEventUnderSourceLock(
         const sessionFactIds = await factsForSession(engine, sourceId, factSessionId);
         const cleanupIds = [...new Set([...precommitFactIds, ...sessionFactIds])]
           .filter((factId) => !protectedFactIds.has(factId));
-        await retractPriorFacts(engine, sourceId, eventId, cleanupIds, 'source event projection aborted before pending facts were hidden');
+        await retractPriorFacts(engine, sourceId, eventId, cleanupIds, ABORT_ROLLBACK_REASON);
         const markerErrors = await clearFactSwapFenceMarkers(engine, {
           sourceId,
           runId,

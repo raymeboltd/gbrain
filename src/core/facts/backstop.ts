@@ -905,6 +905,7 @@ async function runPipelineBodyInner(
     }
 
     inserted += result.inserted;
+    duplicate += result.duplicate ?? 0;
     fact_ids.push(...result.ids);
     if (result.inserted > 0) fencedSlugs.add(slug);
   }

@@ -10,14 +10,20 @@ interface FactFenceRow {
   source_id: string;
   row_num: number | null;
   source_markdown_slug: string | null;
+  expired_at: Date | string | null;
 }
 
 function todayUtc(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
+/** Context cell segment that flags a fence row as staged by source-event run `runId`. */
+export function pendingMarker(runId: string): string {
+  return `source-event-pending:${runId}`;
+}
+
 function removePendingMarker(context: string | undefined, runId: string): string | undefined {
-  const marker = `source-event-pending:${runId}`;
+  const marker = pendingMarker(runId);
   const parts = (context ?? '').split('|').map((part) => part.trim()).filter(Boolean);
   if (!parts.includes(marker)) return context;
   const kept = parts.filter((part) => part !== marker);
@@ -41,10 +47,14 @@ export async function prepareSourceEventFactFence(
   },
 ): Promise<void> {
   const rows = await engine.executeRaw<FactFenceRow>(
-    `SELECT id,source_id,row_num,source_markdown_slug FROM facts WHERE id=$1 AND source_id=$2`,
+    `SELECT id,source_id,row_num,source_markdown_slug,expired_at FROM facts WHERE id=$1 AND source_id=$2`,
     [input.factId, input.sourceId],
   );
   const row = rows[0];
+  // A row moved out of fence scope (expired, row_num NULL — the D2 duplicate
+  // cleanup) has nothing left to strike or unmark; expiring it again is a no-op.
+  if (row && row.row_num === null && row.expired_at !== null
+      && (input.action === 'expire_prior' || input.action === 'clear_pending')) return;
   if (!row || row.row_num === null || row.source_markdown_slug === null) {
     throw new Error(`source-event: fact ${input.factId} is not filesystem-canonical`);
   }
@@ -64,7 +74,7 @@ export async function prepareSourceEventFactFence(
     if (!target) throw new Error(`source-event: fact ${input.factId} missing from canonical fence`);
     const updated: ParsedFact[] = parsed.facts.map((fact) => {
       if (fact.rowNum !== row.row_num) return fact;
-      const marker = `source-event-pending:${input.runId}`;
+      const marker = pendingMarker(input.runId);
       if (input.action === 'mark_pending') {
         const parts = (fact.context ?? '').split('|').map((part) => part.trim()).filter(Boolean);
         if (parts.includes(marker)) return fact;

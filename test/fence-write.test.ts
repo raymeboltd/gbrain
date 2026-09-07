@@ -258,6 +258,63 @@ describe('writeFactsToFence — happy path', () => {
   }, 60_000);
 });
 
+describe('writeFactsToFence — one fence row per (claim, source) key', () => {
+  const target = (slug: string) =>
+    ({ sourceId: 'default', localPath: brainDir, slug, resolutionSource: 'exact_page' }) as const;
+  const dbRows = async (slug: string) =>
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (await (engine as any).db.query(
+      `SELECT id, row_num, fact, expired_at FROM facts WHERE source_markdown_slug = $1 ORDER BY row_num`,
+      [slug],
+    )).rows as Array<{ id: number; row_num: number; fact: string; expired_at: Date | null }>;
+
+  test('re-observing an active claim adopts the existing row instead of appending a duplicate key', async () => {
+    const first = await writeFactsToFence(engine, target('people/eve'), [baseInput({ fact: 'Runs Acme' })]);
+    const again = await writeFactsToFence(engine, target('people/eve'), [
+      baseInput({ fact: 'Runs Acme', pendingRunId: 'run-2' }),
+      baseInput({ fact: 'Lives in Lyon' }),
+    ]);
+
+    expect(again.inserted).toBe(1);
+    expect(again.duplicate).toBe(1);
+    // Input order: the adopted id first, then the new row's id.
+    expect(again.ids[0]).toBe(first.ids[0]);
+    expect(again.ids).toHaveLength(2);
+    const rows = await dbRows('people/eve');
+    expect(rows.map(r => r.fact)).toEqual(['Runs Acme', 'Lives in Lyon']);
+    const fence = readFileSync(join(brainDir, 'people/eve.md'), 'utf-8');
+    expect(fence.split('Runs Acme').length - 1).toBe(1);
+  });
+
+  test('a struck claim is resolved to its struck row: no append, no revival, id reported as duplicate', async () => {
+    const first = await writeFactsToFence(engine, target('people/finn'), [baseInput({ fact: 'Acting CTO' })]);
+    await forgetFactInFence(engine, first.ids[0], { reason: 'left the role' });
+
+    const again = await writeFactsToFence(engine, target('people/finn'), [
+      baseInput({ fact: 'Acting CTO', pendingRunId: 'run-9' }),
+    ]);
+
+    expect(again).toEqual({ inserted: 0, ids: [first.ids[0]], duplicate: 1 });
+    const rows = await dbRows('people/finn');
+    expect(rows).toHaveLength(1);
+    expect(rows[0].expired_at).not.toBeNull();
+    const fence = readFileSync(join(brainDir, 'people/finn.md'), 'utf-8');
+    expect(fence).toContain('~~Acting CTO~~');
+  });
+
+  test('duplicate keys inside one batch collapse to the first row', async () => {
+    const result = await writeFactsToFence(engine, target('people/hal'), [
+      baseInput({ fact: 'Same claim' }),
+      baseInput({ fact: 'Same claim' }),
+    ]);
+
+    expect(result.inserted).toBe(1);
+    expect(result.duplicate).toBe(1);
+    expect(result.ids).toEqual([result.ids[0], result.ids[0]]);
+    expect(await dbRows('people/hal')).toHaveLength(1);
+  });
+});
+
 describe('writeFactsToFence — legacy fallback', () => {
   test('null localPath returns legacyFallback:true with no inserts', async () => {
     const result = await writeFactsToFence(

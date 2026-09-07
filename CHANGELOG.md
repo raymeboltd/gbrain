@@ -2,6 +2,16 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.48.7.0] - 2026-09-07
+
+### Fixed
+
+- **Facts fence: one row per (claim, source) key.** `writeFactsToFence` no longer appends a second row under a key the page's fence already carries; the input resolves to the existing row, whose id is reported as a `duplicate` (the same shape the backstop already used). The source-event projector had no dedupe on this path, so every re-observation of a known claim added a duplicate row and the fence reconcile then threw `FACT_RECONCILE_AMBIGUOUS_IDENTITY` for that page on every cycle. The reconcile itself is unchanged.
+- **Struck claims stay struck (policy D5).** A source-event run may activate only rows it staged or rows already active; a re-observation of a claim the fence struck resolves to the struck row and does not revive it. An aborted run rolls back only the rows it staged, and a retry after an abort re-activates the rows its own rollback struck.
+- `prepareSourceEventFactFence` treats `expire_prior` / `clear_pending` on a row already moved out of fence scope as a no-op instead of throwing.
+
+To take advantage of v0.48.7.0: pages frozen by duplicate fence keys need a one-time cleanup of the surplus DB rows (keep the lowest `row_num` per key, soft-expire the rest and clear their `row_num`), then the next `gbrain dream` run (its extract_facts phase) reconciles them. **Say to your agent:** *"run the overnight maintenance cycle"*.
+
 ## [0.48.6.0] - 2026-09-06
 
 ### Changed

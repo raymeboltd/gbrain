@@ -11,6 +11,8 @@ import { chunkText } from '../src/core/chunkers/recursive.ts';
 import { writePageThrough, _resetWriteThroughCacheForTest } from '../src/core/write-through.ts';
 import { operationsByName } from '../src/core/operations.ts';
 import { writeSingleFact } from '../src/core/facts/write-single.ts';
+import { forgetFactInFence } from '../src/core/facts/forget.ts';
+import { prepareSourceEventFactFence } from '../src/core/source-events/fact-commit.ts';
 import { tryAcquireDbLock } from '../src/core/db-lock.ts';
 import { renderFactsTable } from '../src/core/facts-fence.ts';
 import { writeFactsToFence } from '../src/core/facts/fence-write.ts';
@@ -884,6 +886,105 @@ describe('source-event projector', () => {
     );
     expect(restoredFacts).not.toHaveLength(0);
     expect(restoredFacts.every((row) => row.expired_at === null)).toBe(true);
+  });
+
+  test('D5: a later event re-observing a claim the fence struck does not revive it', async () => {
+    await seedKnownTargets();
+    await engine.executeRaw("UPDATE sources SET local_path=$1 WHERE id='default'", [brainDir]);
+    const runFacts: NonNullable<SourceEventProjectorDeps['runFacts']> = async (factsEngine, sourceInput, _targets, run) => {
+      const written = await writeSingleFact(factsEngine, sourceInput.sourceId, {
+        fact: 'The user is acting CTO of the Porsche Project',
+        provenance: 'source-event', sessionId: run.factSessionId,
+        kind: 'fact', entity: 'projects/porsche', visibility: 'private', pendingRunId: run.runId,
+      });
+      return { inserted: written.status === 'inserted' ? 1 : 0, duplicate: written.status === 'duplicate' ? 1 : 0,
+        superseded: 0, factIds: [written.id], stage: 'applied' as const };
+    };
+    const first = await projectSourceEvent(engine, input(), { runFacts });
+    const firstArtifact = JSON.parse(/```json\s*([\s\S]*?)\s*```/.exec(
+      fs.readFileSync(path.join(brainDir, `${first.artifactSlug}.md`), 'utf8'))![1]!);
+    const [factId] = firstArtifact.revisions[0].fact_ids as number[];
+    await forgetFactInFence(engine, factId, { reason: 'no longer true' });
+
+    const repeated = 'Victor Example repeated that the user is acting CTO of the Porsche Project.';
+    await engine.putPage('raw/gmail/msg-456', { type: 'email', title: 'Car update again', compiled_truth: repeated });
+    const later = await projectSourceEvent(engine, input({
+      sourceKey: 'msg-456', sourceUri: 'gmail://message/msg-456', sourceSlug: 'raw/gmail/msg-456', content: repeated,
+    }), { runFacts });
+    expect(later.status).toBe('applied');
+    const laterArtifact = JSON.parse(/```json\s*([\s\S]*?)\s*```/.exec(
+      fs.readFileSync(path.join(brainDir, `${later.artifactSlug}.md`), 'utf8'))![1]!);
+    expect(laterArtifact.revisions[0].fact_ids).toEqual([]);
+    const rows = await engine.executeRaw<{ id: number; expired_at: Date | null }>(
+      'SELECT id, expired_at FROM facts WHERE source_markdown_slug=$1', ['projects/porsche'],
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].expired_at).not.toBeNull();
+  });
+
+  test('an aborted projection rolls back only the rows it staged, never an adopted row of another event', async () => {
+    await seedKnownTargets();
+    await engine.executeRaw("UPDATE sources SET local_path=$1 WHERE id='default'", [brainDir]);
+    const runFacts: NonNullable<SourceEventProjectorDeps['runFacts']> = async (factsEngine, sourceInput, _targets, run) => {
+      const written = await writeSingleFact(factsEngine, sourceInput.sourceId, {
+        fact: 'The Porsche Project delivery is Friday', provenance: 'source-event', sessionId: run.factSessionId,
+        kind: 'event', entity: 'projects/porsche', visibility: 'private', pendingRunId: run.runId,
+      });
+      return { inserted: 0, duplicate: 0, superseded: 0, factIds: [written.id], stage: 'applied' as const };
+    };
+    await projectSourceEvent(engine, input(), { runFacts });
+    const repeated = 'Victor Example repeated that the Porsche Project delivery is Friday.';
+    await engine.putPage('raw/gmail/msg-789', { type: 'email', title: 'Repeat', compiled_truth: repeated });
+    await expect(projectSourceEvent(engine, input({
+      sourceKey: 'msg-789', sourceUri: 'gmail://message/msg-789', sourceSlug: 'raw/gmail/msg-789', content: repeated,
+    }), { runFacts, persistArtifact: async () => { throw new Error('disk full'); } })).rejects.toThrow('disk full');
+    const rows = await engine.executeRaw<{ expired_at: Date | null }>(
+      'SELECT expired_at FROM facts WHERE source_markdown_slug=$1', ['projects/porsche'],
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].expired_at).toBeNull();
+    expect(fs.readFileSync(path.join(brainDir, 'projects/porsche.md'), 'utf8')).not.toContain('~~');
+  });
+
+  test('a retry after an aborted attempt re-activates the row the rollback struck', async () => {
+    await seedKnownTargets();
+    await engine.executeRaw("UPDATE sources SET local_path=$1 WHERE id='default'", [brainDir]);
+    let attempt = 0;
+    const runFacts: NonNullable<SourceEventProjectorDeps['runFacts']> = async (factsEngine, sourceInput, _targets, run) => {
+      const written = await writeSingleFact(factsEngine, sourceInput.sourceId, {
+        fact: 'The Porsche Project delivery is Friday', provenance: 'source-event', sessionId: run.factSessionId,
+        kind: 'event', entity: 'projects/porsche', visibility: 'private', pendingRunId: run.runId,
+      });
+      if (++attempt === 1) throw new Error('extractor timeout');
+      return { inserted: 0, duplicate: 1, superseded: 0, factIds: [written.id], stage: 'applied' as const };
+    };
+    await expect(projectSourceEvent(engine, input(), { runFacts })).rejects.toThrow('extractor timeout');
+    const struck = await engine.executeRaw<{ expired_at: Date | null }>(
+      'SELECT expired_at FROM facts WHERE source_markdown_slug=$1', ['projects/porsche'],
+    );
+    expect(struck).toHaveLength(1);
+    expect(struck[0].expired_at).not.toBeNull();
+
+    const retried = await projectSourceEvent(engine, input(), { runFacts });
+    expect(retried.status).toBe('applied');
+    const rows = await engine.executeRaw<{ expired_at: Date | null }>(
+      'SELECT expired_at FROM facts WHERE source_markdown_slug=$1', ['projects/porsche'],
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].expired_at).toBeNull();
+    expect(fs.readFileSync(path.join(brainDir, 'projects/porsche.md'), 'utf8')).not.toContain('~~');
+  });
+
+  test('expire_prior on a row moved out of fence scope is a no-op instead of a throw', async () => {
+    await seedKnownTargets();
+    await engine.executeRaw("UPDATE sources SET local_path=$1 WHERE id='default'", [brainDir]);
+    const written = await writeSingleFact(engine, 'default', {
+      fact: 'Surplus duplicate', provenance: 'source-event', kind: 'fact', entity: 'projects/porsche', visibility: 'private',
+    });
+    await engine.executeRaw('UPDATE facts SET row_num=NULL, expired_at=now() WHERE id=$1', [written.id]);
+    await expect(prepareSourceEventFactFence(engine, {
+      sourceId: 'default', factId: written.id, action: 'expire_prior', runId: 'run-x', reason: 'corrected',
+    })).resolves.toBeUndefined();
   });
 
   test('timestamp correction creates a new source revision on the stable artifact', async () => {

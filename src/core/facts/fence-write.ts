@@ -49,6 +49,8 @@ import { isDurabilityHardened, commitWriteThroughFile } from '../brain-repo-dura
 import { upsertFactRow, parseFactsFence } from '../facts-fence.ts';
 import { extractFactsFromFenceText } from './extract-from-fence.ts';
 import { logStubGuardEvent } from './stub-guard-audit.ts';
+import { retainedFactKey } from './reconcile-retained.ts';
+import { pendingMarker } from '../source-events/fact-commit.ts';
 
 /** Resolved source binding for the entity page. */
 export interface FenceTarget {
@@ -95,8 +97,13 @@ export interface FenceInputFact {
 export interface FenceWriteResult {
   /** Number of new rows written + indexed. */
   inserted: number;
-  /** DB ids assigned to the inserted rows, in input order. */
+  /**
+   * One DB id per input, in input order: the appended row's id, or the id of
+   * the row the fence already carried under the same (claim, source) key.
+   */
   ids: number[];
+  /** Inputs that resolved to an existing fence row instead of being appended. */
+  duplicate?: number;
   /** True when the path fell through to DB-only because local_path was unset. */
   legacyFallback?: true;
   /** True when fence parse-validate failed; rows were NOT inserted, .tmp quarantined. */
@@ -419,11 +426,30 @@ export async function writeFactsToFence(
         : 0;
       let nextRowNum = Math.max(fileMaxRowNum, dbMaxRowNum) + 1;
 
-      const assignedRowNums: number[] = [];
+      // One fence row per (claim, source): the reconcile dedupes the fence
+      // first-wins on retainedFactKey and bijects it against the DB, so a
+      // second row under an existing key freezes the page
+      // (FACT_RECONCILE_AMBIGUOUS_IDENTITY). An input whose key the fence
+      // carries resolves to that first row (active or struck; revival is the
+      // caller's policy, see projector.ts D5) and reports its id as a duplicate.
+      const firstByKey = new Map<string, number>();
+      for (const row of existingFenceFacts) {
+        const key = retainedFactKey(row.claim, row.source);
+        if (!firstByKey.has(key)) firstByKey.set(key, row.rowNum);
+      }
+      /** Per input, the row_num carrying its identity. */
+      const rowNums: number[] = [];
+      const inputByRowNum = new Map<number, FenceInputFact>();
       for (const f of facts) {
+        const key = retainedFactKey(f.fact.trim(), f.source);
+        const prior = firstByKey.get(key);
+        if (prior !== undefined) {
+          rowNums.push(prior);
+          continue;
+        }
         const validFromStr = (f.validFrom ?? new Date()).toISOString().slice(0, 10);
         const pendingContext = f.pendingRunId
-          ? [f.context?.trim(), `source-event-pending:${f.pendingRunId}`].filter(Boolean).join(' | ')
+          ? [f.context?.trim(), pendingMarker(f.pendingRunId)].filter(Boolean).join(' | ')
           : f.context ?? undefined;
         const { body: updated, rowNum } = upsertFactRow(body, {
           rowNum:      nextRowNum++,
@@ -444,7 +470,29 @@ export async function writeFactsToFence(
           active:      f.pendingRunId ? false : true,
         });
         body = updated;
-        assignedRowNums.push(rowNum);
+        firstByKey.set(key, rowNum);
+        inputByRowNum.set(rowNum, f);
+        rowNums.push(rowNum);
+      }
+
+      const duplicate = facts.length - inputByRowNum.size;
+      // ids by row_num from the DB, after the stamp: insertFacts compacts its
+      // ids on ON CONFLICT, so a positional stitch would shift.
+      // ponytail: a fence row with no DB row (fence/DB drift) yields no id, so
+      // `ids` can be shorter than `facts`; the next extract_facts reconcile
+      // inserts that row and later inputs adopt it. writeSingleFact fails loudly.
+      const idsInInputOrder = async (): Promise<number[]> => {
+        const rows = await engine.executeRaw<{ id: number; row_num: number }>(
+          `SELECT id, row_num FROM facts
+            WHERE source_id = $1 AND source_markdown_slug = $2 AND row_num = ANY($3::int[])`,
+          [target.sourceId, target.slug, [...new Set(rowNums)]],
+        );
+        const byRowNum = new Map(rows.map(r => [Number(r.row_num), Number(r.id)]));
+        return rowNums.flatMap(rn => byRowNum.has(rn) ? [byRowNum.get(rn)!] : []);
+      };
+      const assignedRowNums = [...inputByRowNum.keys()];
+      if (assignedRowNums.length === 0) {
+        return { inserted: 0, ids: await idsInInputOrder(), duplicate };
       }
 
       // Snapshot the prewrite git state INSIDE the lock, immediately before
@@ -486,14 +534,17 @@ export async function writeFactsToFence(
       // fence text) and source_session is runtime provenance that
       // isn't a fence column either. Stitch them back by row_num
       // index.
-      const enriched = toInsert.map((row, i) => ({
-        ...row,
-        // Pending source-event facts must be invisible in the INSERT itself;
-        // do not rely only on the strikethrough mapper for this trust gate.
-        expired_at:     facts[i].pendingRunId ? new Date() : row.expired_at,
-        embedding:      facts[i].embedding,
-        source_session: facts[i].sessionId,
-      }));
+      const enriched = toInsert.map((row) => {
+        const input = inputByRowNum.get(row.row_num)!;
+        return {
+          ...row,
+          // Pending source-event facts must be invisible in the INSERT itself;
+          // do not rely only on the strikethrough mapper for this trust gate.
+          expired_at:     input.pendingRunId ? new Date() : row.expired_at,
+          embedding:      input.embedding,
+          source_session: input.sessionId,
+        };
+      });
 
       const result = await engine.insertFacts(enriched, { source_id: target.sourceId }); // gbrain-allow-direct-insert: writeFactsToFence is the markdown-first reconcile path; runs only after the atomic fence write commits
       // v0.46 (#3014) — an unresolvable `superseded by #N` reference (self
@@ -513,7 +564,7 @@ export async function writeFactsToFence(
           durabilityPrewriteState,
         );
       }
-      return { inserted: result.inserted, ids: result.ids };
+      return { inserted: result.inserted, ids: await idsInInputOrder(), duplicate };
     },
     { timeoutMs: 5_000 },
   );
