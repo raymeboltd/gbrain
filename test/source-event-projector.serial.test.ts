@@ -1437,6 +1437,130 @@ describe('source-event projector', () => {
     })).rejects.toMatchObject({ code: 'permission_denied' });
   });
 
+  for (const visibility of ['world', 'private'] as const) {
+    test(`projection ownership skips an active ${visibility} duplicate without changing its fact or fence`, async () => {
+      await seedKnownTargets();
+      await engine.executeRaw("UPDATE sources SET local_path=$1 WHERE id='default'", [brainDir]);
+      const written = await writeSingleFact(engine, 'default', {
+        fact: 'Previously recorded delivery Friday', provenance: 'source-event',
+        sessionId: 'source-event:older-unrelated-event', kind: 'fact',
+        entity: 'projects/porsche', visibility,
+      });
+      const before = await engine.executeRaw('SELECT * FROM facts WHERE id=$1', [written.id]);
+      const projectPath = path.join(brainDir, 'projects/porsche.md');
+      const fenceBefore = fs.readFileSync(projectPath, 'utf8');
+      const receipt = await projectSourceEvent(engine, input(), {
+        runFacts: async () => ({ inserted: 0, duplicate: 1, superseded: 0, factIds: [written.id], stage: 'applied' }),
+      });
+      expect(receipt.status).toBe('partial');
+      expect(receipt.factsWritten).toBe(0);
+      expect(receipt.skipped).toBe(1);
+      expect(receipt.errors).toContainEqual({ code: 'facts_duplicate_skipped', detail: '1' });
+      const [stored] = await engine.executeRaw<{ target_results: Array<{ facts: string }> }>(
+        'SELECT target_results FROM source_event_receipts WHERE source_id=$1 AND event_key=$2',
+        ['default', receipt.eventKey],
+      );
+      expect(stored?.target_results).toHaveLength(2);
+      expect(stored?.target_results.every((target) => target.facts === 'skipped')).toBe(true);
+      const artifact = await loadSourceEventArtifact(engine, 'default', receipt.artifactSlug);
+      expect(artifact?.revisions[0]?.fact_ids).toEqual([]);
+      expect(artifact?.revisions[0]?.compiled_truth_candidates).toEqual([]);
+      expect(await engine.executeRaw('SELECT * FROM facts WHERE id=$1', [written.id])).toEqual(before);
+      expect(fs.readFileSync(projectPath, 'utf8')).toBe(fenceBefore);
+      await retractSourceEvent(engine, {
+        sourceId: 'default', eventId: receipt.eventId, artifactSlug: receipt.artifactSlug, reason: 'fixture retraction',
+      });
+      expect(await engine.executeRaw('SELECT * FROM facts WHERE id=$1', [written.id])).toEqual(before);
+      expect(fs.readFileSync(projectPath, 'utf8')).toBe(fenceBefore);
+    });
+  }
+
+  test('projection ownership validation failure retracts staged output and preserves an unrelated active fact', async () => {
+    await seedKnownTargets();
+    await engine.executeRaw("UPDATE sources SET local_path=$1 WHERE id='default'", [brainDir]);
+    const existing = await writeSingleFact(engine, 'default', {
+      fact: 'Unrelated existing delivery fact', provenance: 'source-event', sessionId: 'source-event:older-event',
+      kind: 'fact', entity: 'projects/porsche', visibility: 'world',
+    });
+    const before = await engine.executeRaw('SELECT * FROM facts WHERE id=$1', [existing.id]);
+    let invalidId = 0;
+    await expect(projectSourceEvent(engine, input(), {
+      runFacts: async (factsEngine, sourceInput, _targets, run) => {
+        const invalid = await writeSingleFact(factsEngine, sourceInput.sourceId, {
+          fact: 'Invalid staged world output', provenance: 'source-event', sessionId: run.factSessionId,
+          kind: 'fact', entity: 'people/victor-example', visibility: 'world', pendingRunId: run.runId,
+        });
+        invalidId = invalid.id;
+        return { inserted: 1, duplicate: 1, superseded: 0, factIds: [invalid.id, existing.id], stage: 'applied' };
+      },
+    })).rejects.toThrow(/is not private/);
+    expect(await engine.executeRaw('SELECT * FROM facts WHERE id=$1', [existing.id])).toEqual(before);
+    expect(fs.readFileSync(path.join(brainDir, 'projects/porsche.md'), 'utf8')).not.toContain('~~');
+    const [invalid] = await engine.executeRaw<{ expired_at: Date | null }>(
+      'SELECT expired_at FROM facts WHERE id=$1', [invalidId],
+    );
+    expect(invalid?.expired_at).not.toBeNull();
+    const invalidFence = fs.readFileSync(path.join(brainDir, 'people/victor-example.md'), 'utf8');
+    expect(invalidFence).not.toContain('source-event-pending:');
+    expect(invalidFence).toContain('~~');
+  });
+
+  test('projection ownership commits staged facts while excluding unrelated active duplicates', async () => {
+    await seedKnownTargets();
+    await engine.executeRaw("UPDATE sources SET local_path=$1 WHERE id='default'", [brainDir]);
+    const existing = await writeSingleFact(engine, 'default', {
+      fact: 'Previously recorded fact', provenance: 'source-event', sessionId: 'source-event:older-event',
+      kind: 'fact', entity: 'projects/porsche', visibility: 'private',
+    });
+    const before = await engine.executeRaw('SELECT * FROM facts WHERE id=$1', [existing.id]);
+    let stagedId = 0;
+    const receipt = await projectSourceEvent(engine, input(), {
+      runFacts: async (factsEngine, sourceInput, _targets, run) => {
+        const staged = await writeSingleFact(factsEngine, sourceInput.sourceId, {
+          fact: 'New delivery evidence', provenance: 'source-event', sessionId: run.factSessionId,
+          kind: 'fact', entity: 'people/victor-example', visibility: 'private', pendingRunId: run.runId,
+        });
+        stagedId = staged.id;
+        return { inserted: 1, duplicate: 1, superseded: 0, factIds: [existing.id, staged.id], stage: 'applied' };
+      },
+    });
+    expect(receipt).toMatchObject({ status: 'partial', factsWritten: 1, skipped: 1 });
+    const [stored] = await engine.executeRaw<{ target_results: Array<{ facts: string }> }>(
+      'SELECT target_results FROM source_event_receipts WHERE source_id=$1 AND event_key=$2',
+      ['default', receipt.eventKey],
+    );
+    expect(stored?.target_results).toHaveLength(2);
+    expect(stored?.target_results.every((target) => target.facts === 'applied')).toBe(true);
+    const artifact = await loadSourceEventArtifact(engine, 'default', receipt.artifactSlug);
+    expect(artifact?.revisions[0]?.fact_ids).toEqual([stagedId]);
+    expect(await engine.executeRaw('SELECT * FROM facts WHERE id=$1', [existing.id])).toEqual(before);
+    const [staged] = await engine.executeRaw<{ expired_at: Date | null }>(
+      'SELECT expired_at FROM facts WHERE id=$1', [stagedId],
+    );
+    expect(staged?.expired_at).toBeNull();
+    expect(fs.readFileSync(path.join(brainDir, 'people/victor-example.md'), 'utf8')).not.toContain('source-event-pending:');
+  });
+
+  test('projection ownership preserves an unchanged fact already owned by the same event on correction', async () => {
+    await seedKnownTargets();
+    await engine.executeRaw("UPDATE sources SET local_path=$1 WHERE id='default'", [brainDir]);
+    const runFacts: NonNullable<SourceEventProjectorDeps['runFacts']> = async (factsEngine, sourceInput, _targets, run) => {
+      const written = await writeSingleFact(factsEngine, sourceInput.sourceId, {
+        fact: 'Unchanged delivery evidence', provenance: 'source-event', sessionId: run.factSessionId,
+        kind: 'fact', entity: 'projects/porsche', visibility: 'private', pendingRunId: run.runId,
+      });
+      return { inserted: 0, duplicate: 0, superseded: 0, factIds: [written.id], stage: 'applied' };
+    };
+    const first = await projectSourceEvent(engine, input(), { runFacts });
+    const firstArtifact = await loadSourceEventArtifact(engine, 'default', first.artifactSlug);
+    const factIds = firstArtifact!.revisions[0]!.fact_ids;
+    const corrected = await projectSourceEvent(engine, input({ occurredAt: '2026-08-28T09:00:00.000Z' }), { runFacts });
+    const artifact = await loadSourceEventArtifact(engine, 'default', corrected.artifactSlug);
+    expect(artifact?.revisions.find((revision) => revision.state === 'active')?.fact_ids).toEqual(factIds);
+    expect(await engine.executeRaw('SELECT id FROM facts WHERE id=ANY($1::int[]) AND expired_at IS NULL', [factIds])).toHaveLength(1);
+    expect(fs.readFileSync(path.join(brainDir, 'projects/porsche.md'), 'utf8')).not.toContain('~~');
+  });
+
   test('fact postconditions reject and retract non-private projector output', async () => {
     await seedKnownTargets();
     await engine.executeRaw("UPDATE sources SET local_path=$1 WHERE id='default'", [brainDir]);

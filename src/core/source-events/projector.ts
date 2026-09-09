@@ -300,6 +300,7 @@ async function assertCanonicalFactOutcome(
   sourceId: string,
   targetSlugs: string[],
   factIds: number[],
+  priorOwnedFactIds: Set<number>,
 ): Promise<void> {
   if (factIds.length === 0) return;
   const rows = await engine.executeRaw<{
@@ -328,17 +329,13 @@ async function assertCanonicalFactOutcome(
     if (row.row_num === null || row.source_markdown_slug === null) {
       violations.push(`fact ${factId} is not filesystem-canonical`);
     }
-    if (row.expired_at === null) {
+    if (row.expired_at === null && !priorOwnedFactIds.has(factId)) {
       violations.push(`fact ${factId} became visible before source-event commit`);
     }
   }
   if (violations.length === 0) return;
-  for (const row of rows) {
-    await forgetFactInFence(engine, Number(row.id), {
-      sourceId,
-      reason: 'source-event fact postcondition failed',
-    });
-  }
+  // The caller's abort path retracts only facts staged by this run. Validation
+  // must never expire an existing fence row returned as a duplicate.
   throw new Error(`source-event: ${violations.join('; ')}`);
 }
 
@@ -382,14 +379,15 @@ const ABORT_ROLLBACK_REASON = 'source event projection aborted before pending fa
 /** Decision D5 (2026-09-07): the fence strike wins. Of the ids a facts runner
  * hands back, `staged` are rows this run owns (its session, its pending
  * marker, or a row its own aborted attempt rolled back — the same runId is
- * reused on retry) and `activatable` adds rows already active. A struck row
- * adopted from the fence (fence-write keeps one row per key) is neither, so
- * it never enters the pending set and is never re-activated. */
+ * reused on retry). Existing active duplicates belong to their original
+ * event, so only a duplicate already owned by this event's prior active
+ * revision may be retained. A struck duplicate is excluded and never revived. */
 async function classifyRunFactIds(
   engine: BrainEngine, sourceId: string, runId: string, factSessionId: string, factIds: number[],
-): Promise<{ activatable: number[]; staged: Set<number> }> {
+  priorOwnedFactIds: Set<number>,
+): Promise<{ activatable: number[]; staged: Set<number>; skippedDuplicates: number }> {
   const ids = [...new Set(factIds.map(Number))];
-  if (ids.length === 0) return { activatable: ids, staged: new Set() };
+  if (ids.length === 0) return { activatable: ids, staged: new Set(), skippedDuplicates: 0 };
   const rows = await engine.executeRaw<{ id: number; staged: boolean; active: boolean }>(
     `SELECT id,
             (context LIKE $4 OR (source_session=$3 AND (expired_at IS NULL OR context LIKE $5))) AS staged,
@@ -398,8 +396,11 @@ async function classifyRunFactIds(
     [sourceId, ids, factSessionId, `%${pendingMarker(runId)}%`, `%forgotten: ${ABORT_ROLLBACK_REASON}%`],
   );
   const staged = new Set(rows.filter((row) => row.staged).map((row) => Number(row.id)));
-  const activatable = new Set(rows.filter((row) => row.staged || row.active).map((row) => Number(row.id)));
-  return { activatable: ids.filter((id) => activatable.has(id)), staged };
+  const retained = new Set(rows.filter((row) => row.active && priorOwnedFactIds.has(Number(row.id))).map((row) => Number(row.id)));
+  return {
+    activatable: ids.filter((id) => staged.has(id) || retained.has(id)), staged,
+    skippedDuplicates: rows.filter((row) => !row.staged && row.active && !retained.has(Number(row.id))).length,
+  };
 }
 
 function factSwapSets(pendingFactIds: number[], priorFactIds: number[]) {
@@ -886,16 +887,18 @@ async function projectSourceEventUnderSourceLock(
       inserted: 0, duplicate: 0, superseded: 0, factIds: revision.fact_ids,
       stage: revision.facts_stage === 'applied' ? 'applied' : 'skipped',
     };
+    let skippedFactDuplicates = 0;
     if (targets.length > 0) {
       facts = deps.runFacts
         ? await deps.runFacts(engine, normalized, targets, { runId, factSessionId })
         : await defaultFactsRunner(engine, normalized, targets, factSessionId, runId);
       // D5 + adoption: only rows this run staged may be rolled back on abort;
       // adopted rows belong to other events (or the protected prior revision).
-      const classified = await classifyRunFactIds(engine, sourceId, runId, factSessionId, facts.factIds);
+      const classified = await classifyRunFactIds(engine, sourceId, runId, factSessionId, facts.factIds, protectedFactIds);
+      skippedFactDuplicates = classified.skippedDuplicates;
       revision.fact_ids = classified.activatable;
       precommitFactIds = revision.fact_ids.filter((factId) => classified.staged.has(factId) && !protectedFactIds.has(factId));
-      await assertCanonicalFactOutcome(engine, sourceId, targets, revision.fact_ids);
+      await assertCanonicalFactOutcome(engine, sourceId, targets, revision.fact_ids, protectedFactIds);
       revision.facts_stage = facts.stage;
       const candidates = await buildReviewCandidates(
         engine, normalized, eventId, revisionId, artifactSlug, revision.fact_ids,
@@ -945,20 +948,23 @@ async function projectSourceEventUnderSourceLock(
     if (facts.stage !== 'applied' && targets.length > 0) {
       errors.push({ code: `facts_${facts.stage}`, ...(facts.detail ? { detail: facts.detail } : {}) });
     }
+    if (skippedFactDuplicates > 0) {
+      errors.push({ code: 'facts_duplicate_skipped', detail: String(skippedFactDuplicates) });
+    }
     const targetResults = targets.map((slug) => ({
       slug,
       relationship: 'canonical_private_artifact',
-      facts: revision.fact_ids.length > 0 ? 'applied' : revision.facts_stage,
+      facts: revision.fact_ids.length > 0 ? 'applied' : skippedFactDuplicates > 0 ? 'skipped' : revision.facts_stage,
       project_candidate: revision.project_candidates.some((candidate) => candidate.entity_slug === slug) ? 'review' : 'none',
     }));
     const receipt = await (deps.finalizeReceipt ?? finalizeReceipt)(engine, sourceId, eventKey, {
-      status: targets.length === 0 ? 'skipped' : facts.stage === 'applied' ? 'applied' : 'partial',
+      status: targets.length === 0 ? 'skipped' : facts.stage === 'applied' && skippedFactDuplicates === 0 ? 'applied' : 'partial',
       targetResults,
       candidates: mentions.length,
       resolved: mentions.length,
       links: persisted.linksWritten,
       facts: facts.inserted,
-      skipped: targets.length === 0 ? 1 : 0,
+      skipped: targets.length === 0 ? 1 : skippedFactDuplicates,
       errors,
     });
     // A correction must immediately remove a previously-approved machine
