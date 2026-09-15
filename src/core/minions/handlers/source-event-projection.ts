@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { tryAcquireDbLock } from '../../db-lock.ts';
 import type { BrainEngine } from '../../engine.ts';
 import type { MinionJobContext } from '../types.ts';
@@ -24,6 +25,19 @@ const LOCK_TTL_MIN = 20;
 const DEFAULT_LIMIT = 100;
 const MAX_LIMIT = 500;
 const MAX_SOURCE_EVENT_PART = 999_999_999;
+/**
+ * Terminal-receipt marker for a candidate the projector refuses because it
+ * carries no immutable provider identity. These receipts exist ONLY to make the
+ * refusal durable: without a row, neither NOT EXISTS clause in listCandidates
+ * can exclude the page, so identity-less pages re-occupy the head of every
+ * LIMIT-N scan forever and starve everything behind them (2026-09-15: 23,489
+ * such pages held 73 of every 100 candidate slots on gbrain-prod-02). They
+ * never name a projected artifact, so retraction must skip them.
+ */
+const IDENTITY_REJECTION_ERROR_CODE = 'immutable_identity_missing';
+const IDENTITY_REJECTION_RECEIPT_FILTER =
+  `NOT (errors @> '[{"code":"${IDENTITY_REJECTION_ERROR_CODE}"}]'::jsonb)`;
+
 const IMMUTABLE_IDENTITY_FIELDS = [
   'provider_item_id', 'message_id', 'event_id', 'note_id', 'session_id',
   'thread_id', 'capture_id', 'revision_id', 'conversation_id',
@@ -77,6 +91,70 @@ function uniqueRetractions(rows: RetractionCandidate[]): RetractionCandidate[] {
   const unique = new Map<string, RetractionCandidate>();
   for (const row of rows) unique.set(`${row.event_id}\0${row.artifact_slug}`, row);
   return [...unique.values()];
+}
+
+/**
+ * Write (or refresh) the terminal receipt for an identity-rejected candidate.
+ *
+ * Status 'error' is deliberate: listCandidates excludes 'review'/'error'
+ * receipts for 24 hours, so the page drops out of the scan for a day and then
+ * returns exactly once - the backoff Robin approved. Re-adding provider
+ * frontmatter changes the page body, which changes content_hash, which makes
+ * this receipt stop matching, so a repaired page is picked up on the next scan
+ * rather than waiting out the backoff.
+ *
+ * The identity columns are namespaced sentinels, not provenance: no artifact
+ * page is ever written for these rows, and `IDENTITY_REJECTION_RECEIPT_FILTER`
+ * keeps them out of every retraction sweep.
+ */
+async function recordIdentityRejectionReceipt(
+  engine: BrainEngine,
+  sourceId: string,
+  row: CandidateRow,
+): Promise<void> {
+  const eventId = `identity-missing-${createHash('sha256').update(`${sourceId}\u0000${row.slug}`).digest('hex').slice(0, 32)}`;
+  const eventKey = `identity-missing:${row.slug}`;
+  const revisionId = createHash('sha256').update(`${eventId}\u0000${row.projection_hash}`).digest('hex').slice(0, 32);
+  const now = new Date().toISOString();
+  const errors = JSON.stringify([{ code: IDENTITY_REJECTION_ERROR_CODE, detail: row.slug }]);
+  await engine.executeRaw(
+    `INSERT INTO source_event_receipts
+       (source_id,event_id,revision_id,event_key,artifact_slug,source_kind,source_key,source_uri,
+        source_slug,content_hash,processor_version,observed_at,event_date,status,projection_state,
+        error_count,skipped_count,errors)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'error','aborted',1,1,$14::jsonb)
+     ON CONFLICT (source_id,event_key) DO UPDATE SET
+       revision_id=EXCLUDED.revision_id,
+       source_kind=EXCLUDED.source_kind,
+       source_slug=EXCLUDED.source_slug,
+       content_hash=EXCLUDED.content_hash,
+       processor_version=EXCLUDED.processor_version,
+       observed_at=EXCLUDED.observed_at,
+       event_date=EXCLUDED.event_date,
+       status='error',
+       projection_state='aborted',
+       error_count=1,
+       skipped_count=1,
+       errors=EXCLUDED.errors,
+       attempts=source_event_receipts.attempts+1,
+       updated_at=now()`,
+    [
+      sourceId,
+      eventId,
+      revisionId,
+      eventKey,
+      `source-events/identity-missing/${eventId}`,
+      row.type,
+      eventKey,
+      `gbrain://${sourceId}/${encodeURIComponent(row.slug)}#identity-missing`,
+      row.slug,
+      row.projection_hash,
+      SOURCE_EVENT_PROCESSOR_VERSION,
+      now,
+      now.slice(0, 10),
+      errors,
+    ],
+  );
 }
 
 export function sourceEventProjectionLockId(sourceId: string): string {
@@ -506,6 +584,7 @@ export function makeSourceEventProjectionHandler(
              FROM source_event_receipts
             WHERE source_id=$1
               AND NOT (errors @> '[{"code":"source_retracted"}]'::jsonb)
+              AND ${IDENTITY_REJECTION_RECEIPT_FILTER}
             ORDER BY event_id,observed_at DESC,id DESC`,
           [sourceId],
         );
@@ -534,6 +613,7 @@ export function makeSourceEventProjectionHandler(
            JOIN pages p ON p.source_id=r.source_id AND p.slug=r.source_slug
           WHERE r.source_id=$1 AND p.deleted_at IS NOT NULL
             AND NOT (r.errors @> '[{"code":"source_retracted"}]'::jsonb)
+            AND NOT (r.errors @> '[{"code":"${IDENTITY_REJECTION_ERROR_CODE}"}]'::jsonb)
           ORDER BY r.event_id,r.observed_at DESC,r.id DESC`,
         [sourceId],
       );
@@ -571,6 +651,12 @@ export function makeSourceEventProjectionHandler(
         if (!identity) {
           identityRejected++;
           errors++;
+          // Make the refusal terminal. Before 2026-09-15 this branch incremented
+          // counters and continued WITHOUT a receipt, so the page stayed a
+          // candidate forever and permanently occupied a slot at the head of
+          // every scan. Writing the receipt hands the page to the 24h backoff
+          // and lets listCandidates advance to the pages behind it.
+          await recordIdentityRejectionReceipt(engine, sourceId, row);
           await job.log(`source-event-projection: immutable provider identity missing for ${row.slug}`);
           await job.updateProgress({
             phase: 'source-event-projection', scanned: index + 1, total: candidates.length,
