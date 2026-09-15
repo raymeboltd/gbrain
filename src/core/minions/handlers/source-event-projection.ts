@@ -122,7 +122,7 @@ async function recordIdentityRejectionReceipt(
        (source_id,event_id,revision_id,event_key,artifact_slug,source_kind,source_key,source_uri,
         source_slug,content_hash,processor_version,observed_at,event_date,status,projection_state,
         error_count,skipped_count,errors)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'error','aborted',1,1,$14::jsonb)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'error','aborted',1,1,$14::text::jsonb)
      ON CONFLICT (source_id,event_key) DO UPDATE SET
        revision_id=EXCLUDED.revision_id,
        source_kind=EXCLUDED.source_kind,
