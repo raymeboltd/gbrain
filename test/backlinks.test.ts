@@ -708,3 +708,40 @@ describe('parseBacklinksArgs', () => {
     expect(parseBacklinksArgs(['check', '--dir', '--dry-run']).brainDir).toBe('.');
   });
 });
+
+// ---------------------------------------------------------------------------
+// 2026-09-15 prod regression: an oversized target must still be cached.
+// The LRU used to refuse any snapshot larger than the cache cap, so the single
+// largest people/ page was re-read and re-extracted once per referencing page.
+// On gbrain-prod-02 that was people/robin-ayme.md (4.8 MB) x 10,424 sources
+// = ~3,229 s of pure re-extraction, which SIGKILLed every autopilot-cycle at
+// the 1800 s job timeout. The scan must read each distinct target ONCE.
+// ---------------------------------------------------------------------------
+
+describe('findBacklinkGaps - oversized target is read once per scan', () => {
+  test('a target larger than the LRU budget is not re-read per source page', () => {
+    const root = mkdtempSync(join(tmpdir(), 'gbrain-backlinks-hot-target-'));
+    try {
+      mkdirSync(join(root, 'people'));
+      mkdirSync(join(root, 'meetings'));
+      // ~9 MiB of body: estimatedBytes (length * 2) exceeds any sane cache cap.
+      writeFileSync(
+        join(root, 'people/hot.md'),
+        '# Hot\n\n' + 'x'.repeat(9 * 1024 * 1024) + '\n',
+      );
+      const sources = 25;
+      for (let i = 0; i < sources; i++) {
+        writeFileSync(
+          join(root, 'meetings', 'm-' + i + '.md'),
+          '# Meeting ' + i + '\n\nMet [Hot](../people/hot).\n',
+        );
+      }
+      const stats = { targetReads: 0 };
+      const gaps = findBacklinkGaps(root, stats);
+      expect(gaps).toHaveLength(sources);
+      expect(stats.targetReads).toBe(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+});

@@ -124,8 +124,18 @@ function mayContainPeopleCompanyRef(content: string): boolean {
   return PEOPLE_COMPANY_MARKDOWN_REF_RE.test(content) || PEOPLE_COMPANY_WIKILINK_RE.test(content);
 }
 
+/**
+ * Optional instrumentation for findBacklinkGaps. `targetReads` counts how many
+ * times a people/companies target page was read off disk and re-extracted. A
+ * correctly cached scan reads each distinct target at most once per scan; a
+ * regression in the target LRU shows up here as reads >> distinct targets.
+ */
+export interface BacklinkScanStats {
+  targetReads: number;
+}
+
 /** Scan a brain directory for back-link gaps */
-export function findBacklinkGaps(brainDir: string): BacklinkGap[] {
+export function findBacklinkGaps(brainDir: string, stats?: BacklinkScanStats): BacklinkGap[] {
   const gaps: BacklinkGap[] = [];
 
   // Walk lazily. The previous implementation retained the complete Markdown
@@ -165,7 +175,14 @@ export function findBacklinkGaps(brainDir: string): BacklinkGap[] {
 
   type TargetSnapshot = { content: string; outgoingSlugs: Set<string>; estimatedBytes: number };
   const targetCache = new Map<string, TargetSnapshot>();
-  const targetCacheMaxBytes = 8 * 1024 * 1024;
+  // Sized for the whole people/companies target index, not for a sample of it.
+  // 2026-09-15: at 145K pages the prod brain has 779 targets totalling ~11 MB of
+  // Markdown; an 8 MiB cap made the hottest target (people/robin-ayme.md, 4.8 MB)
+  // exceed the old "only cache if it fits" guard below and be re-read + re-extracted
+  // on each of its 10,424 referencing pages, which is what pushed backlinks.scan
+  // past the 1800 s autopilot-cycle timeout. Retention is still bounded: the LRU
+  // holds at most targetCacheMaxBytes, plus one oversized entry.
+  const targetCacheMaxBytes = 64 * 1024 * 1024;
   let targetCacheBytes = 0;
   let targetCacheEvictionsSinceGc = 0;
 
@@ -180,6 +197,7 @@ export function findBacklinkGaps(brainDir: string): BacklinkGap[] {
     if (!path || !isSafeExistingBrainFile(path, brainDir)) return undefined;
     try {
       const content = readFileSync(path, 'utf-8');
+      if (stats) stats.targetReads++;
       if (!isSafeExistingBrainFile(path, brainDir)) return undefined;
       const outgoingSlugs = new Set(canonicalExtractEntityRefs(content).map(r => r.slug));
       const snapshot = {
@@ -187,23 +205,27 @@ export function findBacklinkGaps(brainDir: string): BacklinkGap[] {
         outgoingSlugs,
         estimatedBytes: content.length * 2 + outgoingSlugs.size * 128,
       };
-      if (snapshot.estimatedBytes <= targetCacheMaxBytes) {
-        while (targetCacheBytes + snapshot.estimatedBytes > targetCacheMaxBytes && targetCache.size > 0) {
-          const oldestSlug = targetCache.keys().next().value as string;
-          const oldest = targetCache.get(oldestSlug)!;
-          targetCache.delete(oldestSlug);
-          targetCacheBytes -= oldest.estimatedBytes;
-          targetCacheEvictionsSinceGc++;
-        }
-        targetCache.set(slug, snapshot);
-        targetCacheBytes += snapshot.estimatedBytes;
-        // Bun's allocator otherwise keeps evicted multi-MiB strings at its
-        // high-water mark until the scan ends. Only force a collection after
-        // sustained cache pressure; normal brains never enter this branch.
-        if (targetCacheEvictionsSinceGc >= 16) {
-          Bun.gc(false);
-          targetCacheEvictionsSinceGc = 0;
-        }
+      // Always admit the snapshot, evicting LRU entries until it fits (or the
+      // cache is empty). The previous "skip caching when it does not fit" guard
+      // silently turned the single largest target into an uncached re-read on
+      // every referencing page - an O(refs x target bytes) scan. Admitting it
+      // costs at most one oversized entry of retention and makes the target read
+      // once per scan.
+      while (targetCacheBytes + snapshot.estimatedBytes > targetCacheMaxBytes && targetCache.size > 0) {
+        const oldestSlug = targetCache.keys().next().value as string;
+        const oldest = targetCache.get(oldestSlug)!;
+        targetCache.delete(oldestSlug);
+        targetCacheBytes -= oldest.estimatedBytes;
+        targetCacheEvictionsSinceGc++;
+      }
+      targetCache.set(slug, snapshot);
+      targetCacheBytes += snapshot.estimatedBytes;
+      // Bun's allocator otherwise keeps evicted multi-MiB strings at its
+      // high-water mark until the scan ends. Only force a collection after
+      // sustained cache pressure; normal brains never enter this branch.
+      if (targetCacheEvictionsSinceGc >= 16) {
+        Bun.gc(false);
+        targetCacheEvictionsSinceGc = 0;
       }
       return snapshot;
     } catch {
