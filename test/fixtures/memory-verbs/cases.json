@@ -36,7 +36,8 @@
       "fact": "conformance {{marker}}: the protocol round-trip fact",
       "provenance": "conformance run {{marker}}",
       "entity": "people/conformance-{{marker}}",
-      "kind": "fact"
+      "kind": "fact",
+      "visibility": "world"
     },
     "validateSchema": true,
     "expect": [
@@ -69,7 +70,8 @@
       "fact": "conformance {{marker}}: expiring fact",
       "provenance": "conformance run {{marker}}",
       "entity": "people/conformance-{{marker}}",
-      "ttl": "30d"
+      "ttl": "30d",
+      "visibility": "world"
     },
     "validateSchema": true,
     "expect": [
@@ -283,7 +285,8 @@
     "params": {
       "fact": "conformance {{marker}}: expiring fact",
       "provenance": "conformance run {{marker}}",
-      "entity": "people/conformance-{{marker}}"
+      "entity": "people/conformance-{{marker}}",
+      "visibility": "world"
     },
     "expectErrorCode": "invalid_params",
     "expectSuggestion": true
@@ -298,7 +301,7 @@
     "expectSuggestion": true
   },
   {
-    "name": "synthesize answers (or reports unavailable) — cost-gated, pass --synthesize",
+    "name": "synthesize answers (or reports unavailable) \u2014 cost-gated, pass --synthesize",
     "verb": "synthesize",
     "params": {
       "question": "What do we know about conformance {{marker}}?"
@@ -306,7 +309,7 @@
     "requiresSynthesizeFlag": true
   },
   {
-    "name": "synthesize without an LLM is a clean unavailable error (never a raw throw) — cost-gated, pass --synthesize",
+    "name": "synthesize without an LLM is a clean unavailable error (never a raw throw) \u2014 cost-gated, pass --synthesize",
     "verb": "synthesize",
     "params": {
       "question": "Conformance {{marker}}: keyless error-path probe"

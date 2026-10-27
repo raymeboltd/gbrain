@@ -511,3 +511,30 @@ describe('facts-absorb minion handler honors the queued notabilityFilter (#4870)
     ]);
   });
 });
+
+test('owner carry: medium ordinary facts survive same automatic batch as high owner facts', async () => {
+ await engine.putPage('people/owner-example',{type:'person',title:'Owner Example',compiled_truth:'# Owner Example'});
+ await engine.putPage('people/ordinary-example',{type:'person',title:'Ordinary Example',compiled_truth:'# Ordinary Example'});
+ await engine.executeRaw("UPDATE sources SET config=config || '{\"facts_owner_slug\":\"people/owner-example\"}'::jsonb WHERE id='default'");
+ try {
+  chatStub([{fact:'owner-floor-medium-skip',kind:'fact',entity:'people/owner-example',notability:'medium'}, {fact:'owner-floor-high-keep',kind:'fact',entity:'people/owner-example',notability:'high'}, {fact:'ordinary-medium-keep',kind:'fact',entity:'people/ordinary-example',notability:'medium'}]);
+  const result=await runFactsBackstop(meetingPage(),makeCtx({mode:'inline',notabilityFilter:'all'}));
+  expect(result.mode).toBe('inline');
+  if(result.mode==='inline') {
+   expect(result.inserted).toBe(2);
+   const rows=await factsForIds(result.fact_ids);
+   expect(rows.map(row=>row.fact).sort()).toEqual(['ordinary-medium-keep','owner-floor-high-keep']);
+  }
+ } finally {await engine.executeRaw("UPDATE sources SET config=config-'facts_owner_slug' WHERE id='default'");}
+});
+
+test('owner carry leaves explicit extract_facts medium owner writes admitted', async () => {
+  await engine.putPage('people/owner-example', { type: 'person', title: 'Owner Example', compiled_truth: '# Owner Example' });
+  await engine.executeRaw(`UPDATE sources SET config=config || '{"facts_owner_slug":"people/owner-example"}'::jsonb WHERE id='default'`);
+  try {
+    chatStub([{ fact: 'Explicit medium owner evidence', kind: 'fact', entity: 'people/owner-example', notability: 'medium' }]);
+    const result = await runFactsBackstop(meetingPage(), makeCtx({ source: 'mcp:extract_facts', mode: 'inline', notabilityFilter: 'all' }));
+    expect(result).toMatchObject({ mode: 'inline', inserted: 1 });
+    if (result.mode === 'inline') expect(await factsForIds(result.fact_ids)).toEqual([{ fact: 'Explicit medium owner evidence' }]);
+  } finally { await engine.executeRaw("UPDATE sources SET config=config-'facts_owner_slug' WHERE id='default'"); }
+});

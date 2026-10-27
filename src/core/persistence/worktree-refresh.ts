@@ -39,6 +39,8 @@ import { lockTopologyPrincipal, lockTopologyRows, topologyPrincipal, withTopolog
 import { ACTIVE_REFRESH_STATES_SQL, CHECKOUT_EFFECT_KINDS_SQL, type WorktreeRefreshState } from './worktree-refresh-schema.ts';
 import { gitChildEnv } from '../git-env.ts';
 import { classifyOriginUniqueViolation } from './origin-guard.ts';
+import { syncProcessingOptions, SYNC_PROCESSING_KEYS, type SyncProcessingOptions } from './sync-authority.ts';
+import { syncCursorOptions } from './sync-slices.ts';
 
 export interface WorktreeRefreshRow {
   id: string; worktree_id: string; source_ids: string[]; principal_id: string; owner_epoch: string | number;
@@ -49,6 +51,8 @@ export type RefreshBoundary = 'drained' | 'fenced' | 'merged';
 export interface RefreshHooks { boundary?: (point: RefreshBoundary, row: WorktreeRefreshRow) => Promise<void> | void }
 export interface RefreshOptions {
   dryRun?: boolean; resume?: boolean; abandon?: boolean;
+  /** Frozen for every member sync, including crash recovery and --resume. */
+  noEmbed?: boolean; noExtract?: boolean;
   /** Flag value; falls back to GBRAIN_REFRESH_DRAIN_WAIT_MS, then `sources.refresh_drain_wait_ms`, then 60 s. */
   waitDrainMs?: number;
   /** Flag value; falls back to GBRAIN_REFRESH_FETCH_TIMEOUT_MS, then `sources.refresh_fetch_timeout_ms`, then 120 s. */
@@ -323,27 +327,40 @@ async function reachedTarget(git: Git, root: string, row: WorktreeRefreshRow, co
   return commit === row.target_head || (!!commit && commit !== row.old_head && await isAncestor(git, root, row.target_head, commit));
 }
 
+/** Refresh intent lives in the existing outcome JSON; legacy rows retain their original defaults. */
+function storedProcessingOptions(row: WorktreeRefreshRow): SyncProcessingOptions {
+  const options = row.outcome.processingOptions;
+  if (options === undefined) return syncProcessingOptions({});
+  if (!options || typeof options !== 'object' || SYNC_PROCESSING_KEYS.some(key => typeof (options as Record<string, unknown>)[key] !== 'boolean')) {
+    throw new OperationError('storage_error', 'The refresh processing options are malformed.',
+      `Inspect gbrain sources writer status ${row.source_ids[0]} --json before resuming refresh ${row.id}.`);
+  }
+  return syncProcessingOptions(options as SyncProcessingOptions);
+}
+
 /** Steps 6-7: the managed `--no-pull` sync per member, then completion when every member reached target_head (or a descendant). */
 async function syncMembers(engine: BrainEngine, git: Git, row: WorktreeRefreshRow, root: string): Promise<{ synced: RefreshMemberSync[]; blocked: RefreshSyncBlocked[]; atTarget: boolean }> {
   const { performManagedSync } = await import('./sync-run.ts');
+  const processingOptions = storedProcessingOptions(row);
   const synced: RefreshMemberSync[] = [], blocked: RefreshSyncBlocked[] = [];
   for (const sourceId of row.source_ids) {
+    const resume = checkpointRetryCommand({ sourceId, processingOptions, syncOptions: syncCursorOptions({}) });
     let status = 'up_to_date';
     for (let pass = 0; pass < MAX_MEMBER_SYNC_PASSES; pass++) {
       if (await reachedTarget(git, root, row, await lastCommit(engine, sourceId))) break;
       let result: SyncResult;
-      try { result = await performManagedSync(engine, { sourceId, noPull: true }); }
+      try { result = await performManagedSync(engine, { sourceId, noPull: true, ...processingOptions }); }
       catch (error) {
         const failure = error instanceof OperationError ? error : opError('storage_error', error instanceof Error ? error.message : String(error),
-          `The managed sync of source ${sourceId} failed during refresh ${row.id}. Check its writer status, fix the cause, then resume with gbrain sync --source ${sourceId} --no-pull.`);
-        blocked.push({ source_id: sourceId, code: failure.code, message: failure.message, resume: `gbrain sync --source ${sourceId} --no-pull` });
+          `The managed sync of source ${sourceId} failed during refresh ${row.id}. Check its writer status, fix the cause, then resume with ${resume}.`);
+        blocked.push({ source_id: sourceId, code: failure.code, message: failure.message, resume });
         status = 'blocked';
         break;
       }
       status = result.status;
       if (result.status === 'blocked_by_failures') {
         blocked.push({ source_id: sourceId, code: result.managedWrite?.write_error ?? result.failureCodes?.[0]?.code ?? 'sync_blocked',
-          message: result.managedWrite?.message ?? 'The managed sync is blocked by a failed write.', resume: `gbrain sync --source ${sourceId} --no-pull` });
+          message: result.managedWrite?.message ?? 'The managed sync is blocked by a failed write.', resume });
         break;
       }
       if (result.status === 'partial') await new Promise(resolve => setTimeout(resolve, DRAIN_POLL_MS));
@@ -376,6 +393,7 @@ function finished(row: WorktreeRefreshRow, sync: { synced: RefreshMemberSync[]; 
  */
 export async function refreshWorktree(engine: BrainEngine, sourceId: string, opts: RefreshOptions = {}): Promise<WorktreeRefreshResult> {
   if (opts.resume || opts.abandon) return resumeOrAbandon(engine, sourceId, opts);
+  const processingOptions = syncProcessingOptions(opts);
   const fetchTimeoutMs = await configuredMs(engine, opts.fetchTimeoutMs, 'GBRAIN_REFRESH_FETCH_TIMEOUT_MS', 'sources.refresh_fetch_timeout_ms', 120_000, 2 ** 31 - 1);
   const waitDrainMs = await configuredMs(engine, opts.waitDrainMs, 'GBRAIN_REFRESH_DRAIN_WAIT_MS', 'sources.refresh_drain_wait_ms', 60_000);
   return withGit(async git => {
@@ -388,15 +406,16 @@ export async function refreshWorktree(engine: BrainEngine, sourceId: string, opt
       const synced: RefreshMemberSync[] = [], blocked: RefreshSyncBlocked[] = [];
       const { performManagedSync } = await import('./sync-run.ts');
       for (const member of plan.members) {
+        const resume = checkpointRetryCommand({ sourceId: member, processingOptions, syncOptions: syncCursorOptions({}) });
         await recordUpstreamObservation(engine, member);
         if (await lastCommit(engine, member) === plan.oldHead) { synced.push({ source_id: member, status: 'up_to_date', last_commit: plan.oldHead }); continue; }
         try {
-          const result = await performManagedSync(engine, { sourceId: member, noPull: true });
+          const result = await performManagedSync(engine, { sourceId: member, noPull: true, ...processingOptions });
           if (result.status === 'blocked_by_failures') blocked.push({ source_id: member, code: result.managedWrite?.write_error ?? 'sync_blocked',
-            message: result.managedWrite?.message ?? 'The managed sync is blocked by a failed write.', resume: `gbrain sync --source ${member} --no-pull` });
+            message: result.managedWrite?.message ?? 'The managed sync is blocked by a failed write.', resume });
           synced.push({ source_id: member, status: result.status, last_commit: await lastCommit(engine, member) });
         } catch (error) {
-          blocked.push({ source_id: member, code: (error as OperationError).code ?? 'storage_error', message: (error as Error).message, resume: `gbrain sync --source ${member} --no-pull` });
+          blocked.push({ source_id: member, code: (error as OperationError).code ?? 'storage_error', message: (error as Error).message, resume });
         }
       }
       return { ...base, status: blocked.length ? 'sync_blocked' : 'already_current', synced, ...(blocked.length ? { sync_blocked: blocked, next: blocked.map(b => b.resume).join(' ; ') } : {}) };
@@ -405,7 +424,7 @@ export async function refreshWorktree(engine: BrainEngine, sourceId: string, opt
     if (!refreshLock) throw refusal('refresh_in_progress', 'Another process is refreshing this worktree right now.', `gbrain sources refresh ${sourceId} --resume`);
     try {
       const principal = await topologyPrincipal(engine);
-      const row = await fenceDraining(engine, sourceId, plan, principal);
+      const row = await fenceDraining(engine, sourceId, plan, principal, processingOptions);
       const config = loadConfig() ?? { engine: engine.kind };
       // The owner keeps claiming what is already queued; this process may be that owner.
       startPersistenceConsumer(engine, config);
@@ -429,7 +448,7 @@ export async function refreshWorktree(engine: BrainEngine, sourceId: string, opt
 }
 
 /** Step 2: native topology + worktree locks, then one transaction inserting the `draining` row. */
-async function fenceDraining(engine: BrainEngine, sourceId: string, plan: Plan, principal: string): Promise<WorktreeRefreshRow> {
+async function fenceDraining(engine: BrainEngine, sourceId: string, plan: Plan, principal: string, processingOptions: SyncProcessingOptions): Promise<WorktreeRefreshRow> {
   return withTopologyLocks(engine, sourceId, async bindings => engine.transaction(async tx => {
     await tx.executeRaw("SELECT set_config('synchronous_commit','on',true),set_config('lock_timeout','5s',true)");
     await lockTopologyPrincipal(tx, principal);
@@ -440,10 +459,10 @@ async function fenceDraining(engine: BrainEngine, sourceId: string, plan: Plan, 
       throw refusal('refresh_source_changed', 'The worktree ownership or source membership changed after the refresh precheck; nothing moved.', `Retry gbrain sources refresh ${sourceId}`);
     }
     const [row] = await tx.executeRaw<WorktreeRefreshRow>(`INSERT INTO persistence_worktree_refreshes
-      (worktree_id,source_ids,principal_id,owner_epoch,topology_generation,state,old_head,target_head,upstream_ref,preserved_uncommitted)
-      VALUES($1::uuid,$2::text[],$3::uuid,$4,$5,'draining',$6,$7,$8,$9::text[]) RETURNING *`,
+      (worktree_id,source_ids,principal_id,owner_epoch,topology_generation,state,old_head,target_head,upstream_ref,preserved_uncommitted,outcome)
+      VALUES($1::uuid,$2::text[],$3::uuid,$4,$5,'draining',$6,$7,$8,$9::text[],$10::text::jsonb) RETURNING *`,
     [plan.binding.worktree_id, plan.members, principal, String(current.owner_epoch), String(current.topology_generation),
-      plan.oldHead, plan.targetHead, plan.upstreamRef, plan.preserved]);
+      plan.oldHead, plan.targetHead, plan.upstreamRef, plan.preserved, JSON.stringify({ processingOptions })]);
     return row;
   })).catch(error => {
     if ((error as { code?: string }).code === '23505' && !classifyOriginUniqueViolation(error)) throw refusal('refresh_in_progress', 'Another refresh of this worktree started first.', `gbrain sources refresh ${sourceId} --resume`);
@@ -573,6 +592,14 @@ async function resumeOrAbandon(engine: BrainEngine, sourceId: string, opts: Refr
   const empty: WorktreeRefreshResult = { status: 'nothing_to_resume', refresh_id: null, worktree_id: binding.worktree_id, source_ids: [sourceId],
     old_head: null, target_head: null, upstream_ref: null, preserved_uncommitted: [], synced: [], next: `gbrain sources refresh ${sourceId}` };
   if (!active) return empty;
+  if (!opts.abandon) {
+    const stored = storedProcessingOptions(active);
+    for (const key of ['noEmbed', 'noExtract'] as const) {
+      if (opts[key] !== undefined && opts[key] !== stored[key]) throw new OperationError('invalid_params',
+        `--resume cannot change the refresh's frozen ${key} option.`,
+        `Resume without processing flags: gbrain sources refresh ${sourceId} --resume`);
+    }
+  }
   const lock = await acquireNativeLock(refreshLockPath(binding.worktree_id), { timeoutMs: 1000 }).catch(() => null as NativeLockHandle | null);
   if (!lock) throw refusal('refresh_in_progress', `Refresh ${active.id} is still running in another process.`, `Wait for it, then gbrain sources refresh ${sourceId} --resume`, active.id);
   try {

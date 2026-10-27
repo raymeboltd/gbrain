@@ -262,3 +262,44 @@ for (const managed of [false, true]) describe(`company source lifecycle ${manage
     }
   }), 120_000);
 });
+
+// Owned repair regression: the shipped lifecycle fixtures omitted companies/ subtype inference.
+test('repair regression inferred company subtype must verify and replay without extra content writes', async () => withEnv({ GBRAIN_HOME: home }, async () => {
+  for (const engine of engines) {
+    await engine.executeRaw('UPDATE persistence_brain SET enabled=$1 WHERE singleton=1', [true]);
+    const root = await fixture();
+    mkdirSync(join(root, 'companies'), { recursive: true });
+    writeFileSync(join(root, 'companies/example.md'), '---\ntype: company\ntitle: Synthetic Company\nowner: "[[people/operator]]"\naudience: internal\n---\nEntirely fictional company.\n');
+    git(root, 'add', '.'); git(root, 'commit', '-qm', 'Add path inferred company subtype');
+    const input = { brainId: 'company-example', sourceId: `company-${randomUUID().slice(0, 8)}`, path: root,
+      plan: await inspectCompanyBrain({ path: root, profile: 'company-brain' }), remote: false, requestId: randomUUID() };
+    const result = await connectCompanyBrain(engine, input);
+    expect(result).toMatchObject({ok: true, code: 'complete', receipt: { phase: 'COMPLETE', outcome: 'complete', counts: { importedPages: 3, verificationFailures: 0 } }});
+    const page = await engine.getPage('companies/example', { sourceId: input.sourceId });
+    expect(page?.frontmatter.subtype).toBe('company');
+    const [before] = await engine.executeRaw<{ count: string }>('SELECT count(*)::text AS count FROM persistence_requests WHERE source_id=$1', [input.sourceId]);
+    const replay = await resumeCompanyBrain(engine, input);
+    expect(replay.receipt).toEqual(result.receipt);
+    expect((await engine.executeRaw<{ count: string }>('SELECT count(*)::text AS count FROM persistence_requests WHERE source_id=$1', [input.sourceId]))[0].count).toBe(before.count);
+  }
+}), 120_000);
+
+test('repair regression explicit subtype survives but unrelated stored metadata still fails verification', async () => withEnv({ GBRAIN_HOME: home }, async () => {
+  const { checkApprovedSchemaForEngine } = await import('../src/core/schema-pack/engine-resolution.ts');
+  for (const engine of engines) {
+    await engine.executeRaw('UPDATE persistence_brain SET enabled=$1 WHERE singleton=1', [true]);
+    const root = await fixture(); mkdirSync(join(root, 'companies'), { recursive: true });
+    writeFileSync(join(root, 'companies/example.md'), '---\ntype: company\nsubtype: org\ntitle: Explicit Synthetic Organization\naudience: internal\n---\nEntirely fictional organization.\n');
+    git(root, 'add', '.'); git(root, 'commit', '-qm', 'Explicit company subtype fixture');
+    const plan = await inspectCompanyBrain({ path: root, profile: 'company-brain' });
+    const input = { brainId: 'company-example', sourceId: `company-${randomUUID().slice(0,8)}`, path: root, plan, remote: false, requestId: randomUUID() };
+    const result = await connectCompanyBrain(engine, input);
+    expect(result.ok).toBe(true);
+    expect((await engine.getPage('companies/example', { sourceId: input.sourceId }))?.frontmatter.subtype).toBe('org');
+    if (!plan.schema) throw new Error('Expected an approved company schema in this fixture.');
+    const { pack } = await checkApprovedSchemaForEngine(engine, { name: plan.schema.name, identity: plan.schema.identity, resolvedManifestHash: plan.schema.resolved_digest }, { remote: false });
+    expect((await verification.verifyCompanyBrain(engine, input.sourceId, plan, pack)).failures).toBe(0);
+    await engine.transaction(tx => withCoordinatedWrite(tx, [input.sourceId], () => tx.executeRaw("UPDATE pages SET frontmatter=frontmatter || '{\"unexpected_test_field\":\"tampered\"}'::jsonb WHERE source_id=$1 AND slug='companies/example'", [input.sourceId]), TEST_WRITE_ATTRIBUTION));
+    expect((await verification.verifyCompanyBrain(engine, input.sourceId, plan, pack)).failures).toBe(1);
+  }
+}), 120_000);

@@ -361,7 +361,7 @@ MEMORY VERB (v1): retrieve saved facts/snippets — the protocol read verb. Filt
 
 ## `remember`
 
-MEMORY VERB (v1): save one fact to durable agent memory — the protocol write verb. provenance is REQUIRED (free text, e.g. "conversation 2026-06-12", "user said in chat", "import: notes.md"). Set `entity` whenever the fact is about a specific person/company/project — entity-scoped recall will not find it otherwise. ttl accepts duration shorthand ("30d", "12h") or an absolute ISO 8601 timestamp; ISO-8601 durations like "P30D" are rejected with a fix. visibility defaults to "world" (readable by every agent connected to this brain; pass "private" for local-CLI-only facts). Response: branch on `status` (inserted|duplicate|superseded), never on `status_text` (human rendering only). On duplicate, `id` is the EXISTING fact's id. For bulk extraction from a raw transcript use extract_facts instead.
+MEMORY VERB (v1): save one fact to durable agent memory — the protocol write verb. provenance is REQUIRED (free text, e.g. "conversation 2026-06-12", "user said in chat", "import: notes.md"). Set `entity` whenever the fact is about a specific person/company/project — entity-scoped recall will not find it otherwise. ttl accepts duration shorthand ("30d", "12h") or an absolute ISO 8601 timestamp; ISO-8601 durations like "P30D" are rejected with a fix. visibility defaults to "private" (local CLI reads only). Pass explicit "world" to make a fact readable by authorized remote agents on this brain. Response: branch on `status` (inserted|duplicate|superseded), never on `status_text` (human rendering only). On duplicate, `id` is the EXISTING fact's id. For bulk extraction from a raw transcript use extract_facts instead.
 
 | Parameter | Type | Guidance |
 | --- | --- | --- |
@@ -376,7 +376,7 @@ MEMORY VERB (v1): save one fact to durable agent memory — the protocol write v
 | `entity` | string | Person/company/project this fact is about (name or slug; canonicalized server-side). Set it whenever the fact has a subject — entity-scoped recall misses unattributed facts. |
 | `infer_entity` | boolean | Default true. When `entity` is omitted, link the fact to the one entity page the text names exactly (response `entity_inferred: "mention"`); pass false to save it unattributed. |
 | `kind` | string (`event`, `preference`, `commitment`, `belief`, `fact`) | Fact kind: event \| preference \| commitment \| belief \| fact (default). |
-| `visibility` | string (`world`, `private`) | world (default): readable by every agent connected to this brain — required for the remote remember→recall round-trip. private: local CLI reads only. |
+| `visibility` | string (`world`, `private`) | private (default): local CLI reads only. Explicit world: readable by authorized agents connected to this brain — required for the remote remember→recall round-trip. |
 
 ## `request_tools`
 

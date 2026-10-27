@@ -180,3 +180,11 @@ describe('remember entity inference (#5836)', () => {
     expect(KNOWN_CONFIG_KEYS).toContain('facts.entity_inference');
   });
 });
+
+test('private-default carry: omission cannot widen a saved claim; explicit world still works', async () => {
+ const hidden = await remember({ fact: 'synthetic private-default canary', infer_entity: false });
+ const shared = await remember({ fact: 'synthetic explicit-world canary', infer_entity: false, visibility: 'world' });
+ const rows=await engine.executeRaw<{id:number;visibility:string}>('SELECT id,visibility FROM facts WHERE id IN ($1,$2)',[Number(hidden.id),Number(shared.id)]);
+ expect(rows.find(row=>row.id===Number(hidden.id))?.visibility).toBe('private');
+ expect(rows.find(row=>row.id===Number(shared.id))?.visibility).toBe('world');
+});

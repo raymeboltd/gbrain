@@ -145,6 +145,7 @@ link_types:
   - name: champion
     inverse: champion_of
     inference:
+      attribution: reference_clause
       page_type: customer
       target_type: person
       regex: '\b([Cc]hampion|[Ss]ponsor|[Mm]ain contact|[Pp]oint of contact)\b'

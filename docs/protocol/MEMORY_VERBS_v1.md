@@ -284,15 +284,13 @@ Save ONE fact with mandatory attribution.
   suggestion. Omitted ⇒ never expires.
 - `kind`: `event` \| `preference` \| `commitment` \| `belief` \| `fact`
   (default).
-- `visibility`: `world` (DEFAULT — readable by every agent connected to this
-  brain; required for the remote remember→recall round-trip) \| `private`
-  (local CLI reads only; session hooks push world facts only, so a private
-  fact never reaches a new agent session, and a local private save carries the
-  `private_fact_not_pushed` notice saying so). The init quickstart carries the
-  consent line. An omitted `visibility` saves `private` when the target page is
-  private (by `visibility` or a privacy alias such as `access: private`) or the
-  operator set `facts.default_visibility` to private; a save never lands wider
-  than the page it is written into.
+- `visibility`: `private` (DEFAULT — local CLI reads only) \| `world`
+  (readable by connected agents and required for a remote remember→recall
+  round trip). Session hooks push world facts only. A local private save
+  carries the `private_fact_not_pushed` notice explaining this trade-off.
+  Omitted visibility stays private regardless of extraction's separate
+  `facts.default_visibility` setting. Explicit values remain caller choices;
+  source and page privacy checks still apply.
 
 Response: `{ id, status, status_text, entity_slug, valid_until,
 protocol_version }` (+ `degraded_dedup: true` when no embedding provider —

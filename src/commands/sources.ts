@@ -1995,7 +1995,7 @@ Subcommands:
   mirror-writable <id> [--dry-run]  Undo mirror-readonly. --dry-run previews either and writes nothing.
   set-strategy <id> <markdown|code|auto>  Persist the sync strategy every sync of the source uses (PR #5955).
   set-pull-strategy <id> <rebase|merge>   How pulls reconcile local commits with origin (#5429); default rebase.
-  refresh <id> [--dry-run] [--wait-drain <s>] [--fetch-timeout-ms <ms>] [--resume|--abandon] [--json]
+  refresh <id> [--dry-run] [--wait-drain <s>] [--fetch-timeout-ms <ms>] [--no-embed] [--no-extract] [--resume|--abandon] [--json]
                                     Managed brains: drain writes to the source's worktree, fast-forward
                                     it to its upstream (git merge --ff-only) and sync every source bound
                                     to it. --dry-run fetches and previews only.

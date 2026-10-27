@@ -544,7 +544,7 @@ function checkExecutionEnvironment(): VerifyCheck {
   }
 }
 
-/** [CX-P1.1] Single-principal posture: facts written without an explicit
+/** [CX-P1.1] Single-principal posture: extracted facts written without an explicit
  * visibility must be recallable by the owner's own sessions (the harness
  * reads at visibility='world'). Set-IF-UNSET only, through the engine config
  * plane — an operator's explicit value (e.g. 'private' for a brain exposed to
@@ -561,7 +561,7 @@ async function ensureDefaultVisibilityPosture(engine: BrainEngine): Promise<Veri
         ok: true,
         detail:
           `facts default visibility: world (set by bootstrap verify — was unset). ` +
-          `Governs extraction-path writes only — \`remember\` always defaults to world regardless; pass \`visibility\` per call to keep a remembered fact private. ` +
+          `Governs extraction-path writes only — \`remember\` defaults to private regardless of this extraction setting; pass \`visibility: \"world\"\` explicitly for remote recall. ` +
           `Flip with \`gbrain config set ${FACTS_DEFAULT_VISIBILITY_KEY} private\` if less-trusted surfaces will read this brain.`,
       };
     }
@@ -570,7 +570,7 @@ async function ensureDefaultVisibilityPosture(engine: BrainEngine): Promise<Veri
       ok: true,
       detail:
         `facts default visibility: ${existing.trim()} (explicit operator value — untouched). ` +
-        `Governs extraction-path writes only — \`remember\` always defaults to world regardless; pass \`visibility\` per call to keep a remembered fact private. ` +
+        `Governs extraction-path writes only — \`remember\` defaults to private regardless of this extraction setting; pass \`visibility: \"world\"\` explicitly for remote recall. ` +
         `Flip with \`gbrain config set ${FACTS_DEFAULT_VISIBILITY_KEY} <world|private>\`.`,
     };
   } catch (e) {

@@ -27,6 +27,11 @@ let engine: PGLiteEngine;
 const CLAIM = 'Alice Example is the procurement lead at Acme Example.';
 
 async function call(name: string, params: Record<string, unknown>) {
+  // These remote withdrawal/link scenarios deliberately exercise world-visible facts.
+  if (name === 'remember') {
+    params = { visibility: 'world', ...params };
+    if (Array.isArray(params.items)) params.items = params.items.map(item => ({ visibility: 'world', ...item }));
+  }
   const res = await dispatchToolCall(engine, name, params, { remote: true, takesHoldersAllowList: ['world'], sourceId: 'default' });
   return { isError: res.isError === true, body: JSON.parse(res.content[0]!.text!) as Record<string, any> };
 }

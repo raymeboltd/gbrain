@@ -8,7 +8,7 @@
  *   - server-side budget packing math (incl. budget < first item)
  *   - query-arm keyword degradation (never an error without embeddings)
  *   - remember contract: provenance_required, ttl forms (P30D trap), enum
- *     kinds, world default + the remote remember→recall round-trip [F2],
+ *     kinds, private default + an explicit-world remote remember→recall round-trip,
  *     private facts hidden from remote readers
  *   - entity: card shape vs RESPONSE_SCHEMAS, three resolution arms,
  *     miss→suggestions, ZERO-LLM guard (chat transport rigged to throw)
@@ -135,7 +135,7 @@ describe('recall — G1B superset + budget packing', () => {
     const r1 = await callRemote('remember', {
       fact: 'superset regression fact',
       provenance: 'conformance test',
-      entity: 'people/superset-test',
+      entity: 'people/superset-test', visibility: 'world',
     });
     expect(r1.isError).toBe(false);
 
@@ -166,7 +166,7 @@ describe('recall — G1B superset + budget packing', () => {
       await callRemote('remember', {
         fact: `budget fact number ${i} with some padding text to cost tokens`,
         provenance: 'conformance test',
-        entity: 'people/budget-test',
+        entity: 'people/budget-test', visibility: 'world',
       });
     }
     const big = await callRemote('recall', { entity: 'people/budget-test', budget_tokens: 10000 });
@@ -269,9 +269,31 @@ describe('remember — contract behavior', () => {
     expect(violations).toEqual([]);
   });
 
-  it('remote remember→recall round-trip holds (world default [F2]); private facts stay hidden', async () => {
+  it('omitted remote visibility stays private even when extraction defaults world', async () => {
+    await engine.setConfig('facts.default_visibility', 'world');
+    try {
+      const saved = await callRemote('remember', {
+        fact: 'implicit visibility privacy sentinel', provenance: 'test',
+        entity: 'people/private-default-test',
+      });
+      expect(saved.isError).toBe(false);
+      const rows = await engine.executeRaw<{ visibility: string }>(
+        'SELECT visibility FROM facts WHERE id = $1', [Number(saved.body.id)],
+      );
+      expect(rows).toEqual([{ visibility: 'private' }]);
+      const recalled = await callRemote('recall', { entity: 'people/private-default-test' });
+      expect(recalled.body.facts).toEqual([]);
+      const forgotten = await callRemote('forget', { id: saved.body.id });
+      expect(forgotten.isError).toBe(true);
+      expect(forgotten.body.error).toBe('not_found');
+    } finally {
+      await engine.unsetConfig('facts.default_visibility');
+    }
+  });
+
+  it('remote remember→recall round-trip holds with explicit world; private facts stay hidden', async () => {
     await callRemote('remember', {
-      fact: 'world-visible round-trip fact', provenance: 'test', entity: 'people/roundtrip-test',
+      fact: 'world-visible round-trip fact', provenance: 'test', entity: 'people/roundtrip-test', visibility: 'world',
     });
     await callRemote('remember', {
       fact: 'PRIVATE-SENTINEL fact', provenance: 'test', entity: 'people/roundtrip-test',
@@ -589,7 +611,7 @@ describe('context_pack — error-path envelope [B6]', () => {
 describe('forget — idempotency + not_found', () => {
   it('expires once, reports expired:false on re-forget, not_found on unknown id', async () => {
     const r = await callRemote('remember', {
-      fact: 'fact to forget', provenance: 'test', entity: 'people/forget-test',
+      fact: 'fact to forget', provenance: 'test', entity: 'people/forget-test', visibility: 'world',
     });
     const id = r.body.id as string;
 
@@ -648,7 +670,7 @@ describe('forget — idempotency + not_found', () => {
       fact: 'private fact remote cannot forget', provenance: 'test',
       entity: 'people/private-forget-test', visibility: 'private',
     });
-    // remote remember defaults world; force a private one locally instead.
+    // A trusted-local writer can save and read private facts; remote readers cannot.
     const localRes = await dispatchToolCall(engine, 'remember', {
       fact: 'truly private fact', provenance: 'test',
       entity: 'people/private-forget-test', visibility: 'private',

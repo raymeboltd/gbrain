@@ -28,6 +28,7 @@ import type { BrainEngine } from '../src/core/engine.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { configureGateway, resetGateway, __setChatTransportForTests, __setEmbedTransportForTests, type ChatResult } from '../src/core/ai/gateway.ts';
 import { runFactsBackstop } from '../src/core/facts/backstop.ts';
+import { resolveDefaultVisibility } from '../src/core/facts/visibility.ts';
 import { operationsByName } from '../src/core/operations.ts';
 import type { OperationContext } from '../src/core/ops/contract.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
@@ -187,13 +188,15 @@ describe('remember without a visibility never widens', () => {
   const visibilityOf = async (engine: BrainEngine, id: string) =>
     (await engine.executeRaw<{ visibility: string }>('SELECT visibility FROM facts WHERE id=$1', [Number(id)]))[0]?.visibility;
 
-  test('onto a private entity page it saves private; an explicit world is honored; a world page keeps the world default', async () => {
+  test('omitted remember stays private on either page with world extraction configured; explicit world remains available', async () => {
     await onEachEngine(async engine => {
       const s = await source(engine, true);
+      await engine.setConfig('facts.default_visibility', 'world');
+      expect(await resolveDefaultVisibility(engine)).toBe('world');
       const onPrivate = await remember(s.local, { fact: 'Dana Example prefers morning meetings', entity: PRIVATE_PERSON });
       expect(await visibilityOf(engine, onPrivate.id)).toBe('private');
       const onWorld = await remember(s.local, { fact: 'Alice Example prefers morning meetings', entity: PERSON });
-      expect(await visibilityOf(engine, onWorld.id)).toBe('world');
+      expect(await visibilityOf(engine, onWorld.id)).toBe('private');
       const explicit = await remember(s.local, { fact: 'Dana Example uses a standing desk', entity: PRIVATE_PERSON, visibility: 'world' });
       expect(await visibilityOf(engine, explicit.id)).toBe('world');
     });

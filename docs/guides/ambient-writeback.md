@@ -381,8 +381,10 @@ accordingly). Nothing is deleted or mutated; the doctor's
   secret-scanned before they touch disk; scanner unavailable = fail-closed
   skip).
 - **`world` is not the internet.** Fact visibility `world` means *readable by
-  agents authorized on this brain* — the default that makes the
-  remember→recall round-trip work across sessions. When
+  agents authorized on this brain*. The opt-in ambient template explicitly
+  supplies `world` so the remote remember→recall round-trip works across sessions.
+  This differs from this carry's `remember` omission default of `private`;
+  enabling ambient writeback alone does not change that verb default. When
   `facts.default_visibility` is unset, the instruction template tells agents
   to write `world`; only an explicitly-private brain gets the private posture,
   stated with its trade-off: private facts are readable by the local CLI only,

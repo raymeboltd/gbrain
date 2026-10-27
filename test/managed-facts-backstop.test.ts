@@ -98,3 +98,25 @@ test('managed extract_facts publishes multiple private entity fences and replays
     });
   } finally { await disposePersistenceConsumer(engine); rmSync(home, { recursive: true, force: true }); }
 }, 60_000);
+
+test('automatic managed publication filters medium owner and preserves ordinary medium', async () => {
+ const { runFactsBackstop }=await import('../src/core/facts/backstop.ts');
+ const home=mkdtempSync(join(tmpdir(),'gbrain-managed-owner-'));
+ try { await withEnv({GBRAIN_HOME:home}, async () => {
+  for(const slug of ['people/owner-example','people/ordinary-example']) await engine.putPage(slug,{type:'person',title:slug,compiled_truth:'Registered synthetic entity.'});
+  await engine.putPage('meetings/owner-fixture',{type:'meeting',title:'Owner fixture',compiled_truth:'Substantive synthetic meeting material. '.repeat(8)});
+  await engine.executeRaw("UPDATE sources SET config=config || '{\"facts_owner_slug\":\" PEOPLE/OWNER-EXAMPLE \"}'::jsonb WHERE id='default'");
+  await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
+  __setChatTransportForTests(async()=>({text:JSON.stringify({facts:[
+   {fact:'owner medium must be rejected',entity:'people/owner-example',kind:'fact',notability:'medium',confidence:1},
+   {fact:'owner high retained',entity:'people/owner-example',kind:'fact',notability:'high',confidence:1},
+   {fact:'ordinary medium retained',entity:'people/ordinary-example',kind:'fact',notability:'medium',confidence:1},
+  ]}),blocks:[],stopReason:'end',usage:{input_tokens:1,output_tokens:1,cache_read_tokens:0,cache_creation_tokens:0},model:'test:stub',providerId:'test'}));
+  __setEmbedTransportForTests((async({values}:{values:string[]})=>({embeddings:values.map(()=>[1,...Array(1535).fill(0)])})) as never);
+  const result=await runFactsBackstop({slug:'meetings/owner-fixture',type:'meeting',compiled_truth:'Substantive synthetic meeting material. '.repeat(8),frontmatter:{}},{engine,sourceId:'default',source:'mcp:put_page',sessionId:null,remote:false,mode:'inline',notabilityFilter:'all',config:{engine:'pglite'}});
+  expect(result.mode).toBe('inline');
+  expect(result).toMatchObject({inserted:2});
+  const rows=await engine.executeRaw<{fact:string}>('SELECT fact FROM facts ORDER BY fact');
+  expect(rows.map(r=>r.fact)).toEqual(['ordinary medium retained','owner high retained']);
+ }); } finally { await disposePersistenceConsumer(engine);rmSync(home,{recursive:true,force:true}); }
+},60000);

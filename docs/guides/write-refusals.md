@@ -505,6 +505,12 @@ and syncs each of those sources with `--no-pull`. Each refusal below prints
 `code`, a one-line `cause`, a literal `fix` with the real source filled in and
 this anchor (`--json` puts them in one object on stdout); the command exits 1.
 
+`--no-embed` and `--no-extract` suppress the corresponding processing for every
+member sync. Refresh records these options before draining; restart and
+`--resume` preserve them, so the resume command needs no repeated flags.
+Conflicting processing flags on `--resume` are refused. A new refresh without
+these flags retains the normal sync defaults.
+
 **Say to your agent:** *"Pull the latest commits into my notes source."* or
 *"The refresh was refused. What do I need to do?"*
 

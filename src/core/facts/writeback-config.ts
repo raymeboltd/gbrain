@@ -41,8 +41,8 @@
  * write guidance: a template telling agents to write private-by-default on
  * every default install would make ambient facts invisible to the very
  * remote agents that saved them (remote recall is world-only). So: unset →
- * 'world' (the `remember` verb's own documented default — the round-trip
- * works); only an explicit non-'world' value → 'private' posture, with the
+ * 'world' (explicit opt-in ambient guidance for the remote round-trip,
+ * independent of `remember`'s private omission default); only an explicit non-'world' value → 'private' posture, with the
  * recall trade-off surfaced by doctor and the guide. An explicit private is
  * never widened.
  */
@@ -86,7 +86,7 @@ export interface WritebackFileConfig {
   visibility_posture: 'world' | 'private';
 }
 
-/** F5 semantics in one place: unset/empty → world (the verb default — never
+/** F5 ambient guidance in one place: unset/empty → explicit world (never
  * an explicit private to widen); ONLY the literal 'world' opts in on the
  * explicit side; anything else is honored as an explicit private posture
  * (matching visibility.ts's fail direction for garbage). */
