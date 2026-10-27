@@ -18,6 +18,7 @@ import { registerLocalWriter } from '../src/core/persistence/identity.ts';
 import { configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
 import { LEGACY_EMBEDDING_CONFIG } from './helpers/legacy-embedding-config.ts';
 import { formatRememberResult } from '../src/cli/remember-format.ts';
+import { submitRememberMutation } from '../src/core/persistence/memory-mutations.ts';
 
 let engine: PGLiteEngine;
 const sourceId = 'remember-private-test';
@@ -37,6 +38,8 @@ beforeAll(async () => {
   await engine.executeRaw('INSERT INTO sources(id,name) VALUES($1,$1)', [sourceId]);
   await registerLocalWriter(engine, 'cli'); await registerLocalWriter(engine, 'stdio');
   await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
+  // Regression: the existing extraction default must not widen omitted remember saves.
+  await engine.setConfig('facts.default_visibility', 'world');
 }, 60_000);
 afterAll(async () => {
   await disposePersistenceConsumer(engine);
@@ -56,10 +59,33 @@ describe('remember --visibility private says the fact is not pushed (#6606)', ()
     expect(formatRememberResult(result, { visibility: 'private' })).toContain('note: private — local CLI recall only; not pushed into new agent sessions');
   });
 
+  test('omitted visibility stays private under a world extraction default and emits the local notice', async () => {
+    const { result, notices } = await remember({ fact: 'Synthetic private default notice.' }, false);
+    expect(await engine.getConfig('facts.default_visibility')).toBe('world');
+    expect(result.status).toBe('inserted');
+    expect(notices.map(n => n.code)).toContain('private_fact_not_pushed');
+    expect(formatRememberResult(result, {})).toContain('note: private');
+  });
+
+  // The verb's filled default can hide a resolver regression. Exercise the
+  // real managed submission boundary with its explicit defaulted marker;
+  // reverting only the resolver must widen this row and fail this assertion.
+  // No production seam or provider call is introduced.
+  test('managed default resolution preserves private remember independently of world extraction', async () => {
+    const ctx: OperationContext = { engine, remote: false, sourceId, config: { engine: 'pglite' }, dryRun: false,
+      logger: { info() {}, warn() {}, error() {} } };
+    const result = await submitRememberMutation(ctx, { fact: 'Synthetic managed private default.',
+      provenance: 'synthetic test', kind: 'fact', visibility: 'private', infer_entity: false }, undefined, { visibilityDefaulted: true });
+    expect(result.status).toBe('inserted');
+    const [row] = await engine.executeRaw<{ visibility: string }>('SELECT visibility FROM facts WHERE id=$1', [Number(result.id)]);
+    expect(row?.visibility).toBe('private');
+    expect(await engine.getConfig('facts.default_visibility')).toBe('world');
+  });
+
   test('a world save, a remote private save and a duplicate emit no such notice', async () => {
-    const world = await remember({ fact: 'The user\'s bike is teal.' }, false);
+    const world = await remember({ fact: 'The user\'s bike is teal.', visibility: 'world' }, false);
     expect(world.notices.map(n => n.code)).not.toContain('private_fact_not_pushed');
-    expect(formatRememberResult(world.result, {})).not.toContain('note: private');
+    expect(formatRememberResult(world.result, { visibility: 'world' })).not.toContain('note: private');
     const remote = await remember({ fact: 'The user\'s gym is on Example Street.', visibility: 'private' }, true);
     expect(remote.notices.map(n => n.code)).not.toContain('private_fact_not_pushed');
     await remember({ fact: 'The user\'s coat is red.', visibility: 'private' }, false);

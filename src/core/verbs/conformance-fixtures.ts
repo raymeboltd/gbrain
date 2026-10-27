@@ -81,6 +81,7 @@ export const CONFORMANCE_CASES: ConformanceCase[] = [
       provenance: 'conformance run {{marker}}',
       entity: 'people/conformance-{{marker}}',
       kind: 'fact',
+      visibility: 'world',
     },
     validateSchema: true,
     expect: [
@@ -98,6 +99,7 @@ export const CONFORMANCE_CASES: ConformanceCase[] = [
       provenance: 'conformance run {{marker}}',
       entity: 'people/conformance-{{marker}}',
       ttl: '30d',
+      visibility: 'world',
     },
     validateSchema: true,
     expect: [{ path: 'valid_until', type: 'string' }],
@@ -225,6 +227,7 @@ export const CONFORMANCE_CASES: ConformanceCase[] = [
       fact: 'conformance {{marker}}: expiring fact',
       provenance: 'conformance run {{marker}}',
       entity: 'people/conformance-{{marker}}',
+      visibility: 'world',
     },
     expectErrorCode: 'invalid_params',
     expectSuggestion: true,

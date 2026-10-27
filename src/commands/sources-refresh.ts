@@ -14,7 +14,7 @@ import { OperationError } from '../core/ops/contract.ts';
 import { cliRenderContext, toAgentError } from '../core/agent-output.ts';
 import { refreshWorktree, type RefreshOptions, type WorktreeRefreshResult } from '../core/persistence/worktree-refresh.ts';
 
-const USAGE = 'Usage: gbrain sources refresh <source-id> [--dry-run] [--wait-drain <seconds>] [--fetch-timeout-ms <ms>] [--resume | --abandon] [--json]';
+const USAGE = 'Usage: gbrain sources refresh <source-id> [--dry-run] [--wait-drain <seconds>] [--fetch-timeout-ms <ms>] [--no-embed] [--no-extract] [--resume | --abandon] [--json]';
 
 function numberFlag(args: string[], flag: string): number | undefined {
   const index = args.indexOf(flag);
@@ -29,7 +29,7 @@ function numberFlag(args: string[], flag: string): number | undefined {
 
 export function parseRefreshArgs(args: string[]): { sourceId: string; json: boolean; options: RefreshOptions } {
   const valued = new Set(['--wait-drain', '--fetch-timeout-ms']);
-  const known = new Set(['--dry-run', '--resume', '--abandon', '--json', ...valued]);
+  const known = new Set(['--dry-run', '--resume', '--abandon', '--json', '--no-embed', '--no-extract', ...valued]);
   const positional: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -45,6 +45,8 @@ export function parseRefreshArgs(args: string[]): { sourceId: string; json: bool
   const waitDrain = numberFlag(args, '--wait-drain');
   return { sourceId: positional[0], json: args.includes('--json'), options: {
     dryRun: args.includes('--dry-run'), resume: args.includes('--resume'), abandon: args.includes('--abandon'),
+    ...(args.includes('--no-embed') ? { noEmbed: true } : {}),
+    ...(args.includes('--no-extract') ? { noExtract: true } : {}),
     ...(waitDrain !== undefined ? { waitDrainMs: Math.round(waitDrain * 1000) } : {}),
     ...(args.includes('--fetch-timeout-ms') ? { fetchTimeoutMs: numberFlag(args, '--fetch-timeout-ms') } : {}),
   } };

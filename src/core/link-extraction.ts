@@ -721,6 +721,44 @@ type TypeFor = (ctx: string, targetSlug: string, idx?: number, sourceId?: string
  * The per-occurrence typer of extractPageLinks. Order: a typed relation line (stated type), then the active pack's
  * inference rules, then meeting attendance, then inferLinkType's verb rules and role priors, then unit post-passes.
  */
+/** Reference-local role evidence is opt-in; markup and URLs cannot supply role words. */
+function referenceClauseAttribution(content: string): (index: number | undefined) => string | undefined {
+  const blank = (value: string) => ' '.repeat(value.length);
+  const masked = stripCodeBlocks(content)
+    .replace(/<!--[\s\S]*?(?:-->|$)/g, value => value.replace(/[^\r\n]/g, ' '))
+    .replace(/`[^`\n]*`/g, blank)
+    .replace(/"[^"\n]*"|“[^”\n]*”|(?<!\w)'[^'\n]*'(?!\w)/g, blank)
+    .replace(/\[\[[^\]\n]*\]\]/g, blank)
+    .replace(/\[[^\]\n]*\]\([^\n)]*\)/g, blank)
+    .replace(/https?:\/\/[^\s]+/g, value => {
+      // Preserve terminal sentence delimiters; URL path words remain masked.
+      const suffix = value.match(/[.!?;]+$/)?.[0] ?? '';
+      return blank(value.slice(0, value.length - suffix.length)) + suffix;
+    })
+    .replace(/\b[a-z0-9_-]+\/[a-z0-9][a-z0-9/_.-]*/gi, blank);
+  const boundaries: Array<[number, number]> = [];
+  for (const match of masked.matchAll(/[.!?;](?:\s+|$)|\n+/g)) boundaries.push([match.index!, match.index! + 1]);
+  // New explicitly linked subjects after a conjunction start a separate clause.
+  for (const match of content.matchAll(/(?:,\s*|\s+)(?:while|whereas|but|and)\s+(?=\[\[|\[[^\]\n]+\]\()/gi)) {
+    if (masked.slice(match.index!, match.index! + match[0].length) === match[0]) boundaries.push([match.index!, match.index! + match[0].length]);
+  }
+  boundaries.sort((a, b) => a[0] - b[0]);
+  return index => {
+    if (index === undefined || index < 0 || index >= content.length) return undefined;
+    let start = 0, end = content.length;
+    for (const [from, to] of boundaries) {
+      if (to <= index) start = to;
+      else if (from > index) { end = from; break; }
+    }
+    // Preserve the existing bounded reference window as an outer limit.
+    const clause = masked.slice(Math.max(start, index - 240), Math.min(end, index + 240));
+    // Role assertions need positive evidence. Ambiguous negation or meta-discussion
+    // degrades to mentions rather than borrowing another subject's role.
+    if (/\b(?:not|never|no|neither|nor|cannot|can['’]t|isn['’]t|wasn['’]t|aren['’]t|weren['’]t|word|term|example|quoted?|discuss(?:ed|es)?|mention(?:ed|s)?)\b/i.test(clause)) return '';
+    return clause;
+  };
+}
+
 function makeTypeFor(content: string, pageType: PageType, opts: ExtractPageLinksOptions, attendancePending: Set<number>, attendanceResolved: Set<number>): TypeFor {
   // #3190: pack-aware verb inference. Pack-declared verbs win (page-type
   // bindings, then pack regexes under the shared per-page ReDoS budget);
@@ -732,6 +770,8 @@ function makeTypeFor(content: string, pageType: PageType, opts: ExtractPageLinks
   const pack = opts.pack ?? null;
   const packBudget = pack ? opts.regexBudget ?? new PageRegexBudget() : undefined;
   const packOwnsAttendance = ownsAttendanceInference(pack);
+  const referenceContext = pack?.link_types.some(lt => lt.inference?.attribution === 'reference_clause')
+    ? referenceClauseAttribution(content) : undefined;
   // Timeline / See-also links never receive the page-role prior — see
   // rolePriorSuppressedRanges (matched on the code-stripped content, so a
   // fenced `## Timeline` never opens a range). idx is the link's position in
@@ -750,7 +790,7 @@ function makeTypeFor(content: string, pageType: PageType, opts: ExtractPageLinks
     if (stated && !(stated === 'attended' && pageType === 'meeting')) return decide(stated, { stated });
     const targetType = opts.targetType?.(targetSlug, sourceId);
     if (pack) {
-      const packVerb = inferLinkTypeFromPack(pack, pageType as string, ctx, packBudget, targetType);
+      const packVerb = inferLinkTypeFromPack(pack, pageType as string, ctx, packBudget, targetType, { referenceContext: referenceContext?.(idx) });
       if (packVerb && (packOwnsAttendance || packVerb !== 'attended' || pageType !== 'meeting')) {
         if (packVerb === 'attended' && pageType === 'meeting'
           && (opts.targetType ? targetType !== 'person' : !targetSlug.startsWith('people/'))) return decide('mentions', { packRule: packVerb });

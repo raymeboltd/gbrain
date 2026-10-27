@@ -1,6 +1,6 @@
 import type { BrainEngine } from '../engine.ts';
 import type { ResolvedPack } from '../schema-pack/registry.ts';
-import { parseMarkdown } from '../markdown.ts';
+import { parseMarkdown, resolveParsedSubtype } from '../markdown.ts';
 import { extractPageLinks, parseTimelineEntries } from '../link-extraction.ts';
 import { loadLinkPageMetadata, makeIndexedLinkResolver } from '../link-reconciliation.ts';
 import { extractTimelineFromContent } from '../timeline-extract.ts';
@@ -34,6 +34,7 @@ export async function verifyCompanyBrain(engine: BrainEngine, sourceId: string, 
     const snapshot = await engine.readPageSnapshot(slug, { sourceId });
     const content = (await readCommittedBlob(plan.revision!, entry, plan.limits)).toString('utf8');
     const parsed = parseMarkdown(content, slug, { activePack: pack.manifest });
+    resolveParsedSubtype(parsed);
     const page = snapshot?.page;
     if (!page || Object.hasOwn(page.frontmatter, QUARANTINE_KEY) || Object.hasOwn(page.frontmatter, EMBED_SKIP_KEY) ||
       snapshot!.revision !== index.get(slug)?.knowledge_revision || page.source_path !== entry.path ||

@@ -64,6 +64,7 @@
  *   `--override-disabled` to force-run.
  */
 
+import { admitConversationOwnerFacts } from '../core/facts/owner-admission.ts';
 import { extractExitCode, extractRunStatus, recordFailedPage } from '../core/facts/conversation-run-status.ts';
 import type { BrainEngine, NewFact } from '../core/engine.ts';
 import type { Page } from '../core/types.ts';
@@ -1071,13 +1072,19 @@ async function processPage(
         );
       },
     );
+    // Retain segment evidence before inference and owner admission; page privacy
+    // has already tightened factVisibility above.
+    extracted = await inferConversationSubjects(state.engine, state.sourceId, factVisibility, extracted.map(fact => ({
+      ...fact, context: fact.context ?? `from ${page.slug} segment ${seg.startIso}..${seg.endIso}`,
+    })));
+    extracted = await admitConversationOwnerFacts(state.engine, state.sourceId, page.slug, factVisibility, extracted);
     if (extracted.length > 0) {
       // Eng-v2 C1 / E11: page-global row_num stays unique across segments.
       // entity_slug is already canonical here — resolveExtractedEntitiesForSave
       // (above) ran every fact through the shipped resolver cascade (#3729/#4052),
       // so master's per-row resolveEntitySlug mapper (#4567's independent fix for
       // the same issue) is superseded rather than layered on top.
-      const rows = await inferConversationSubjects(state.engine, state.sourceId, factVisibility, extracted.map((fact, i) => ({ // #6764
+      const rows = extracted.map((fact, i) => ({
         ...fact, visibility: factVisibility,
         row_num: rowNum + i,
         source_markdown_slug: page.slug,
@@ -1089,7 +1096,7 @@ async function processPage(
         ...segmentValidFrom(fact.valid_from, seg.startIso),
         context:
           fact.context ?? `from ${page.slug} segment ${seg.startIso}..${seg.endIso}`,
-      })));
+      }));
       pageRows.push(...rows);
     }
     rowNum += extracted.length;

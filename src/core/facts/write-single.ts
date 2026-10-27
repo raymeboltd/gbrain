@@ -70,7 +70,7 @@ export interface SingleFactInput {
   kind?: NewFact['kind'];
   /** Free-form entity ref; canonicalized via resolveEntitySlugWithSource. */
   entity?: string | null;
-  /** Facts-layer default 'private'; the remember VERB passes 'world' [F2]. */
+  /** Omitted visibility is private, including the remember verb. */
   visibility?: 'private' | 'world';
   validUntil?: Date | null;
   sessionId?: string | null;

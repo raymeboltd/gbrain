@@ -82,7 +82,7 @@ export async function prepareMemoryMutation(engine: BrainEngine, row: WriteReque
   }
   const p = row.intent;
   const input: SingleFactIntent = { fact: String(p.fact).trim(), kind: (p.kind ?? 'fact') as SingleFactIntent['kind'],
-    visibility: (p.visibility ?? 'world') as SingleFactIntent['visibility'], entity_slug: p.entity_slug as string | null };
+    visibility: (p.visibility ?? 'private') as SingleFactIntent['visibility'], entity_slug: p.entity_slug as string | null };
   const snapshot = await engine.readPageSnapshot(row.slug, { sourceId: row.source_id, includeDeleted: true });
   if ((snapshot?.page.id ?? null) !== row.page_id) throw pageIdentityError(snapshot != null || row.page_id === null, 'The accepted entity was deleted or recreated.');
   // A defaulted visibility never lands broader than the target page as it stands at publication.

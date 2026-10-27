@@ -63,14 +63,14 @@ describe('buildAmbientWritebackSection (F1 leaf — the single source)', () => {
     expect(without).toContain('distill them yourself');
   });
 
-  test('visibility postures: world names the agents-on-this-brain semantics; private names the widen trap + recall trade-off (F5/req 6)', () => {
+  test('visibility postures: world names agent scope; private names the default and recall trade-off', () => {
     const world = buildAmbientWritebackSection(BASE_OPTS);
     expect(world).toContain('visibility: "world"');
     expect(world).toContain('not the public internet');
     expect(world).toContain('Never widen a private fact on your own.');
     const priv = buildAmbientWritebackSection({ ...BASE_OPTS, visibility: 'private' });
     expect(priv).toContain('visibility: "private"');
-    expect(priv).toContain('omitting visibility would silently widen');
+    expect(priv).toContain('remember also defaults to private');
     expect(priv).toContain('not by remote sessions');
   });
 

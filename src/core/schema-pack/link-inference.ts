@@ -60,7 +60,7 @@ export function inferLinkTypeFromPack(
   context: string,
   budget?: PageRegexBudget,
   targetType?: string,
-  opts: { ner?: boolean } = {},
+  opts: { ner?: boolean; referenceContext?: string } = {},
 ): string | null {
   const rules = [
     ...pack.link_types.filter(lt => lt.inference?.page_type),
@@ -73,10 +73,15 @@ export function inferLinkTypeFromPack(
     if (rule.ner_only && !opts.ner) continue;
     if (rule.page_type && rule.page_type !== pageType) continue;
     if (rule.target_type && rule.target_type !== targetType) continue;
+    // An opted-in rule never borrows an unanchored mention/NER window.
+    const matchContext = rule.attribution === 'reference_clause' ? opts.referenceContext : context;
+    if (matchContext === undefined) continue;
+    // Defend runtime callers that bypass schema validation; no evidence means no role.
+    if (rule.attribution === 'reference_clause' && (!rule.regex?.trim() || !matchContext.trim())) continue;
     const pattern = rule.regex;
     if (!pattern) return lt.name;
     if (budget) {
-      const match = budget.runBounded(lt.name, pattern, context);
+      const match = budget.runBounded(lt.name, pattern, matchContext);
       if (match === undefined) {
         // Budget exhausted — caller's surrounding logic falls through
         // to mentions per design.
@@ -90,7 +95,7 @@ export function inferLinkTypeFromPack(
       // one ReDoS hole with no timeout. runRegexBounded throws on
       // timeout/oversize/malformed → skip and continue (degrade to mentions).
       try {
-        if (runRegexBounded(pattern, context) !== null) return lt.name;
+        if (runRegexBounded(pattern, matchContext) !== null) return lt.name;
       } catch {
         // Timed out, oversize input, or malformed pattern — skip and continue.
         // Pack validation + the star-height lint rule surface bad patterns.

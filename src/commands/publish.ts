@@ -14,12 +14,11 @@
 
 import { readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { randomBytes, createCipheriv, pbkdf2Sync } from 'crypto';
-import { dirname, basename, join } from 'path';
-import { createRequire } from 'module';
+import { dirname, basename } from 'path';
+import MARKED_JS from '../../node_modules/marked/lib/marked.umd.js' with { type: 'text' };
 
 // Inline marked.js so published HTML is truly self-contained (no CDN dependency)
-const require = createRequire(import.meta.url);
-const MARKED_JS = readFileSync(join(dirname(require.resolve('marked')), 'marked.umd.js'), 'utf8');
+// Static text import embeds the UMD asset inside Bun's standalone binary.
 
 // ── Content stripping ──────────────────────────────────────────────
 
@@ -28,7 +27,7 @@ export function makeShareable(content: string): string {
   let clean = content;
 
   // Remove YAML frontmatter
-  clean = clean.replace(/^---[\s\S]*?---\n*/, '');
+  clean = clean.replace(/^---[ \t]*\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n)*/, '');
 
   // Remove [Source: ...] citations (all formats)
   clean = clean.replace(/\s*\[Source:[^\]]*\]/g, '');
@@ -36,16 +35,36 @@ export function makeShareable(content: string): string {
   // Remove confirmation numbers
   clean = clean.replace(/\*\*Confirmation:\*\*\s*[A-Z0-9]{6,}/gi, '**Confirmation:** on file');
   clean = clean.replace(/Confirmation[:#]?\s*[A-Z0-9]{6,}/gi, 'Confirmation: on file');
-  clean = clean.replace(/\bconf\s*#?\s*[A-Z0-9]{6,}/gi, 'Confirmation: on file');
+  clean = clean.replace(/\bconf\b\s*#?\s*[A-Z0-9]{6,}\b/gi, 'Confirmation: on file');
 
-  // Remove brain cross-links but keep display text
-  clean = clean.replace(/\[([^\]]+)\]\(\.[^)]*\/[^)]+\)/g, '$1');
+  // Keep public destinations; references and raw HTML must use the same boundary.
+  const publicDestination = (target: string) => /^(?:https?:|mailto:|tel:)/i.test(target) || target.startsWith('//') || target.startsWith('#');
+  const privateReferences = new Set<string>();
+  const referenceKey = (key: string) => key.trim().replace(/\s+/g, ' ').toLowerCase();
+  clean = clean.replace(/^ {0,3}\[([^\]]+)\]:[ \t]*(?:<([^>]+)>|(\S+))[^\r\n]*$/gm, (whole, key, angled, bare) => {
+    if (publicDestination(angled || bare)) return whole;
+    privateReferences.add(referenceKey(key));
+    return '';
+  });
+  clean = clean.replace(/!?\[([^\]]+)\]\[([^\]]*)\]/g, (whole, label, key) => privateReferences.has(referenceKey(key || label)) ? label : whole);
+  clean = clean.replace(/!?\[([^\]]+)\](?![[(])/g, (whole, label) => privateReferences.has(referenceKey(label)) ? label : whole);
+  // One balanced nested pair covers common Markdown destinations such as PRIVATE_(TEAM).md.
+  clean = clean.replace(/!?\[([^\]]+)\]\(((?:[^()]|\([^()]*\))*)\)/g, (whole, label, target) => {
+    const path = target.trim().replace(/^<|>$/g, '');
+    return publicDestination(path) ? whole : label;
+  });
+  clean = clean.replace(/(<[^>]*?\s(?:href|src|action|poster)\s*=\s*)(["'])(.*?)\2/gi, (whole, prefix, quote, target) => publicDestination(target.trim()) ? whole : prefix + quote + quote);
+  clean = clean.replace(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (whole, target, label) => {
+    if (/^https?:\/\//i.test(target)) return whole;
+    return label || target.split('/').pop();
+  });
 
   // Remove "See also" brain-internal lines
   clean = clean.replace(/^-?\s*See also:.*$/gm, '');
 
   // Remove Timeline section (below the --- separator near end)
-  clean = clean.replace(/\n---\n\n## Timeline[\s\S]*$/, '');
+  clean = clean.replace(/(?:^|\r?\n)##[ \t]+Timeline\b[^\r\n]*(?:\r?\n|$)[\s\S]*$/i, '');
+  clean = clean.replace(/\r?\n---[ \t]*(?:\r?\n)*$/, '');
 
   // Clean up excessive blank lines
   clean = clean.replace(/\n{3,}/g, '\n\n');
@@ -92,6 +111,11 @@ export function generatePassword(length: number = 16): string {
 }
 
 // ── HTML generation ────────────────────────────────────────────────
+
+// HTML parsers terminate inline scripts before JavaScript parses string literals.
+function scriptJson(value: unknown): string {
+  return JSON.stringify(value).replace(/</g, '\\u003c').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
+}
 
 const CSS = `
   :root {
@@ -275,13 +299,33 @@ export function generateHtml({ title, markdown, encrypted }: GenerateHtmlOptions
 
   const encryptedVars = encrypted ? `
     <script>
-      window.__SALT = ${JSON.stringify(encrypted.salt)};
-      window.__IV = ${JSON.stringify(encrypted.iv)};
-      window.__CT = ${JSON.stringify(encrypted.ciphertext)};
+      window.__SALT = ${scriptJson(encrypted.salt)};
+      window.__IV = ${scriptJson(encrypted.iv)};
+      window.__CT = ${scriptJson(encrypted.ciphertext)};
     </script>` : '';
 
   // Sanitize markdown rendering to prevent XSS from embedded HTML in brain pages
   const sanitizeScript = `
+    function escapeRenderedText(value) {
+      return String(value ?? '').replace(/[&<>"']/g, character => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+      })[character]);
+    }
+    function renderMarkdown(markdown) {
+      const renderer = new marked.Renderer();
+      // Preserve image URLs as deliberate links; never fetch remote assets.
+      renderer.image = function(token) {
+        const label = escapeRenderedText(token.text || 'Image');
+        const href = String(token.href || '').trim();
+        const lower = href.toLowerCase();
+        if (!lower.startsWith('https://') && !lower.startsWith('http://')) return label;
+        return '<a href="' + escapeRenderedText(href) + '">' + label + '</a>';
+      };
+      // Escape raw HTML before creating any DOM: img/style tokens can fetch
+      // resources even inside a detached sanitization element.
+      renderer.html = function(token) { return escapeRenderedText(token.text || ''); };
+      return sanitizeHtml(marked.parse(markdown, { renderer }));
+    }
     function sanitizeHtml(html) {
       const div = document.createElement('div');
       div.innerHTML = html;
@@ -300,11 +344,11 @@ export function generateHtml({ title, markdown, encrypted }: GenerateHtmlOptions
   const contentScript = encrypted
     ? `<script>${sanitizeScript}${DECRYPT_JS.replace(
         'document.getElementById(\'content\').innerHTML = marked.parse(result)',
-        'document.getElementById(\'content\').innerHTML = sanitizeHtml(marked.parse(result))'
+        'document.getElementById(\'content\').innerHTML = renderMarkdown(result)'
       )}<\/script>`
     : `<script>${sanitizeScript}
-        const md = ${JSON.stringify(markdown)};
-        document.getElementById('content').innerHTML = sanitizeHtml(marked.parse(md));
+        const md = ${scriptJson(markdown)};
+        document.getElementById('content').innerHTML = renderMarkdown(md);
       <\/script>`;
 
   return `<!DOCTYPE html>
@@ -334,27 +378,33 @@ export async function runPublish(args: string[]) {
   const pwIdx = args.indexOf('--password');
 
   if (!inputPath) {
-    console.error('Usage: gbrain publish <page.md> [--password ["secret"]] [--title "Title"] [--out path]');
+    console.error('Usage: gbrain publish <page.md> [--password ["secret"]] [--public] [--title "Title"] [--out path]');
     console.error('');
     console.error('  Generates a shareable HTML page from brain markdown.');
     console.error('  Strips private data (frontmatter, citations, timeline, brain links).');
-    console.error('  Optionally encrypts with AES-256-GCM (client-side, no server needed).');
+    console.error('  Encrypts by default with AES-256-GCM (client-side, no server needed).');
     console.error('');
+    console.error('  Default             Encrypt with an auto-generated password');
+    console.error('  --public            Explicitly publish unencrypted content');
     console.error('  --password          Auto-generate a password');
     console.error('  --password "secret" Use a specific password');
-    console.error('  --title "Title"     Override the page title');
+    console.error('  --title "Title"     Public title, visible before decryption');
     console.error('  --out path          Output file (default: <input-basename>.html)');
     process.exit(1);
   }
 
   const raw = readFileSync(inputPath, 'utf-8');
   const cleaned = makeShareable(raw);
-  const title = (titleIdx >= 0 ? args[titleIdx + 1] : null) || extractTitle(raw);
+  const publicOutput = args.includes('--public');
+  const explicitTitle = titleIdx >= 0 ? args[titleIdx + 1] : null;
+  // Inferred content titles are private unless the output is explicitly public.
+  const title = explicitTitle || (publicOutput ? extractTitle(cleaned) : 'Protected document');
 
   // Handle password
   let encrypted: EncryptedContent | null = null;
-  if (pwIdx >= 0) {
-    const nextArg = args[pwIdx + 1];
+  if (publicOutput && pwIdx >= 0) throw new Error('--public cannot be combined with --password');
+  if (!publicOutput) {
+    const nextArg = pwIdx >= 0 ? args[pwIdx + 1] : undefined;
     const password = (nextArg && !nextArg.startsWith('--')) ? nextArg : generatePassword();
     encrypted = encryptContent(cleaned, password);
     if (!nextArg || nextArg.startsWith('--')) {

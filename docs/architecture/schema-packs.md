@@ -198,6 +198,15 @@ bundled `gbrain-base` and `gbrain-base-v2` packs mark their `founded`,
 were extracted before v0.60.36.0 re-derives them with
 `gbrain extract links --source db`.
 
+A regex rule may opt into `attribution: reference_clause`. Markdown extraction
+then matches only bounded reference-local sentence/clause evidence, masking
+entity markup, URLs, code and quotations. Explicit negation or meta-discussion
+conservatively falls through to mentions. Unanchored callers cannot use this
+rule. Existing rules retain their wide narrative context by default. This is
+a conservative local role heuristic, not general pronoun, negation or clause
+parsing. Joint subjects, ellipses, complex quotations and indirect assertions
+need separate evidence before their role edges can be trusted.
+
 ## How the agent uses the active pack
 
 Every read + write path consults the active pack at runtime:

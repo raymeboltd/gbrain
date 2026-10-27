@@ -31,7 +31,7 @@ describe('remember records the MCP session', () => {
     const res = await dispatchToolCall(
       engine,
       'remember',
-      { fact: 'the ledger closes on Fridays', provenance: 'test', _meta: { session_id: 'sess-a' } },
+      { fact: 'the ledger closes on Fridays', provenance: 'test', visibility: 'world', _meta: { session_id: 'sess-a' } },
       { ...STDIO },
     );
     expect(res.isError ?? false).toBe(false);
@@ -48,7 +48,7 @@ describe('remember records the MCP session', () => {
     const res = await dispatchToolCall(
       engine,
       'remember',
-      { fact: 'the bank settles at noon', provenance: 'test', _meta: { session_id: 'sess-args' } },
+      { fact: 'the bank settles at noon', provenance: 'test', visibility: 'world', _meta: { session_id: 'sess-args' } },
       { ...STDIO, sessionId: 'sess-transport' },
     );
     const { id } = parsed(res);

@@ -102,7 +102,7 @@ const remember: Operation = {
     visibility: {
       type: 'string',
       enum: ['world', 'private'],
-      description: 'world (default) or private (local CLI).',
+      description: 'private (default, local CLI only) or explicit world.',
     },
     replaces: { type: 'string', description: 'fact_id this fact replaces (same entity, or none).', fullSurfaceOnly: true },
   },
@@ -157,12 +157,12 @@ const remember: Operation = {
         `Use one of: ${FACT_KINDS.join(' | ')}.`,
       );
     }
-    const visibility = typeof p.visibility === 'string' ? p.visibility : 'world';
+    const visibility = typeof p.visibility === 'string' ? p.visibility : 'private';
     if (visibility !== 'world' && visibility !== 'private') {
       throw verbError(
         'invalid_params',
         `visibility "${visibility}" is not valid.`,
-        'Use "world" (default — agents can recall it) or "private" (local CLI reads only).',
+        'Use "private" (default — local CLI reads only) or explicit "world" (agents can recall it).',
       );
     }
     if (p.valid_from !== undefined && (typeof p.valid_from !== 'string' || !Number.isFinite(Date.parse(p.valid_from)))) {

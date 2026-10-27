@@ -35,9 +35,14 @@ const LinkInferenceSchema = z.object({
   regex: z.string().optional(),
   page_type: z.string().optional(),
   target_type: z.string().optional(),
+  /** Opt-in role attribution; default preserves broad narrative context. */
+  attribution: z.enum(['reference_clause']).optional(),
   /** The regex labels body mentions found by NER only; markdown links fall through to the in-code matchers (#5882). */
   ner_only: z.boolean().optional(),
-}).strict();
+}).strict().refine(rule => !rule.attribution || !!rule.regex?.trim(), {
+  message: 'Reference-clause attribution requires a nonempty regex',
+  path: ['regex'],
+});
 
 const LinkTypeSchema = z.object({
   name: z.string().min(1),

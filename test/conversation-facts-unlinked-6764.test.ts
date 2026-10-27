@@ -74,6 +74,45 @@ describe('#6764 write-time inference on conversation facts', () => {
     expect(row!.context!.startsWith(`from ${MEETING} segment `)).toBe(true);
   });
 
+  test('owner carry applies the high floor after subject inference', async () => {
+    await engine.executeRaw(`UPDATE sources SET config=config || '{"facts_owner_slug":"people/alice-example"}'::jsonb WHERE id='default'`);
+    await extract(engine, { notability: 'medium' });
+    expect(await extracted(engine)).toEqual([]);
+    await extract(engine, { notability: 'high' });
+    expect((await extracted(engine)).map(row => row.entity_slug)).toEqual(['people/alice-example']);
+  });
+
+  test('private page tightening applies before inferred owner admission under a world global default', async () => {
+    await seedPages(engine, { visibility: 'private' });
+    const page = (await engine.getPage(MEETING, { sourceId: 'default' }))!;
+    await engine.putPage(MEETING, { ...page, frontmatter: { ...page.frontmatter, visibility: 'private' } }, { sourceId: 'default' });
+    await engine.setConfig('facts.default_visibility', 'world');
+    await engine.executeRaw(`UPDATE sources SET config=config || '{"facts_owner_slug":"people/alice-example"}'::jsonb WHERE id='default'`);
+    await extract(engine, { notability: 'medium' });
+    expect(await extracted(engine)).toEqual([]);
+    await extract(engine, { notability: 'high' });
+    const rows = await engine.executeRaw<{ entity_slug: string; visibility: string; row_num: number }>(
+      `SELECT entity_slug,visibility,row_num FROM facts WHERE source='cli:extract-conversation-facts' AND expired_at IS NULL`);
+    expect(rows).toEqual([{ entity_slug: 'people/alice-example', visibility: 'private', row_num: 0 }]);
+  });
+
+  test('owner filtering and exact segment dedupe assign contiguous rows without dropping ordinary evidence', async () => {
+    await engine.executeRaw(`UPDATE sources SET config=config || '{"facts_owner_slug":"people/alice-example"}'::jsonb WHERE id='default'`);
+    const owner = { fact: 'A synthetic important owner decision', entity_slug: 'people/alice-example', notability: 'high',
+      kind: 'fact', confidence: 0.9, source: 'test' } as ExtractedFact;
+    const spy = spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      await runExtractConversationFactsCore(engine, { sourceId: 'default', slugs: [MEETING], sleepMs: 0,
+        overrideDisabled: true, force: true, extractor: async () => [
+          { ...owner, fact: 'Medium owner decision', notability: 'medium' }, owner, { ...owner },
+          { ...owner, fact: 'Ordinary medium evidence', entity_slug: 'people/bob-example', notability: 'medium' },
+        ] });
+    } finally { spy.mockRestore(); }
+    const rows = await engine.executeRaw<{ fact: string; row_num: number }>(
+      `SELECT fact,row_num FROM facts WHERE source='cli:extract-conversation-facts' AND expired_at IS NULL ORDER BY row_num`);
+    expect(rows).toEqual([{ fact: owner.fact, row_num: 0 }, { fact: 'Ordinary medium evidence', row_num: 1 }]);
+  });
+
   test('the kill switch stops it, and an extractor-named entity is kept', async () => {
     await engine.setConfig('facts.entity_inference', 'off');
     await extract(engine);

@@ -73,18 +73,10 @@ export function tightenToPage(visibility: FactVisibility, page: { type?: string 
 }
 
 /**
- * `remember` without a `visibility`: the v1 default is `world`, except where
- * that would widen what the caller is saving into. A private target page, an
- * operator's explicit private `facts.default_visibility` (any non-empty value
- * other than `world`, as the writeback posture reads it) or an unreadable
- * config resolve `private`.
+ * The installed personal-brain policy keeps omitted remember visibility private.
+ * Extraction's facts.default_visibility remains independent; explicit remember
+ * values still pass through the caller's existing visibility path.
  */
-export async function resolveRememberVisibility(engine: BrainEngine, page: { type?: string | null; frontmatter?: unknown } | null | undefined): Promise<FactVisibility> {
-  if (page && isDerivationPrivate(page)) return 'private';
-  try {
-    const raw = (await engine.getConfig(FACTS_DEFAULT_VISIBILITY_KEY))?.trim().toLowerCase() ?? '';
-    return raw === '' || raw === 'world' ? 'world' : 'private';
-  } catch {
-    return 'private';
-  }
+export async function resolveRememberVisibility(_engine: BrainEngine, _page: { type?: string | null; frontmatter?: unknown } | null | undefined): Promise<FactVisibility> {
+  return 'private';
 }

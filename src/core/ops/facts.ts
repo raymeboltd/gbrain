@@ -155,16 +155,11 @@ const extract_facts: Operation = {
     // message. `chat_unavailable` means no servable chat model: the calling
     // agent IS an LLM, so hand it the keyless self-extract path (the
     // `remember` verb + `## Facts` fences work with zero keys). The
-    // visibility pin in the instruction is mandatory copy: `remember`
-    // defaults to 'world' while extract_facts facts default 'private' —
-    // omitting it would silently widen private data to every connected agent.
-    // The visibility instruction names the RESOLVED visibility for THIS call
-    // (caller param > facts.default_visibility config > private): a caller who
-    // asked for world must not be steered to private, and an unpinned
-    // instruction would silently widen private-default extractions because
-    // `remember` hard-defaults to 'world'.
-    const visibilityPin = `visibility: "${visibility}"` +
-      (visibility === 'private' ? ' (remember defaults to world — omitting it would widen these facts)' : '');
+    // Pin the resolved extraction visibility (caller > config > private).
+    // remember independently defaults to private; explicit world is required
+    // for a remote remember/recall round trip. Never change a resolved private
+    // extraction to world merely to make it remotely recallable.
+    const visibilityPin = `visibility: "${visibility}"`;
     if (r.skipped_reason === 'chat_unavailable') {
       return {
         inserted: 0, duplicate: 0, superseded: 0, fact_ids: [],

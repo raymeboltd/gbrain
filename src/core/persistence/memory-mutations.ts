@@ -166,7 +166,7 @@ async function inferRememberTarget(ctx: OperationContext, sourceId: string, sour
     { fact, mode: 'write', excludePrivate: await excludesPrivateWrites(ctx.engine, ctx.remote !== false) });
   if (inferred.slug === null) return null;
   try {
-    const target = await planRememberTarget(ctx, sourceId, source, inferred.slug, { fact, visibility: String(p.visibility ?? 'world') }, call);
+    const target = await planRememberTarget(ctx, sourceId, source, inferred.slug, { fact, visibility: String(p.visibility ?? 'private') }, call);
     return { target, via: inferred.via };
   } catch (error) {
     if (error instanceof InferredTargetRejected) return { warning: error.warning };

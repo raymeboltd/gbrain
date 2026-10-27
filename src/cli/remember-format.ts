@@ -9,7 +9,7 @@ export function formatRememberResult(r: Record<string, any>, params: Record<stri
   if (r.entity_slug) lines.push(`  entity: ${r.entity_slug}${r.entity_inferred ? ' (inferred from mention)' : ''}`);
   if (r.valid_until) lines.push(`  expires: ${r.valid_until}`);
   if (r.degraded_dedup) lines.push('  note: no embedding provider — duplicate detection degraded');
-  if (params.visibility === 'private') lines.push('  note: private — local CLI recall only; not pushed into new agent sessions');
+  if ((params.visibility ?? 'private') === 'private') lines.push('  note: private — local CLI recall only; not pushed into new agent sessions');
   if (Array.isArray(r.warnings)) for (const warning of r.warnings) lines.push(`  warning: ${warning}`);
   if (r.hint) lines.push(`  hint: ${r.hint}`);
   return lines.join('\n') + '\n';
