@@ -296,6 +296,7 @@ test('repair regression explicit subtype survives but unrelated stored metadata 
     const result = await connectCompanyBrain(engine, input);
     expect(result.ok).toBe(true);
     expect((await engine.getPage('companies/example', { sourceId: input.sourceId }))?.frontmatter.subtype).toBe('org');
+    if (!plan.schema) throw new Error('Expected an approved company schema in this fixture.');
     const { pack } = await checkApprovedSchemaForEngine(engine, { name: plan.schema.name, identity: plan.schema.identity, resolvedManifestHash: plan.schema.resolved_digest }, { remote: false });
     expect((await verification.verifyCompanyBrain(engine, input.sourceId, plan, pack)).failures).toBe(0);
     await engine.transaction(tx => withCoordinatedWrite(tx, [input.sourceId], () => tx.executeRaw("UPDATE pages SET frontmatter=frontmatter || '{\"unexpected_test_field\":\"tampered\"}'::jsonb WHERE source_id=$1 AND slug='companies/example'", [input.sourceId]), TEST_WRITE_ATTRIBUTION));
